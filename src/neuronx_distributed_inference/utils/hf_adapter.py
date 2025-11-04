@@ -43,7 +43,11 @@ def load_pretrained_config(
             raise ValueError('Please provide only one of "model_path_or_name" or "hf_config"')
 
         if model_path_or_name is not None:
-            config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
+            if 'MiniMax-M2' in model_path_or_name:
+                from neuronx_distributed_inference.models.minimax_m2.configuration_minimax_m2 import MiniMaxM2Config
+                config: PretrainedConfig = MiniMaxM2Config.from_pretrained(model_path_or_name)
+            else:
+                config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
         else:
             config: PretrainedConfig = hf_config
         config_dict = config.to_dict()
