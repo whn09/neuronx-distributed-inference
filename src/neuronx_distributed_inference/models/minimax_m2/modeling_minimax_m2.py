@@ -454,7 +454,10 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_gpu import MiniMaxM2ForCausalLM
-        return MiniMaxM2ForCausalLM.from_pretrained(model_path, **kwargs)
+        print('model_path:', model_path)
+        print('kwargs:', kwargs)
+        model_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
+        return MiniMaxM2ForCausalLM.from_pretrained(model_path, **kwargs)  # TODO: No GPU or XPU found. A GPU or XPU is needed for FP8 quantization.
 
     @classmethod
     def get_config_cls(cls):
