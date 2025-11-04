@@ -22,13 +22,19 @@ def generate(skip_compile=False):
         # tp_degree must be a multiple of num_key_value_heads (8) for proper KV head distribution
         neuron_config = MoENeuronConfig(
             tp_degree=64,  # Must be multiple of num_key_value_heads=8
+            # moe_tp_degree=16,
             # moe_ep_degree=4,
             batch_size=1,
             max_context_length=128,
             seq_len=1024,
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
-            flash_decoding_enabled=False
+            flash_decoding_enabled=False,
+            # Use torch implementation to bypass NKI kernel's DGE limitation
+            # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
+            blockwise_matmul_config={
+                'use_torch_block_wise': True,
+            }
         )
         config = MiniMaxM2InferenceConfig(
             neuron_config,

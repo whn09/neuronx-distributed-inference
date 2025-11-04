@@ -38,7 +38,8 @@ from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecode
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
-from neuronx_distributed_inference.modules.moe import initialize_moe_module
+# from neuronx_distributed_inference.modules.moe import initialize_moe_module
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
@@ -205,6 +206,11 @@ def get_rmsnorm_cls():
 
 
 class MiniMaxM2InferenceConfig(InferenceConfig):
+    def __init__(self, neuron_config, fused_spec_config=None, load_config=None, metadata=None, **kwargs):
+        super().__init__(neuron_config, fused_spec_config, load_config, metadata, **kwargs)
+        # MiniMax M2 doesn't have shared experts
+        self.n_shared_experts = 0
+
     def get_required_attributes(self) -> List[str]:
         return [
             "head_dim",
@@ -338,14 +344,7 @@ class NeuronMiniMaxM2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronMiniMaxM2Attention(config=config)
 
-        self.mlp = initialize_moe_module(
-            config=config,
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        self.mlp = initialize_moe_module(config=config)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
