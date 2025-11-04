@@ -1,6 +1,6 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import torch
-from modeling_minimax_m2 import MiniMaxM2ForCausalLM
+from modeling_minimax_m2_gpu import MiniMaxM2ForCausalLM
 
 # MODEL_PATH = "MiniMaxAI/MiniMax-M2"
 MODEL_PATH = "/home/ubuntu/model_hf/MiniMax-M2"

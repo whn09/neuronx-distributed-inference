@@ -198,24 +198,8 @@ def get_rmsnorm_cls():
     # If infer on NXD -> CustomRMSNorm
     # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
     if cpu_mode():
-        try:
-            from transformers.models.minimax_m2.modeling_minimax_m2 import MiniMaxM2RMSNorm
-            return MiniMaxM2RMSNorm
-        except ImportError:
-            # Fallback to a generic RMSNorm implementation
-            class MiniMaxM2RMSNorm(nn.Module):
-                def __init__(self, hidden_size, eps=1e-6):
-                    super().__init__()
-                    self.weight = nn.Parameter(torch.ones(hidden_size))
-                    self.variance_epsilon = eps
-
-                def forward(self, hidden_states):
-                    input_dtype = hidden_states.dtype
-                    hidden_states = hidden_states.to(torch.float32)
-                    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-                    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-                    return self.weight * hidden_states.to(input_dtype)
-            return MiniMaxM2RMSNorm
+        from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_gpu import MiniMaxM2RMSNorm
+        return MiniMaxM2RMSNorm
     else:
         return CustomRMSNorm
 
@@ -470,15 +454,8 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        # Import the HuggingFace model
-        try:
-            from transformers import AutoModelForCausalLM
-            return AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, **kwargs)
-        except Exception as e:
-            print(f"Failed to load model with transformers AutoModelForCausalLM: {e}")
-            print("Trying to load with trust_remote_code=True")
-            from transformers import AutoModelForCausalLM
-            return AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, **kwargs)
+        from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_gpu import MiniMaxM2ForCausalLM
+        return MiniMaxM2ForCausalLM.from_pretrained(model_path, trust_remote_code=True, **kwargs)
 
     @classmethod
     def get_config_cls(cls):
@@ -495,7 +472,7 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         compiler_args += " --auto-cast=none"
-        # Enable vector-offset DGE
-        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
+        # Disable vector-offset DGE to avoid "Invalid Shape for Scalar DGE" error with MoE models
+        # compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         return compiler_args

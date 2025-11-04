@@ -21,8 +21,8 @@ def generate(skip_compile=False):
         # Model uses GQA: num_attention_heads=48, num_key_value_heads=8
         # tp_degree must be a multiple of num_key_value_heads (8) for proper KV head distribution
         neuron_config = MoENeuronConfig(
-            tp_degree=8,  # Must be multiple of num_key_value_heads=8
-            moe_ep_degree=4,
+            tp_degree=64,  # Must be multiple of num_key_value_heads=8
+            # moe_ep_degree=4,
             batch_size=1,
             max_context_length=128,
             seq_len=1024,
@@ -33,7 +33,7 @@ def generate(skip_compile=False):
         config = MiniMaxM2InferenceConfig(
             neuron_config,
             load_config=load_pretrained_config(model_path),
-        )        
+        )      
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
         tokenizer.pad_token = tokenizer.eos_token
         # Compile and save model.
@@ -54,21 +54,12 @@ def generate(skip_compile=False):
     messages = [
         {"role": "user", "content": prompt}
     ]
-    # Apply chat template (enable_thinking may not be supported by all tokenizers)
-    try:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True # Switches between thinking and non-thinking modes if supported.
-        )
-    except TypeError:
-        # Fallback if enable_thinking is not supported
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True # Switches between thinking and non-thinking modes if supported.
+    )
     inputs = tokenizer([text], padding=True, return_tensors="pt")
     generation_model = HuggingFaceGenerationAdapter(model)
     outputs = generation_model.generate(
