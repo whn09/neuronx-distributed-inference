@@ -472,7 +472,8 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         compiler_args += " --auto-cast=none"
-        # Disable vector-offset DGE to avoid "Invalid Shape for Scalar DGE" error with MoE models
-        # compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
+        # Enable vector-offset DGE (try with lower tp_degree first, e.g., 8 or 16)
+        # Disable this if you get "Invalid Shape for Scalar DGE" error with high tp_degree
+        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         return compiler_args
