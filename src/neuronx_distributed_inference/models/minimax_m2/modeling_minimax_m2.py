@@ -454,7 +454,7 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_gpu import MiniMaxM2ForCausalLM
-        return MiniMaxM2ForCausalLM.from_pretrained(model_path, trust_remote_code=True, **kwargs)
+        return MiniMaxM2ForCausalLM.from_pretrained(model_path, **kwargs)
 
     @classmethod
     def get_config_cls(cls):

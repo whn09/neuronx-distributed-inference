@@ -82,3 +82,4 @@ def generate(skip_compile=False):
 
 if __name__ == "__main__":
     generate()
+    # generate(skip_compile=True)

@@ -609,6 +609,10 @@ class MoENeuronConfig(NeuronConfig):
 
         self.router_config = kwargs.pop("router_config", None)
         if isinstance(self.router_config, dict):
+            # Handle dtype conversion if it's a string
+            if 'dtype' in self.router_config and isinstance(self.router_config['dtype'], str):
+                from neuronx_distributed.modules.moe.moe_configs import to_torch_dtype
+                self.router_config['dtype'] = to_torch_dtype(self.router_config['dtype'])
             self.router_config = RouterConfig(**self.router_config)
         else:
             self.router_config = RouterConfig.from_kwargs(**kwargs)
