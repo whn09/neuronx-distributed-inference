@@ -107,14 +107,23 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     for l in range(config.num_hidden_layers):  # noqa: E741
         # Handle QK norm if present
         if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
-            # Rename the q_norm, k_norm names
+            # MiniMax M2 uses per-head QK norm: [num_heads, head_dim]
+            # Neuron expects shared QK norm: [head_dim]
+            # We average across all heads to convert per-head to shared
+
+            # k_norm: [num_kv_heads * head_dim] -> [head_dim]
+            k_norm_full = neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
+            k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)
             neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
-                neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"].detach().clone()
+                k_norm_reshaped.mean(dim=0).detach().clone()
             )
             del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
 
+            # q_norm: [num_attention_heads * head_dim] -> [head_dim]
+            q_norm_full = neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
+            q_norm_reshaped = q_norm_full.reshape(config.num_attention_heads, config.head_dim)
             neuron_state_dict[f"layers.{l}.self_attn.q_layernorm.weight"] = (
-                neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"].detach().clone()
+                q_norm_reshaped.mean(dim=0).detach().clone()
             )
             del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
 
@@ -457,7 +466,7 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         print('model_path:', model_path)
         print('kwargs:', kwargs)
         model_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
-        return MiniMaxM2ForCausalLM.from_pretrained(model_path, **kwargs)  # TODO: No GPU or XPU found. A GPU or XPU is needed for FP8 quantization.
+        return MiniMaxM2ForCausalLM.from_pretrained(model_path, trust_remote_code=True, dtype=torch.bfloat16, **kwargs)  # TODO: No GPU or XPU found. A GPU or XPU is needed for FP8 quantization.
 
     @classmethod
     def get_config_cls(cls):

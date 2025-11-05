@@ -30,6 +30,7 @@ def generate(skip_compile=False):
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
             flash_decoding_enabled=False,
+            # save_sharded_checkpoint=True,
             # Use torch implementation to bypass NKI kernel's DGE limitation
             # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
             blockwise_matmul_config={

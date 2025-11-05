@@ -10,7 +10,7 @@ from neuronx_distributed.utils.medusa_utils import (
     update_inference_inputs,
 )
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig, PreTrainedModel
-from transformers.generation import GenerateDecoderOnlyOutput, SampleDecoderOnlyOutput
+from transformers.generation import GenerateDecoderOnlyOutput, SampleDecoderOnlyOutput, GenerationMixin
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.modeling_outputs import ModelOutput
@@ -100,10 +100,14 @@ def to_pretrained_config(config: InferenceConfig):
     return PretrainedConfig(**config_dict)
 
 
-class HuggingFaceGenerationAdapter(PreTrainedModel):
+class HuggingFaceGenerationAdapter(GenerationMixin, PreTrainedModel):
+    """
+    Adapter class to enable HuggingFace generation API for Neuron models.
+    Inherits from GenerationMixin for transformers 4.50+ compatibility.
+    """
     def __init__(self, model: NeuronApplicationBase, input_start_offsets=None):
         hf_config = to_pretrained_config(model.config)
-        super().__init__(hf_config)
+        PreTrainedModel.__init__(self, hf_config)
         if self.generation_config is not None:
             # In transformers v4.50+, the logic for default generation config args is changed.
             # - For models defined in v4.50+, it uses the model's default generation config.
