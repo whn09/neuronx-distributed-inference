@@ -35,7 +35,16 @@ def generate(skip_compile=False):
             # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
             blockwise_matmul_config={
                 'use_torch_block_wise': True,
-            }
+            },
+            # Enable FP8 quantization for MLP layers
+            # This automatically sets quantization_dtype="f8e4m3" and quantization_type="per_channel_symmetric"
+            quantized_mlp_kernel_enabled=True,
+            # Specify modules that should NOT be quantized (matching HF config's quantization_config)
+            # These modules don't have FP8 weights and scale parameters
+            modules_to_not_convert=[
+                "lm_head",
+                # Note: "gate" and "e_score_correction_bias" are already excluded in the model architecture
+            ],
         )
         config = MiniMaxM2InferenceConfig(
             neuron_config,
