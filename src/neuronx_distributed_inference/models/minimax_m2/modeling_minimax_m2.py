@@ -99,6 +99,21 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     """
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
 
+    # Handle FP8 scale parameters: rename weight_scale_inv to scale
+    # MiniMax M2 uses weight_scale_inv for FP8 quantized weights
+    # Note: modules_to_not_convert (gate, e_score_correction_bias, lm_head) don't have scale params
+    if config.neuron_config.quantized_mlp_kernel_enabled or config.neuron_config.quantized:
+        param_name_list = list(neuron_state_dict.keys())
+        for param_name in param_name_list:
+            if param_name.endswith(".weight_scale_inv"):
+                # Convert weight_scale_inv to scale
+                new_param_name = param_name.replace(".weight_scale_inv", ".scale")
+                # Note: weight_scale_inv is the inverse of scale, so we need to compute 1/x
+                scale_inv = neuron_state_dict[param_name]
+                neuron_state_dict[new_param_name] = 1.0 / scale_inv
+                del neuron_state_dict[param_name]
+                print(f"Converted FP8 scale parameter: {new_param_name}")
+
     # to facilitate rank usage in base model
     neuron_state_dict["rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32
@@ -462,11 +477,62 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
+        import json
+        import os
+        import shutil
         from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_gpu import MiniMaxM2ForCausalLM
+
         print('model_path:', model_path)
         print('kwargs:', kwargs)
         model_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
-        return MiniMaxM2ForCausalLM.from_pretrained(model_path, trust_remote_code=True, dtype=torch.bfloat16, **kwargs)  # TODO: No GPU or XPU found. A GPU or XPU is needed for FP8 quantization.
+
+        # For FP8 quantized models, transformers will check for GPU/XPU even with device_map="cpu"
+        # We need to temporarily remove quantization_config from config.json to bypass the check
+        # The actual FP8 weights will be loaded correctly from safetensors by Neuron
+        config_path = os.path.join(model_path, 'config.json')
+        config_backup_path = os.path.join(model_path, 'config.json.backup')
+
+        # Backup original config and create a version without quantization_config
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+
+            # Check if quantization_config exists
+            if 'quantization_config' in config_data:
+                print("Temporarily removing quantization_config to bypass transformers FP8 GPU check...")
+                # Backup original config
+                shutil.copy2(config_path, config_backup_path)
+
+                # Remove quantization_config
+                quantization_config = config_data.pop('quantization_config')
+
+                # Write modified config
+                with open(config_path, 'w') as f:
+                    json.dump(config_data, f, indent=2)
+
+                try:
+                    # Load model without quantization_config check
+                    model = MiniMaxM2ForCausalLM.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                        device_map="cpu",
+                        **kwargs
+                    )
+                finally:
+                    # Restore original config
+                    if os.path.exists(config_backup_path):
+                        shutil.move(config_backup_path, config_path)
+                        print("Restored original config.json with quantization_config")
+
+                return model
+
+        # Fallback if no config manipulation needed
+        return MiniMaxM2ForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            device_map="cpu",
+            **kwargs
+        )
 
     @classmethod
     def get_config_cls(cls):
