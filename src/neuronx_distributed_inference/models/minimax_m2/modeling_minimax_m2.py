@@ -99,11 +99,32 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     """
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
 
+    # Debug: Check what keys are in the state_dict
+    print("\n=== DEBUG: Checking state_dict keys ===")
+    all_keys = list(neuron_state_dict.keys())
+    print(f"  Total keys in state_dict: {len(all_keys)}")
+
+    # Check for weight_scale_inv keys
+    scale_inv_keys = [k for k in all_keys if 'weight_scale_inv' in k]
+    print(f"  Keys with 'weight_scale_inv': {len(scale_inv_keys)}")
+    if scale_inv_keys:
+        print(f"  First 5 weight_scale_inv keys:")
+        for k in scale_inv_keys[:5]:
+            print(f"    {k}")
+
+    # Check layer 0 self_attn keys
+    layer0_attn = [k for k in all_keys if k.startswith('layers.0.self_attn.')]
+    print(f"  Layer 0 self_attn keys: {len(layer0_attn)}")
+    for k in sorted(layer0_attn)[:10]:
+        print(f"    {k}")
+
     # Handle FP8 scale parameters: rename weight_scale_inv to scale
     # MiniMax M2 uses weight_scale_inv for FP8 quantized weights
     # Note: modules_to_not_convert (gate, e_score_correction_bias, lm_head) don't have scale params
     if config.neuron_config.quantized_mlp_kernel_enabled or config.neuron_config.quantized:
+        print("\n=== Converting FP8 scale parameters ===")
         param_name_list = list(neuron_state_dict.keys())
+        scale_count = 0
         for param_name in param_name_list:
             if param_name.endswith(".weight_scale_inv"):
                 # Convert weight_scale_inv to scale
@@ -112,12 +133,54 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
                 scale_inv = neuron_state_dict[param_name]
                 neuron_state_dict[new_param_name] = 1.0 / scale_inv
                 del neuron_state_dict[param_name]
-                print(f"Converted FP8 scale parameter: {new_param_name}")
+                scale_count += 1
+                if scale_count <= 3:  # Print first 3
+                    print(f"  Converted: {param_name} -> {new_param_name}")
+        print(f"  Total converted: {scale_count} FP8 scale parameters")
 
     # to facilitate rank usage in base model
     neuron_state_dict["rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
+
+    # Rename attention projection keys to match Neuron's GQA module expectations
+    # Neuron GQA expects: layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,scale}
+    # HF model has: layers.X.self_attn.{q,k,v}_proj.{weight,scale}
+    # NOTE: This must run AFTER FP8 scale conversion to capture both .weight and .scale
+    print("\n=== Renaming attention projections to add qkv_proj prefix ===")
+    param_name_list = list(neuron_state_dict.keys())
+    renamed_count = 0
+    weight_count = 0
+    scale_count = 0
+    for param_name in param_name_list:
+        new_param_name = None
+        # Add qkv_proj prefix to attention projections (handles both .weight and .scale)
+        if '.self_attn.q_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.q_proj.', '.self_attn.qkv_proj.q_proj.')
+        elif '.self_attn.k_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
+        elif '.self_attn.v_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
+        # Also handle o_proj
+        elif '.self_attn.o_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.o_proj.', '.self_attn.o_proj.o_proj.')
+
+        if new_param_name:
+            neuron_state_dict[new_param_name] = neuron_state_dict.pop(param_name)
+            renamed_count += 1
+            if param_name.endswith('.weight'):
+                weight_count += 1
+            elif param_name.endswith('.scale'):
+                scale_count += 1
+            if renamed_count <= 5:  # Print first 5
+                print(f"  Renamed: {param_name} -> {new_param_name}")
+    print(f"  Total renamed: {renamed_count} parameters ({weight_count} weights, {scale_count} scales)")
+
+    # Debug: Check if layer 0 qkv_proj keys exist
+    print("\n=== Checking layer 0 attention keys ===")
+    layer0_attn_keys = [k for k in neuron_state_dict.keys() if k.startswith('layers.0.self_attn.')]
+    for key in sorted(layer0_attn_keys):
+        print(f"  {key}")
 
     for l in range(config.num_hidden_layers):  # noqa: E741
         # Handle QK norm if present
@@ -474,6 +537,88 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
     """
 
     _model_cls = NeuronMiniMaxM2Model
+
+    @classmethod
+    def get_state_dict(cls, model_name_or_path: str, config: InferenceConfig) -> dict:
+        """
+        Override get_state_dict to handle FP8 quantized models.
+        The default load_state_dict doesn't load weight_scale_inv parameters when quantization_config is missing.
+        """
+        import os
+        from safetensors import safe_open
+        import json
+
+        print(f"\n=== CUSTOM get_state_dict CALLED ===")
+        print(f"  model_name_or_path: {model_name_or_path}")
+        print(f"  Is directory: {os.path.isdir(model_name_or_path)}")
+
+        if os.path.isdir(model_name_or_path):
+            # For FP8 quantized models, we need to load ALL parameters from safetensors
+            # The standard load_state_dict filters out weight_scale_inv when quantization_config is missing
+            print(f"\n=== Loading state_dict from {model_name_or_path} ===")
+
+            # Check if this is a sharded safetensors model
+            index_path = os.path.join(model_name_or_path, 'model.safetensors.index.json')
+            if os.path.exists(index_path):
+                print("  Detected sharded safetensors model, loading all shards...")
+                with open(index_path, 'r') as f:
+                    index = json.load(f)
+
+                model_sd = {}
+                # Load all shard files
+                shard_files = set(index['weight_map'].values())
+                for i, shard_file in enumerate(sorted(shard_files)):
+                    if i % 20 == 0:  # Progress every 20 files
+                        print(f"  Loading shard {i+1}/{len(shard_files)}: {shard_file}")
+                    shard_path = os.path.join(model_name_or_path, shard_file)
+                    with safe_open(shard_path, framework="pt", device="cpu") as f:
+                        for key in f.keys():
+                            model_sd[key] = f.get_tensor(key)
+
+                print(f"  Loaded {len(model_sd)} parameters from {len(shard_files)} shards")
+
+                # Check for scale parameters BEFORE any conversion
+                weight_scale_inv_keys = [k for k in model_sd.keys() if 'weight_scale_inv' in k]
+                print(f"  Found {len(weight_scale_inv_keys)} parameters with 'weight_scale_inv'")
+                if weight_scale_inv_keys:
+                    print(f"  First 3 weight_scale_inv keys:")
+                    for k in weight_scale_inv_keys[:3]:
+                        print(f"    {k}")
+
+                scale_keys = [k for k in model_sd.keys() if 'scale' in k and 'weight_scale_inv' not in k]
+                print(f"  Found {len(scale_keys)} parameters with 'scale' (excluding weight_scale_inv)")
+            else:
+                # Fall back to standard loading for non-sharded models
+                from neuronx_distributed_inference.modules.checkpoint import load_state_dict
+                model_sd = load_state_dict(model_name_or_path)
+
+            # Remove model. prefix and handle other transformations
+            param_name_list = list(model_sd.keys())
+            for param_name in param_name_list:
+                updated_param_name = param_name
+                if param_name.startswith(cls._STATE_DICT_MODEL_PREFIX):
+                    updated_param_name = param_name.replace(
+                        cls._STATE_DICT_MODEL_PREFIX, cls._NEW_STATE_DICT_MODEL_PREFIX, 1
+                    )
+                if param_name.endswith(".weight_scale"):
+                    updated_param_name = updated_param_name.replace(".weight_scale", ".scale")
+                if updated_param_name != param_name:
+                    model_sd[updated_param_name] = model_sd[param_name]
+                    del model_sd[param_name]
+        else:
+            # Use parent class implementation for non-directory paths
+            return super().get_state_dict(model_name_or_path, config)
+
+        model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
+        if getattr(config, "tie_word_embeddings", False):
+            cls.update_state_dict_for_tied_weights(model_sd)
+
+        param_name_list = list(model_sd.keys())
+        if cls._FUSED_PREFIX != "":
+            for param_name in param_name_list:
+                model_sd[f"{cls._FUSED_PREFIX}.{param_name}"] = model_sd[param_name]
+                del model_sd[param_name]
+        return model_sd
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):

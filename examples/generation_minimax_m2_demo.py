@@ -45,6 +45,9 @@ def generate(skip_compile=False):
                 "lm_head",
                 # Note: "gate" and "e_score_correction_bias" are already excluded in the model architecture
             ],
+            # Disable fused_qkv when using FP8 quantization
+            # FP8 quantization requires separate scale parameters for Q, K, V
+            fused_qkv=False,
         )
         config = MiniMaxM2InferenceConfig(
             neuron_config,
