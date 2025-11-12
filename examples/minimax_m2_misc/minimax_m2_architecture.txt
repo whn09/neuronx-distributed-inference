@@ -1,0 +1,171 @@
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+
+====================================================================================================
+  MiniMax-M2 Architecture Visualization
+====================================================================================================
+
+📊 Model Configuration:
+  • Architecture: MiniMaxM2ForCausalLM
+  • Model Type: minimax_m2
+  • Total Layers: 62
+  • Hidden Dimension: 3072
+  • Vocabulary Size: 200,064
+
+====================================================================================================
+  Layer-by-Layer Structure
+====================================================================================================
+
+MiniMaxM2ForCausalLM
+│
+├── model (MiniMaxM2Model)
+│   │
+│   ├── embed_tokens (Embedding)
+│   │   └── [vocab_size=200064, hidden_size=3072]
+│   │
+│   ├── layers (ModuleList[62])
+│   │   │
+
+│   │   ├── Layer[0...61] (MiniMaxM2DecoderLayer)
+│   │   │   │
+│   │   │   ├── input_layernorm (RMSNorm)
+│   │   │   │   └── normalized_shape: [3072], eps=1e-06
+│   │   │   │
+│   │   │   ├── self_attn (MiniMaxM2Attention - Group Query Attention)
+│   │   │   │   │
+│   │   │   │   ├── q_proj (Linear): [3072 → 3072]
+│   │   │   │   │   • Output: 48 attention heads
+│   │   │   │   │   • Head dim: 64
+│   │   │   │   │   └── q_norm (RMSNorm): per-head normalization
+│   │   │   │   │       • Shape: [48, 64]
+│   │   │   │   │
+│   │   │   │   ├── k_proj (Linear): [3072 → 512]
+│   │   │   │   │   • Output: 8 KV heads (GQA)
+│   │   │   │   │   • Head dim: 64
+│   │   │   │   │   • Ratio: 6:1 (Q:KV)
+│   │   │   │   │   └── k_norm (RMSNorm): per-head normalization
+│   │   │   │   │       • Shape: [8, 64]
+│   │   │   │   │
+│   │   │   │   ├── v_proj (Linear): [3072 → 512]
+│   │   │   │   │   • Output: 8 KV heads
+│   │   │   │   │
+│   │   │   │   ├── o_proj (Linear): [3072 → 3072]
+│   │   │   │   │   • Merges all attention heads back
+│   │   │   │   │
+│   │   │   │   └── rotary_emb (RotaryEmbedding)
+│   │   │   │       • Theta: 5,000,000
+│   │   │   │       • Max positions: 196,608
+│   │   │   │
+│   │   │   ├── post_attention_layernorm (RMSNorm)
+│   │   │   │   └── normalized_shape: [3072], eps=1e-06
+│   │   │   │
+│   │   │   └── block_sparse_moe (MoE - Mixture of Experts)
+│   │   │       │
+│   │   │       ├── gate (Linear): [3072 → 256]
+│   │   │       │   • Routes input to top-8 experts
+│   │   │       │
+│   │   │       ├── experts (ModuleList[256])
+│   │   │       │   │   Each expert is an FFN:
+│   │   │       │   │
+│   │   │       │   ├── Expert[0...255] (MiniMaxM2MLP)
+│   │   │       │   │   │
+│   │   │       │   │   ├── w1 (gate_proj): [3072 → 1536]
+│   │   │       │   │   │   • For SwiGLU activation (gate path)
+│   │   │       │   │   │
+│   │   │       │   │   ├── w3 (up_proj): [3072 → 1536]
+│   │   │       │   │   │   • For SwiGLU activation (up path)
+│   │   │       │   │   │
+│   │   │       │   │   ├── activation: SwiGLU
+│   │   │       │   │   │   • Combines: silu(w1(x)) * w3(x)
+│   │   │       │   │   │
+│   │   │       │   │   └── w2 (down_proj): [1536 → 3072]
+│   │   │       │   │       • Projects back to hidden dimension
+│   │   │       │   │
+│   │   │       │   └── ... (repeated for all experts)
+│   │   │       │
+│   │   │       └── (no e_score_correction_bias)
+│   │   │
+│   │   └── ... (repeated for 62 layers)
+│   │
+│   └── norm (RMSNorm - Final)
+│       └── normalized_shape: [3072], eps=1e-06
+│
+└── lm_head (Linear)
+    └── [3072 → 200,064]
+        • Generates vocabulary logits for next token prediction
+
+====================================================================================================
+  Parameter Count Breakdown
+====================================================================================================
+
+📊 Embedding Layer:
+  • Parameters: 614,596,608
+
+📊 Per Decoder Layer (62 total):
+  • Attention: 22,023,680 params
+    - Q/K/V/O projections: 22,023,680 params
+    - Q/K norms: 3,584 params
+  • MoE MLP: 3,624,665,088 params
+    - Router (gate): 786,432 params
+    - 256 Experts: 3,623,878,656 params
+    - Per expert: 14,155,776 params
+  • LayerNorms: 6,144 params
+  ─────────────────────────────
+  • Total per layer: 3,646,694,912 params
+
+📊 All 62 Layers:
+  • Total: 226,095,084,544 params
+
+📊 Final LayerNorm:
+  • Parameters: 3,072
+
+📊 LM Head (usually tied with embedding):
+  • Parameters: 614,596,608 (if not tied)
+
+====================================================================================================
+  🎯 TOTAL MODEL PARAMETERS: 226,709,684,224
+====================================================================================================
+
+📈 Model Characteristics:
+  • Sparsity: 8/256 experts activated
+  • Sparsity ratio: 3.1%
+  • Effective MoE params per token: 114,032,640
+  • Attention type: Group Query Attention (GQA)
+  • GQA ratio: 6:1 (Query:KV)
+  • Use QK normalization: True
+
+====================================================================================================
+  Key Features
+====================================================================================================
+
+✨ Architecture Highlights:
+
+1. 🎯 Group Query Attention (GQA)
+   • Reduces KV cache size while maintaining model quality
+   • Q heads: 48, KV heads: 8 (6:1 ratio)
+   • Per-head Q/K normalization for training stability
+
+2. 🔀 Mixture of Experts (MoE)
+   • 256 experts per layer (massive expert pool)
+   • Top-8 expert routing (sparse activation)
+   • Only ~3.125% of experts active per token
+   • Enables scaling model capacity without proportional compute increase
+
+3. 🎨 SwiGLU Activation
+   • silu(w1(x)) ⊗ w3(x) → w2(x)
+   • Gated activation for better expressiveness
+   • Separate gate and up projections
+
+4. 🔄 RoPE (Rotary Position Embedding)
+   • Theta: 5,000,000 (supports very long contexts)
+   • Max positions: 196,608 tokens (~200K context length!)
+   • Relative positional encoding
+
+5. 📐 RMSNorm
+   • Lightweight normalization (no bias, no mean centering)
+   • Lower computational cost than LayerNorm
+   • eps=1e-6 for numerical stability
+
+====================================================================================================
+Visualization complete!
+====================================================================================================

@@ -547,6 +547,8 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         import os
         from safetensors import safe_open
         import json
+        
+        model_name_or_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
 
         print(f"\n=== CUSTOM get_state_dict CALLED ===")
         print(f"  model_name_or_path: {model_name_or_path}")

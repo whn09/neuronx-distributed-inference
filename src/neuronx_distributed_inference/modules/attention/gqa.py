@@ -137,10 +137,54 @@ def should_pad_scale(tensor_scale: torch.Tensor, pad_dim: int) -> bool:
     return False
 
 
+def transpose_blockwise_scale_if_needed(tensor: torch.Tensor, tensor_scale: torch.Tensor) -> torch.Tensor:
+    """
+    Transpose block-wise scale to match ColumnParallelLinear's transposed weight storage format.
+
+    ColumnParallelLinear stores weight as [in_features, out_features/tp], so block-wise scale
+    should also be transposed from [out_blocks, in_blocks] to [in_blocks, out_blocks].
+    """
+    if tensor_scale is None or not is_per_channel(tensor_scale):
+        return tensor_scale
+
+    # Detect if this is 2D block-wise quantization by checking if both dimensions are much smaller than tensor
+    if len(tensor_scale.shape) >= 2:
+        # rough heuristic: if scale dimension is < 1/32 of tensor dimension, it's likely block-wise
+        is_blockwise_dim0 = tensor_scale.shape[0] * 32 < tensor.shape[0]
+        is_blockwise_dim1 = tensor_scale.shape[1] * 32 < tensor.shape[1]
+
+        if is_blockwise_dim0 and is_blockwise_dim1:
+            # This is 2D block-wise quantization, transpose it
+            print(f'Transposing block-wise scale: {tuple(tensor_scale.shape)} -> {tuple(tensor_scale.T.shape)}')
+            return tensor_scale.T
+
+    return tensor_scale
+
+
 def verify_scale_dimension(tensor: torch.Tensor, tensor_scale: torch.Tensor):
     if is_per_channel(tensor_scale):
         channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
-        assert tensor_scale.shape[channel_axis] == tensor.shape[channel_axis]
+        # Check if this is block-wise quantization
+        # Block-wise: scale dimension is much smaller than tensor dimension (scale = tensor / block_size)
+        is_blockwise = tensor_scale.shape[channel_axis] < tensor.shape[channel_axis]
+
+        if is_blockwise:
+            # For block-wise quantization, verify that scale covers all blocks
+            block_size = tensor.shape[channel_axis] // tensor_scale.shape[channel_axis]
+            expected_scale_dim = tensor.shape[channel_axis] // block_size
+            print(f'Block-wise quantization detected: channel_axis={channel_axis}, '
+                  f'tensor.shape[{channel_axis}]={tensor.shape[channel_axis]}, '
+                  f'scale.shape[{channel_axis}]={tensor_scale.shape[channel_axis]}, '
+                  f'block_size={block_size}')
+            assert tensor_scale.shape[channel_axis] == expected_scale_dim, \
+                f"Block-wise scale dimension mismatch: scale[{channel_axis}]={tensor_scale.shape[channel_axis]}, " \
+                f"expected {expected_scale_dim} (tensor[{channel_axis}]={tensor.shape[channel_axis]} / block_size={block_size})"
+        else:
+            # For per-channel quantization
+            print(f'Per-channel quantization: channel_axis={channel_axis}, '
+                  f'scale.shape[{channel_axis}]={tensor_scale.shape[channel_axis]}, '
+                  f'tensor.shape[{channel_axis}]={tensor.shape[channel_axis]}')
+            assert tensor_scale.shape[channel_axis] == tensor.shape[channel_axis]
 
 
 def maybe_pad_interleaved(
@@ -153,9 +197,44 @@ def maybe_pad_interleaved(
 ):
     tensor = _maybe_pad_interleaved(tensor, pad_dim, source_heads, target_heads, source_group_size)
     if should_pad_scale(tensor_scale=tensor_scale, pad_dim=pad_dim):
-        tensor_scale = _maybe_pad_interleaved(
-            tensor_scale, pad_dim, source_heads, target_heads, source_group_size
-        )
+        # Check if this is block-wise quantization
+        channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
+        if channel_axis == pad_dim:
+            is_blockwise = tensor_scale.shape[channel_axis] < tensor.shape[pad_dim]
+
+            if is_blockwise:
+                # For block-wise quantization, compute the block_size and scale heads accordingly
+                # Original tensor shape before padding
+                original_tensor_dim = tensor.shape[pad_dim] // target_heads * source_heads
+                block_size = original_tensor_dim // tensor_scale.shape[channel_axis]
+
+                # Block-wise scales should be padded proportionally to head padding
+                # source_heads -> target_heads means scale should go from
+                # source_heads*head_dim/block_size -> target_heads*head_dim/block_size
+                scale_source_blocks = tensor_scale.shape[channel_axis]
+                scale_target_blocks = scale_source_blocks * target_heads // source_heads
+
+                print(f'Block-wise scale padding: dim={pad_dim}, '
+                      f'scale {tensor_scale.shape} from {scale_source_blocks} to {scale_target_blocks} blocks, '
+                      f'block_size={block_size}')
+
+                # Use simple tail padding for block-wise scales
+                tensor_scale = _maybe_pad_tail(
+                    tensor_scale,
+                    source_heads=scale_source_blocks,
+                    target_heads=scale_target_blocks,
+                    pad_dim=pad_dim
+                )
+            else:
+                # Per-channel quantization: use original interleaved padding
+                tensor_scale = _maybe_pad_interleaved(
+                    tensor_scale, pad_dim, source_heads, target_heads, source_group_size
+                )
+        else:
+            # Scale is on a different dimension, use original logic
+            tensor_scale = _maybe_pad_interleaved(
+                tensor_scale, pad_dim, source_heads, target_heads, source_group_size
+            )
 
     return tensor, tensor_scale
 
@@ -205,7 +284,37 @@ def _maybe_pad_interleaved(
 def maybe_pad_tail(tensor, source_heads: int, target_heads: int, pad_dim: int, tensor_scale=None):
     tensor = _maybe_pad_tail(tensor, source_heads, target_heads, pad_dim)
     if should_pad_scale(tensor_scale=tensor_scale, pad_dim=pad_dim):
-        tensor_scale = _maybe_pad_tail(tensor_scale, source_heads, target_heads, pad_dim)
+        # Check if this is block-wise quantization
+        channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
+        if channel_axis == pad_dim:
+            is_blockwise = tensor_scale.shape[channel_axis] < tensor.shape[pad_dim]
+
+            if is_blockwise:
+                # For block-wise quantization, scale heads proportionally
+                # After padding tensor from source_heads to target_heads,
+                # scale should be padded from (source_heads*head_dim/block_size) to (target_heads*head_dim/block_size)
+                original_tensor_dim = tensor.shape[pad_dim] // target_heads * source_heads
+                block_size = original_tensor_dim // tensor_scale.shape[channel_axis]
+
+                scale_source_blocks = tensor_scale.shape[channel_axis]
+                scale_target_blocks = scale_source_blocks * target_heads // source_heads
+
+                print(f'Block-wise scale tail padding: dim={pad_dim}, '
+                      f'scale {tensor_scale.shape} from {scale_source_blocks} to {scale_target_blocks} blocks, '
+                      f'block_size={block_size}')
+
+                tensor_scale = _maybe_pad_tail(
+                    tensor_scale,
+                    source_heads=scale_source_blocks,
+                    target_heads=scale_target_blocks,
+                    pad_dim=pad_dim
+                )
+            else:
+                # Per-channel quantization: use original padding
+                tensor_scale = _maybe_pad_tail(tensor_scale, source_heads, target_heads, pad_dim)
+        else:
+            # Scale is on a different dimension
+            tensor_scale = _maybe_pad_tail(tensor_scale, source_heads, target_heads, pad_dim)
     return tensor, tensor_scale
 
 
@@ -228,9 +337,41 @@ def replicate_kv(tensor, source_heads: int, repeats: int, head_dim=0, tensor_sca
         tensor=tensor, source_heads=source_heads, repeats=repeats, head_dim=head_dim
     )
     if should_pad_scale(tensor_scale=tensor_scale, pad_dim=head_dim):
-        tensor_scale = _replicate_kv(
-            tensor=tensor_scale, source_heads=source_heads, repeats=repeats, head_dim=head_dim
-        )
+        # Check if this is block-wise quantization
+        channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
+        if channel_axis == head_dim:
+            is_blockwise = tensor_scale.shape[channel_axis] < tensor.shape[head_dim]
+
+            if is_blockwise:
+                # For block-wise quantization, replicate blocks proportionally
+                # tensor goes from source_heads to (source_heads * repeats)
+                # scale should go from (source_heads*head_dim/block_size) to (source_heads*repeats*head_dim/block_size)
+                original_tensor_dim = tensor.shape[head_dim] // repeats
+                block_size = original_tensor_dim // tensor_scale.shape[channel_axis]
+
+                scale_source_blocks = tensor_scale.shape[channel_axis]
+                # Scale blocks should be replicated the same number of times as tensor heads
+
+                print(f'Block-wise scale replication: dim={head_dim}, '
+                      f'scale {tensor_scale.shape} with {scale_source_blocks} blocks replicated {repeats}x, '
+                      f'block_size={block_size}')
+
+                tensor_scale = _replicate_kv(
+                    tensor=tensor_scale,
+                    source_heads=scale_source_blocks,
+                    repeats=repeats,
+                    head_dim=head_dim
+                )
+            else:
+                # Per-channel quantization: use original replication
+                tensor_scale = _replicate_kv(
+                    tensor=tensor_scale, source_heads=source_heads, repeats=repeats, head_dim=head_dim
+                )
+        else:
+            # Scale is on a different dimension
+            tensor_scale = _replicate_kv(
+                tensor=tensor_scale, source_heads=source_heads, repeats=repeats, head_dim=head_dim
+            )
     return tensor, tensor_scale
 
 
@@ -963,6 +1104,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             qkv_scale = None
             if all(scale is not None for scale in (q_proj_scale, k_proj_scale, v_proj_scale)):
                 qkv_scale = torch.cat([q_proj_scale, k_proj_scale, v_proj_scale], dim=0)
+                # Transpose block-wise scale if needed to match ColumnParallelLinear's storage format
+                qkv_scale = transpose_blockwise_scale_if_needed(qkv_weight, qkv_scale)
 
             # Set heads info as weight parameter attributes to be used in weights sharding
             fused_qkv_params = (
@@ -992,6 +1135,11 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     model_state_dict=model_state_dict,
                 )
         else:
+            # Transpose block-wise scales if needed to match ColumnParallelLinear's storage format
+            q_proj_scale = transpose_blockwise_scale_if_needed(q_proj_weight, q_proj_scale)
+            k_proj_scale = transpose_blockwise_scale_if_needed(k_proj_weight, k_proj_scale)
+            v_proj_scale = transpose_blockwise_scale_if_needed(v_proj_weight, v_proj_scale)
+
             self.set_weight(
                 tensor=q_proj_weight,
                 prefix=prefix,
@@ -1205,6 +1353,8 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
 
         model_state_dict[f"{prefix}.o_proj.weight"] = o_proj_weight
         if o_proj_scale is not None:
+            # Transpose block-wise scale if needed to match RowParallelLinear's storage format
+            o_proj_scale = transpose_blockwise_scale_if_needed(o_proj_weight, o_proj_scale)
             model_state_dict[f"{prefix}.o_proj.scale"] = o_proj_scale
             verify_scale_dimension(tensor=o_proj_weight, tensor_scale=o_proj_scale)
 

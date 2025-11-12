@@ -1,0 +1,216 @@
+====================================================================================================
+MiniMax-M2 Checkpoint Precision Analysis
+====================================================================================================
+
+📁 Found 125 safetensor file(s):
+  • model-00000-of-00130.safetensors
+  • model-00001-of-00130.safetensors
+  • model-00002-of-00130.safetensors
+  • model-00003-of-00130.safetensors
+  • model-00004-of-00130.safetensors
+  • model-00005-of-00130.safetensors
+  • model-00006-of-00130.safetensors
+  • model-00007-of-00130.safetensors
+  • model-00008-of-00130.safetensors
+  • model-00009-of-00130.safetensors
+  • model-00010-of-00130.safetensors
+  • model-00011-of-00130.safetensors
+  • model-00012-of-00130.safetensors
+  • model-00013-of-00130.safetensors
+  • model-00014-of-00130.safetensors
+  • model-00015-of-00130.safetensors
+  • model-00016-of-00130.safetensors
+  • model-00017-of-00130.safetensors
+  • model-00018-of-00130.safetensors
+  • model-00019-of-00130.safetensors
+  • model-00020-of-00130.safetensors
+  • model-00021-of-00130.safetensors
+  • model-00022-of-00130.safetensors
+  • model-00023-of-00130.safetensors
+  • model-00024-of-00130.safetensors
+  • model-00025-of-00130.safetensors
+  • model-00026-of-00130.safetensors
+  • model-00027-of-00130.safetensors
+  • model-00028-of-00130.safetensors
+  • model-00029-of-00130.safetensors
+  • model-00030-of-00130.safetensors
+  • model-00031-of-00130.safetensors
+  • model-00032-of-00130.safetensors
+  • model-00033-of-00130.safetensors
+  • model-00034-of-00130.safetensors
+  • model-00035-of-00130.safetensors
+  • model-00036-of-00130.safetensors
+  • model-00037-of-00130.safetensors
+  • model-00038-of-00130.safetensors
+  • model-00039-of-00130.safetensors
+  • model-00040-of-00130.safetensors
+  • model-00041-of-00130.safetensors
+  • model-00042-of-00130.safetensors
+  • model-00043-of-00130.safetensors
+  • model-00044-of-00130.safetensors
+  • model-00045-of-00130.safetensors
+  • model-00046-of-00130.safetensors
+  • model-00047-of-00130.safetensors
+  • model-00048-of-00130.safetensors
+  • model-00049-of-00130.safetensors
+  • model-00050-of-00130.safetensors
+  • model-00051-of-00130.safetensors
+  • model-00052-of-00130.safetensors
+  • model-00053-of-00130.safetensors
+  • model-00054-of-00130.safetensors
+  • model-00055-of-00130.safetensors
+  • model-00056-of-00130.safetensors
+  • model-00057-of-00130.safetensors
+  • model-00058-of-00130.safetensors
+  • model-00059-of-00130.safetensors
+  • model-00060-of-00130.safetensors
+  • model-00061-of-00130.safetensors
+  • model-00062-of-00130.safetensors
+  • model-00063-of-00130.safetensors
+  • model-00064-of-00130.safetensors
+  • model-00065-of-00130.safetensors
+  • model-00066-of-00130.safetensors
+  • model-00067-of-00130.safetensors
+  • model-00068-of-00130.safetensors
+  • model-00069-of-00130.safetensors
+  • model-00070-of-00130.safetensors
+  • model-00071-of-00130.safetensors
+  • model-00072-of-00130.safetensors
+  • model-00073-of-00130.safetensors
+  • model-00074-of-00130.safetensors
+  • model-00075-of-00130.safetensors
+  • model-00076-of-00130.safetensors
+  • model-00077-of-00130.safetensors
+  • model-00078-of-00130.safetensors
+  • model-00079-of-00130.safetensors
+  • model-00080-of-00130.safetensors
+  • model-00081-of-00130.safetensors
+  • model-00082-of-00130.safetensors
+  • model-00083-of-00130.safetensors
+  • model-00084-of-00130.safetensors
+  • model-00085-of-00130.safetensors
+  • model-00086-of-00130.safetensors
+  • model-00087-of-00130.safetensors
+  • model-00088-of-00130.safetensors
+  • model-00089-of-00130.safetensors
+  • model-00090-of-00130.safetensors
+  • model-00091-of-00130.safetensors
+  • model-00092-of-00130.safetensors
+  • model-00093-of-00130.safetensors
+  • model-00094-of-00130.safetensors
+  • model-00095-of-00130.safetensors
+  • model-00096-of-00130.safetensors
+  • model-00097-of-00130.safetensors
+  • model-00098-of-00130.safetensors
+  • model-00099-of-00130.safetensors
+  • model-00100-of-00130.safetensors
+  • model-00101-of-00130.safetensors
+  • model-00102-of-00130.safetensors
+  • model-00103-of-00130.safetensors
+  • model-00104-of-00130.safetensors
+  • model-00105-of-00130.safetensors
+  • model-00106-of-00130.safetensors
+  • model-00107-of-00130.safetensors
+  • model-00108-of-00130.safetensors
+  • model-00109-of-00130.safetensors
+  • model-00110-of-00130.safetensors
+  • model-00111-of-00130.safetensors
+  • model-00112-of-00130.safetensors
+  • model-00113-of-00130.safetensors
+  • model-00114-of-00130.safetensors
+  • model-00115-of-00130.safetensors
+  • model-00116-of-00130.safetensors
+  • model-00117-of-00130.safetensors
+  • model-00118-of-00130.safetensors
+  • model-00119-of-00130.safetensors
+  • model-00120-of-00130.safetensors
+  • model-00121-of-00130.safetensors
+  • model-00122-of-00130.safetensors
+  • model-00123-of-00130.safetensors
+  • model-00124-of-00130.safetensors
+
+🔍 Analyzing parameters...
+✓ Analyzed 96103 parameters
+
+====================================================================================================
+Data Type Distribution
+====================================================================================================
+  bfloat16            :    251 parameters (  0.3%)
+  float32             :  47988 parameters ( 49.9%)
+  float8_e4m3fn       :  47864 parameters ( 49.8%)
+
+====================================================================================================
+FP8 Quantization Status
+====================================================================================================
+✓ Found 47864 FP8 scale parameters (weight_scale_inv)
+  → Model has FP8 quantized weights
+
+  First 10 FP8 scale parameters:
+    • model.layers.0.block_sparse_moe.experts.0.w1.weight_scale_inv                    | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.0.w3.weight_scale_inv                    | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.1.w1.weight_scale_inv                    | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.1.w3.weight_scale_inv                    | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.10.w1.weight_scale_inv                   | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.10.w3.weight_scale_inv                   | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.100.w1.weight_scale_inv                  | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.100.w3.weight_scale_inv                  | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.101.w1.weight_scale_inv                  | dtype: float32    | shape: [12, 24]
+    • model.layers.0.block_sparse_moe.experts.101.w3.weight_scale_inv                  | dtype: float32    | shape: [12, 24]
+    ... and 47854 more
+
+====================================================================================================
+Layer-wise Precision Breakdown
+====================================================================================================
+
+📦 Embedding Layers (1 parameters):
+  • model.embed_tokens.weight                                                        | bfloat16   | shape: [200064, 3072]
+
+🔍 Attention Layers (Layer 0 as example):
+  • model.k_norm.weight                      | bfloat16   | shape: [1024]
+  • model.k_proj.weight                      | float8_e4m3fn | shape: [1024, 3072]
+  • model.k_proj.weight_scale_inv            | float32    | shape: [8, 24]
+  • model.o_proj.weight                      | float8_e4m3fn | shape: [3072, 6144]
+  • model.o_proj.weight_scale_inv            | float32    | shape: [24, 48]
+  • model.q_norm.weight                      | bfloat16   | shape: [6144]
+  • model.q_proj.weight                      | float8_e4m3fn | shape: [6144, 3072]
+  • model.q_proj.weight_scale_inv            | float32    | shape: [48, 24]
+  • model.v_proj.weight                      | float8_e4m3fn | shape: [1024, 3072]
+  • model.v_proj.weight_scale_inv            | float32    | shape: [8, 24]
+  → Attention precision: ['bfloat16', 'float32', 'float8_e4m3fn']
+  → Has FP8 scales: Yes
+
+🔀 MoE Expert Layers (Layer 0, Expert 0 as example):
+  • model.w1.weight                          | float8_e4m3fn | shape: [1536, 3072]
+  • model.w1.weight_scale_inv                | float32    | shape: [12, 24]
+  • model.w2.weight                          | float8_e4m3fn | shape: [3072, 1536]
+  • model.w2.weight_scale_inv                | float32    | shape: [24, 12]
+  • model.w3.weight                          | float8_e4m3fn | shape: [1536, 3072]
+  • model.w3.weight_scale_inv                | float32    | shape: [12, 24]
+  → MoE precision: ['float8_e4m3fn', 'float32']
+  → Has FP8 scales: Yes
+
+🎯 Router/Gate (Layer 0):
+  • model.gate.weight                        | float32    | shape: [256, 3072]
+
+📐 Normalization Layers (Layer 0 as example):
+  • model.input_layernorm.weight             | bfloat16   | shape: [3072]
+
+====================================================================================================
+Summary
+====================================================================================================
+
+📊 Parameter Type Breakdown:
+  • Embedding params: 1
+  • Attention params: 682
+  • MoE params: 95356
+  • Normalization params: 63
+  • Other params: 1
+  • Total: 96103
+
+🎯 Quantization Status:
+  ✓ Model IS FP8 quantized
+  • Found 47864 FP8 scale parameters
+  • Quantized modules: self_attn, moe_experts
+  • NOT quantized: gate, lm_head
+
+====================================================================================================
