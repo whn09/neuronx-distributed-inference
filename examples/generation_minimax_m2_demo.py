@@ -37,9 +37,9 @@ def generate(skip_compile=False):
             blockwise_matmul_config={
                 'use_torch_block_wise': True,
             },
-            # Enable FP8 quantization for MLP layers
-            # This automatically sets quantization_dtype="f8e4m3" and quantization_type="per_channel_symmetric"
-            quantized_mlp_kernel_enabled=True,
+            # Disable FP8 quantization (Neuron's quantization layer doesn't support block-wise quantization)
+            # FP8 weights will be auto-converted to bfloat16 by Neuron
+            quantized_mlp_kernel_enabled=False,
             # Specify modules that should NOT be quantized (matching HF config's quantization_config)
             # These modules don't have FP8 weights and scale parameters
             modules_to_not_convert=[
