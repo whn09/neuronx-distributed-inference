@@ -96,7 +96,7 @@ def generate(skip_compile=False):
 
 if __name__ == "__main__":
     # Step 1: Compile and save sharded checkpoint (run once, takes time)
-    # generate(skip_compile=False)
+    generate(skip_compile=False)
 
     # Step 2: After compilation, use this for fast loading
-    generate(skip_compile=True)
+    # generate(skip_compile=True)
