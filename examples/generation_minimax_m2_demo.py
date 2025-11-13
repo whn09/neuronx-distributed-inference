@@ -23,8 +23,8 @@ def generate(skip_compile=False):
         neuron_config = MoENeuronConfig(
             tp_degree=64,  # Must be multiple of num_key_value_heads=8
             # ep_degree=64,
-            # moe_tp_degree=16,
-            # moe_ep_degree=4,
+            # moe_tp_degree=1,
+            # moe_ep_degree=64,
             batch_size=1,
             max_context_length=1024,  # default: 128
             seq_len=1024,
@@ -37,18 +37,17 @@ def generate(skip_compile=False):
             blockwise_matmul_config={
                 'use_torch_block_wise': True,
             },
-            # # Disable FP8 quantization (Neuron's quantization layer doesn't support block-wise quantization)
-            # # FP8 weights will be auto-converted to bfloat16 by Neuron
-            # quantized_mlp_kernel_enabled=True,
-            # # Specify modules that should NOT be quantized (matching HF config's quantization_config)
-            # # These modules don't have FP8 weights and scale parameters
-            # modules_to_not_convert=[
-            #     "lm_head",
-            #     # Note: "gate" and "e_score_correction_bias" are already excluded in the model architecture
-            # ],
-            # # Disable fused_qkv when using FP8 quantization
-            # # FP8 quantization requires separate scale parameters for Q, K, V
-            # fused_qkv=False,
+            # quantized_mlp_kernel_enabled=False,  # Disable FP8 quantization (Neuron's quantization layer doesn't support block-wise quantization). FP8 weights will be auto-converted to bfloat16 by Neuron
+            quantized_mlp_kernel_enabled=True,
+            # Specify modules that should NOT be quantized (matching HF config's quantization_config)
+            # These modules don't have FP8 weights and scale parameters
+            modules_to_not_convert=[
+                "lm_head",
+                # Note: "gate" and "e_score_correction_bias" are already excluded in the model architecture
+            ],
+            # Disable fused_qkv when using FP8 quantization
+            # FP8 quantization requires separate scale parameters for Q, K, V
+            fused_qkv=False,
         )
         config = MiniMaxM2InferenceConfig(
             neuron_config,
