@@ -37,8 +37,11 @@ def generate(skip_compile=False):
             blockwise_matmul_config={
                 'use_torch_block_wise': True,
             },
+            quantized=True,
+            quantization_dtype='f8e4m3',  # Important: To use f8e4m3 for quantization, you must set the XLA_HANDLE_SPECIAL_SCALAR environment variable to 1.
+            quantization_type='per_tensor_symmetric',  # per_tensor_symmetric, per_channel_symmetric
             # quantized_mlp_kernel_enabled=False,  # Disable FP8 quantization (Neuron's quantization layer doesn't support block-wise quantization). FP8 weights will be auto-converted to bfloat16 by Neuron
-            quantized_mlp_kernel_enabled=True,
+            # quantized_mlp_kernel_enabled=True,
             # Specify modules that should NOT be quantized (matching HF config's quantization_config)
             # These modules don't have FP8 weights and scale parameters
             modules_to_not_convert=[
@@ -47,7 +50,7 @@ def generate(skip_compile=False):
             ],
             # Disable fused_qkv when using FP8 quantization
             # FP8 quantization requires separate scale parameters for Q, K, V
-            fused_qkv=False,
+            # fused_qkv=False,  # default: False
         )
         config = MiniMaxM2InferenceConfig(
             neuron_config,
