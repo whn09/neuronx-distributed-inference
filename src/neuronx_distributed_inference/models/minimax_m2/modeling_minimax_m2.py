@@ -143,38 +143,38 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
-    # Rename attention projection keys to match Neuron's GQA module expectations
-    # Neuron GQA expects: layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,scale}
-    # HF model has: layers.X.self_attn.{q,k,v}_proj.{weight,scale}
-    # NOTE: This must run AFTER FP8 scale conversion to capture both .weight and .scale
-    print("\n=== Renaming attention projections to add qkv_proj prefix ===")
-    param_name_list = list(neuron_state_dict.keys())
-    renamed_count = 0
-    weight_count = 0
-    scale_count = 0
-    for param_name in param_name_list:
-        new_param_name = None
-        # Add qkv_proj prefix to attention projections (handles both .weight and .scale)
-        if '.self_attn.q_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.q_proj.', '.self_attn.qkv_proj.q_proj.')
-        elif '.self_attn.k_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
-        elif '.self_attn.v_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
-        # Also handle o_proj
-        elif '.self_attn.o_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.o_proj.', '.self_attn.o_proj.o_proj.')
+    # # Rename attention projection keys to match Neuron's GQA module expectations
+    # # Neuron GQA expects: layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,scale}
+    # # HF model has: layers.X.self_attn.{q,k,v}_proj.{weight,scale}
+    # # NOTE: This must run AFTER FP8 scale conversion to capture both .weight and .scale
+    # print("\n=== Renaming attention projections to add qkv_proj prefix ===")
+    # param_name_list = list(neuron_state_dict.keys())
+    # renamed_count = 0
+    # weight_count = 0
+    # scale_count = 0
+    # for param_name in param_name_list:
+    #     new_param_name = None
+    #     # Add qkv_proj prefix to attention projections (handles both .weight and .scale)
+    #     if '.self_attn.q_proj.' in param_name:
+    #         new_param_name = param_name.replace('.self_attn.q_proj.', '.self_attn.qkv_proj.q_proj.')
+    #     elif '.self_attn.k_proj.' in param_name:
+    #         new_param_name = param_name.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
+    #     elif '.self_attn.v_proj.' in param_name:
+    #         new_param_name = param_name.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
+    #     # Also handle o_proj
+    #     elif '.self_attn.o_proj.' in param_name:
+    #         new_param_name = param_name.replace('.self_attn.o_proj.', '.self_attn.o_proj.o_proj.')
 
-        if new_param_name:
-            neuron_state_dict[new_param_name] = neuron_state_dict.pop(param_name)
-            renamed_count += 1
-            if param_name.endswith('.weight'):
-                weight_count += 1
-            elif param_name.endswith('.scale'):
-                scale_count += 1
-            if renamed_count <= 5:  # Print first 5
-                print(f"  Renamed: {param_name} -> {new_param_name}")
-    print(f"  Total renamed: {renamed_count} parameters ({weight_count} weights, {scale_count} scales)")
+    #     if new_param_name:
+    #         neuron_state_dict[new_param_name] = neuron_state_dict.pop(param_name)
+    #         renamed_count += 1
+    #         if param_name.endswith('.weight'):
+    #             weight_count += 1
+    #         elif param_name.endswith('.scale'):
+    #             scale_count += 1
+    #         if renamed_count <= 5:  # Print first 5
+    #             print(f"  Renamed: {param_name} -> {new_param_name}")
+    # print(f"  Total renamed: {renamed_count} parameters ({weight_count} weights, {scale_count} scales)")
 
     # Debug: Check if layer 0 qkv_proj keys exist
     print("\n=== Checking layer 0 attention keys ===")

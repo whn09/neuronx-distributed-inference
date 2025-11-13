@@ -26,29 +26,29 @@ def generate(skip_compile=False):
             # moe_tp_degree=16,
             # moe_ep_degree=4,
             batch_size=1,
-            max_context_length=128,
+            max_context_length=1024,  # default: 128
             seq_len=1024,
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
             flash_decoding_enabled=False,
-            save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
+            # save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
             # Use torch implementation to bypass NKI kernel's DGE limitation
             # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
             blockwise_matmul_config={
                 'use_torch_block_wise': True,
             },
-            # Disable FP8 quantization (Neuron's quantization layer doesn't support block-wise quantization)
-            # FP8 weights will be auto-converted to bfloat16 by Neuron
-            quantized_mlp_kernel_enabled=False,
-            # Specify modules that should NOT be quantized (matching HF config's quantization_config)
-            # These modules don't have FP8 weights and scale parameters
-            modules_to_not_convert=[
-                "lm_head",
-                # Note: "gate" and "e_score_correction_bias" are already excluded in the model architecture
-            ],
-            # Disable fused_qkv when using FP8 quantization
-            # FP8 quantization requires separate scale parameters for Q, K, V
-            fused_qkv=False,
+            # # Disable FP8 quantization (Neuron's quantization layer doesn't support block-wise quantization)
+            # # FP8 weights will be auto-converted to bfloat16 by Neuron
+            # quantized_mlp_kernel_enabled=True,
+            # # Specify modules that should NOT be quantized (matching HF config's quantization_config)
+            # # These modules don't have FP8 weights and scale parameters
+            # modules_to_not_convert=[
+            #     "lm_head",
+            #     # Note: "gate" and "e_score_correction_bias" are already excluded in the model architecture
+            # ],
+            # # Disable fused_qkv when using FP8 quantization
+            # # FP8 quantization requires separate scale parameters for Q, K, V
+            # fused_qkv=False,
         )
         config = MiniMaxM2InferenceConfig(
             neuron_config,
@@ -96,7 +96,7 @@ def generate(skip_compile=False):
 
 if __name__ == "__main__":
     # Step 1: Compile and save sharded checkpoint (run once, takes time)
-    generate(skip_compile=False)
+    # generate(skip_compile=False)
 
     # Step 2: After compilation, use this for fast loading
-    # generate(skip_compile=True)
+    generate(skip_compile=True)
