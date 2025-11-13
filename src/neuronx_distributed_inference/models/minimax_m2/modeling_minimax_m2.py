@@ -206,7 +206,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
             del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
 
         # Copy router weights from block_sparse_moe
-        neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
+        neuron_state_dict[f"layers.{l}.block_sparse_moe.router.linear_router.weight"] = (
             neuron_state_dict[f"layers.{l}.block_sparse_moe.gate.weight"].detach().clone()
         )
         del neuron_state_dict[f"layers.{l}.block_sparse_moe.gate.weight"]
@@ -252,7 +252,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
 
             del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w1.weight"]
             del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w3.weight"]
-        neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
+        neuron_state_dict[f"layers.{l}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
 
         down_proj = torch.empty(
             config.num_local_experts,
@@ -271,7 +271,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
             down_proj_slice = torch.narrow(down_proj, 0, e, 1)
             down_proj_slice.copy_(down_proj_weights)
             del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w2.weight"]
-        neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+        neuron_state_dict[f"layers.{l}.block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
         gc.collect()
 
@@ -431,7 +431,7 @@ class NeuronMiniMaxM2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronMiniMaxM2Attention(config=config)
 
-        self.mlp = initialize_moe_module(config=config)
+        self.block_sparse_moe = initialize_moe_module(config=config)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
@@ -482,7 +482,7 @@ class NeuronMiniMaxM2DecoderLayer(nn.Module):
         # MoE
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)[0]
+        hidden_states = self.block_sparse_moe(hidden_states)[0]
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
