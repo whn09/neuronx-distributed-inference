@@ -6,8 +6,11 @@ from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDevic
 from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2 import MiniMaxM2InferenceConfig, NeuronMiniMaxM2ForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 
-model_path = "/home/ubuntu/model_hf/MiniMax-M2/"
-traced_model_path = "/home/ubuntu/traced_model/MiniMax-M2/"
+# Use BF16 checkpoint (converted from FP8 on GPU)
+model_path = "/home/ubuntu/model_hf/MiniMax-M2-BF16/"
+# Original FP8 checkpoint:
+# model_path = "/home/ubuntu/model_hf/MiniMax-M2/"
+traced_model_path = "/home/ubuntu/traced_model/MiniMax-M2-BF16-weights/"
 
 torch.manual_seed(0)
 
@@ -37,17 +40,9 @@ def generate(skip_compile=False):
             blockwise_matmul_config={
                 'use_torch_block_wise': True,
             },
-            quantized=True,
-            quantization_dtype='f8e4m3',  # Important: To use f8e4m3 for quantization, you must set the XLA_HANDLE_SPECIAL_SCALAR environment variable to 1.
-            quantization_type='per_tensor_symmetric',  # per_tensor_symmetric, per_channel_symmetric
-            # quantized_mlp_kernel_enabled=False,  # Disable FP8 quantization (Neuron's quantization layer doesn't support block-wise quantization). FP8 weights will be auto-converted to bfloat16 by Neuron
-            # quantized_mlp_kernel_enabled=True,
-            # Specify modules that should NOT be quantized (matching HF config's quantization_config)
-            # These modules don't have FP8 weights and scale parameters
-            modules_to_not_convert=[
-                "lm_head",
-                # Note: "gate" and "e_score_correction_bias" are already excluded in the model architecture
-            ],
+            # Dequantize FP8 weights to bfloat16 (quantized_mlp_kernel_enabled=False)
+            # This avoids scale sharding issues with block-wise quantization
+            # quantized_mlp_kernel_enabled=False,
             # Disable fused_qkv when using FP8 quantization
             # FP8 quantization requires separate scale parameters for Q, K, V
             # fused_qkv=False,  # default: False
@@ -70,8 +65,41 @@ def generate(skip_compile=False):
     model.load(traced_model_path)
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
 
+    # Debug: Check if model weights are loaded correctly
+    print("\n=== Debug: Checking loaded model ===")
+    print(f"Model type: {type(model)}")
+    print(f"Model attributes: {[attr for attr in dir(model) if not attr.startswith('_')][:20]}")
+    print(f"Model config neuron_config.quantized: {model.config.neuron_config.quantized}")
+    print(f"Model config neuron_config.quantized_mlp_kernel_enabled: {model.config.neuron_config.quantized_mlp_kernel_enabled}")
+    print(f"Model config torch_dtype: {model.config.neuron_config.torch_dtype}")
+
+    # Check a sample weight - try different possible structures
+    try:
+        if hasattr(model, 'model'):
+            sample_weight = model.model.layers[0].self_attn.qkv_proj.q_proj.weight
+        elif hasattr(model, 'models'):
+            print(f"Model has 'models' attribute with {len(model.models)} model(s)")
+            sample_weight = model.models[0].layers[0].self_attn.qkv_proj.q_proj.weight
+        else:
+            print("Could not access model layers - skipping weight check")
+            sample_weight = None
+
+        if sample_weight is not None:
+            print(f"\nSample weight (layers.0.self_attn.qkv_proj.q_proj.weight):")
+            print(f"  dtype: {sample_weight.dtype}")
+            print(f"  shape: {sample_weight.shape}")
+            print(f"  device: {sample_weight.device}")
+            if sample_weight.device.type == 'cpu':
+                print(f"  value range: [{sample_weight.min():.6f}, {sample_weight.max():.6f}]")
+                print(f"  mean: {sample_weight.float().mean():.6f}")
+                print(f"  std: {sample_weight.float().std():.6f}")
+            else:
+                print(f"  (weight is on Neuron device, cannot inspect values)")
+    except Exception as e:
+        print(f"Error checking weights: {e}")
+
     # Generate outputs.
-    print("\nGenerating outputs...")
+    print("\n=== Generating outputs ===")
     prompt = "Give me a short introduction to large language models."
     messages = [
         {"role": "user", "content": prompt}
@@ -82,18 +110,30 @@ def generate(skip_compile=False):
         add_generation_prompt=True,
         enable_thinking=True # Switches between thinking and non-thinking modes if supported.
     )
+    print(f"Formatted prompt (first 200 chars): {text[:200]}...")
+
     inputs = tokenizer([text], padding=True, return_tensors="pt")
+    print(f"Input token IDs shape: {inputs.input_ids.shape}")
+    print(f"Input token IDs (first 10): {inputs.input_ids[0, :10].tolist()}")
+
     generation_model = HuggingFaceGenerationAdapter(model)
+    print(f"\nGenerating with max_length={model.config.neuron_config.max_length}...")
+
     outputs = generation_model.generate(
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
         max_length=model.config.neuron_config.max_length,
     )
+    print(f"Output token IDs shape: {outputs.shape}")
+    print(f"Output token IDs (first 20): {outputs[0, :20].tolist()}")
+
     output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    print("Generated outputs:")
+    print("\n=== Generated outputs ===")
     for i, output_token in enumerate(output_tokens):
-        print(f"Output {i}: {output_token}")
+        print(f"Output {i} (first 500 chars):\n{output_token[:500]}...")
+        if len(output_token) > 500:
+            print(f"...(total length: {len(output_token)} chars)")
 
 
 if __name__ == "__main__":

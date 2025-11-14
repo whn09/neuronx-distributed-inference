@@ -99,82 +99,132 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     """
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
 
-    # Debug: Check what keys are in the state_dict
-    print("\n=== DEBUG: Checking state_dict keys ===")
-    all_keys = list(neuron_state_dict.keys())
-    print(f"  Total keys in state_dict: {len(all_keys)}")
+    # # Debug: Check what keys are in the state_dict
+    # print("\n=== DEBUG: Checking state_dict keys ===")
+    # all_keys = list(neuron_state_dict.keys())
+    # print(f"  Total keys in state_dict: {len(all_keys)}")
 
-    # Check for weight_scale_inv keys
-    scale_inv_keys = [k for k in all_keys if 'weight_scale_inv' in k]
-    print(f"  Keys with 'weight_scale_inv': {len(scale_inv_keys)}")
-    if scale_inv_keys:
-        print(f"  First 5 weight_scale_inv keys:")
-        for k in scale_inv_keys[:5]:
-            print(f"    {k}")
+    # # Check for weight_scale_inv keys
+    # scale_inv_keys = [k for k in all_keys if 'weight_scale_inv' in k]
+    # print(f"  Keys with 'weight_scale_inv': {len(scale_inv_keys)}")
+    # if scale_inv_keys:
+    #     print(f"  First 5 weight_scale_inv keys:")
+    #     for k in scale_inv_keys[:5]:
+    #         print(f"    {k}")
 
-    # Check layer 0 self_attn keys
-    layer0_attn = [k for k in all_keys if k.startswith('layers.0.self_attn.')]
-    print(f"  Layer 0 self_attn keys: {len(layer0_attn)}")
-    for k in sorted(layer0_attn)[:10]:
-        print(f"    {k}")
+    # # Check layer 0 self_attn keys
+    # layer0_attn = [k for k in all_keys if k.startswith('layers.0.self_attn.')]
+    # print(f"  Layer 0 self_attn keys: {len(layer0_attn)}")
+    # for k in sorted(layer0_attn)[:10]:
+    #     print(f"    {k}")
 
-    # Handle FP8 scale parameters: rename weight_scale_inv to scale
-    # MiniMax M2 uses weight_scale_inv for FP8 quantized weights
-    # Note: modules_to_not_convert (gate, e_score_correction_bias, lm_head) don't have scale params
-    if config.neuron_config.quantized_mlp_kernel_enabled or config.neuron_config.quantized:
-        print("\n=== Converting FP8 scale parameters ===")
-        param_name_list = list(neuron_state_dict.keys())
-        scale_count = 0
-        for param_name in param_name_list:
-            if param_name.endswith(".weight_scale_inv"):
-                # Convert weight_scale_inv to scale
-                new_param_name = param_name.replace(".weight_scale_inv", ".scale")
-                # Note: weight_scale_inv is the inverse of scale, so we need to compute 1/x
-                scale_inv = neuron_state_dict[param_name]
-                neuron_state_dict[new_param_name] = 1.0 / scale_inv
-                del neuron_state_dict[param_name]
-                scale_count += 1
-                if scale_count <= 3:  # Print first 3
-                    print(f"  Converted: {param_name} -> {new_param_name}")
-        print(f"  Total converted: {scale_count} FP8 scale parameters")
+    # # Handle FP8 quantized weights
+    # # MiniMax M2 uses FP8 (float8_e4m3fn) weights with weight_scale_inv parameters
+    # print("\n=== Processing FP8 quantized weights ===")
+
+    # # Check if we should use FP8 compute or dequantize to bfloat16
+    # use_fp8_compute = config.neuron_config.quantized_mlp_kernel_enabled
+
+    # if use_fp8_compute:
+    #     # Keep FP8 weights and convert scale parameters
+    #     print("  Mode: FP8 compute (quantized_mlp_kernel_enabled=True)")
+    #     param_name_list = list(neuron_state_dict.keys())
+    #     scale_count = 0
+    #     for param_name in param_name_list:
+    #         if param_name.endswith(".weight_scale_inv"):
+    #             # Convert weight_scale_inv to scale
+    #             # Note: Despite the name, weight_scale_inv is actually the scale itself!
+    #             new_param_name = param_name.replace(".weight_scale_inv", ".scale")
+    #             neuron_state_dict[new_param_name] = neuron_state_dict[param_name]
+    #             del neuron_state_dict[param_name]
+    #             scale_count += 1
+    #             if scale_count <= 3:
+    #                 print(f"    Converted: {param_name} -> {new_param_name}")
+    #     print(f"  Total converted: {scale_count} FP8 scale parameters")
+    # else:
+    #     # Dequantize FP8 weights to bfloat16
+    #     print("  Mode: Dequantize to bfloat16 (quantized_mlp_kernel_enabled=False)")
+    #     param_name_list = list(neuron_state_dict.keys())
+    #     dequant_count = 0
+
+    #     for param_name in param_name_list:
+    #         if param_name.endswith(".weight") and param_name.replace(".weight", ".weight_scale_inv") in neuron_state_dict:
+    #             weight = neuron_state_dict[param_name]
+    #             scale_inv_name = param_name.replace(".weight", ".weight_scale_inv")
+
+    #             if weight.dtype == torch.float8_e4m3fn:
+    #                 # Get scale parameter
+    #                 # Note: Despite the name "weight_scale_inv", it's actually the scale itself!
+    #                 scale = neuron_state_dict[scale_inv_name]
+
+    #                 # Dequantize: FP8 -> float32 (with scale) -> bfloat16
+    #                 weight_float = weight.float()
+
+    #                 # Block-wise dequantization
+    #                 # Scale shape: [scale_h, scale_w], Weight shape: [weight_h, weight_w]
+    #                 # Each block is [weight_h/scale_h, weight_w/scale_w]
+    #                 scale_h, scale_w = scale.shape
+    #                 weight_h, weight_w = weight.shape
+    #                 block_h = weight_h // scale_h
+    #                 block_w = weight_w // scale_w
+
+    #                 dequantized_weight = torch.empty_like(weight_float)
+    #                 for i in range(scale_h):
+    #                     for j in range(scale_w):
+    #                         block_scale = scale[i, j]
+    #                         h_start, h_end = i * block_h, (i + 1) * block_h
+    #                         w_start, w_end = j * block_w, (j + 1) * block_w
+    #                         dequantized_weight[h_start:h_end, w_start:w_end] = weight_float[h_start:h_end, w_start:w_end] * block_scale
+
+    #                 # Convert to bfloat16 and update state dict
+    #                 neuron_state_dict[param_name] = dequantized_weight.to(torch.bfloat16)
+
+    #                 # Remove scale parameter
+    #                 del neuron_state_dict[scale_inv_name]
+
+    #                 dequant_count += 1
+    #                 if dequant_count <= 3:
+    #                     print(f"    Dequantized: {param_name} (FP8 -> bfloat16)")
+
+    #     print(f"  Total dequantized: {dequant_count} FP8 weights")
 
     # to facilitate rank usage in base model
     neuron_state_dict["rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
-    # # Rename attention projection keys to match Neuron's GQA module expectations
-    # # Neuron GQA expects: layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,scale}
-    # # HF model has: layers.X.self_attn.{q,k,v}_proj.{weight,scale}
-    # # NOTE: This must run AFTER FP8 scale conversion to capture both .weight and .scale
-    # print("\n=== Renaming attention projections to add qkv_proj prefix ===")
-    # param_name_list = list(neuron_state_dict.keys())
-    # renamed_count = 0
-    # weight_count = 0
-    # scale_count = 0
-    # for param_name in param_name_list:
-    #     new_param_name = None
-    #     # Add qkv_proj prefix to attention projections (handles both .weight and .scale)
-    #     if '.self_attn.q_proj.' in param_name:
-    #         new_param_name = param_name.replace('.self_attn.q_proj.', '.self_attn.qkv_proj.q_proj.')
-    #     elif '.self_attn.k_proj.' in param_name:
-    #         new_param_name = param_name.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
-    #     elif '.self_attn.v_proj.' in param_name:
-    #         new_param_name = param_name.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
-    #     # Also handle o_proj
-    #     elif '.self_attn.o_proj.' in param_name:
-    #         new_param_name = param_name.replace('.self_attn.o_proj.', '.self_attn.o_proj.o_proj.')
+    # Rename attention projection keys to match Neuron's GQA module expectations
+    # Neuron GQA expects: layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,scale}
+    # HF model has: layers.X.self_attn.{q,k,v}_proj.{weight,scale}
+    # NOTE: This must run AFTER FP8 scale conversion to capture both .weight and .scale
+    print("\n=== Renaming attention projections to add qkv_proj prefix ===")
+    param_name_list = list(neuron_state_dict.keys())
+    renamed_count = 0
+    weight_count = 0
+    scale_count = 0
+    for param_name in param_name_list:
+        new_param_name = None
+        # Add qkv_proj prefix to attention projections (handles both .weight and .scale)
+        if '.self_attn.q_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.q_proj.', '.self_attn.qkv_proj.q_proj.')
+        elif '.self_attn.k_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
+        elif '.self_attn.v_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
+        # Also handle o_proj
+        elif '.self_attn.o_proj.' in param_name:
+            new_param_name = param_name.replace('.self_attn.o_proj.', '.self_attn.o_proj.o_proj.')
 
-    #     if new_param_name:
-    #         neuron_state_dict[new_param_name] = neuron_state_dict.pop(param_name)
-    #         renamed_count += 1
-    #         if param_name.endswith('.weight'):
-    #             weight_count += 1
-    #         elif param_name.endswith('.scale'):
-    #             scale_count += 1
-    #         if renamed_count <= 5:  # Print first 5
-    #             print(f"  Renamed: {param_name} -> {new_param_name}")
-    # print(f"  Total renamed: {renamed_count} parameters ({weight_count} weights, {scale_count} scales)")
+        if new_param_name:
+            neuron_state_dict[new_param_name] = neuron_state_dict.pop(param_name)
+            renamed_count += 1
+            if param_name.endswith('.weight'):
+                weight_count += 1
+            elif param_name.endswith('.scale'):
+                scale_count += 1
+            if renamed_count <= 5:  # Print first 5
+                print(f"  Renamed: {param_name} -> {new_param_name}")
+    print(f"  Total renamed: {renamed_count} parameters ({weight_count} weights, {scale_count} scales)")
 
     # Debug: Check if layer 0 qkv_proj keys exist
     print("\n=== Checking layer 0 attention keys ===")
@@ -254,6 +304,44 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
             del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w3.weight"]
         neuron_state_dict[f"layers.{l}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
 
+        # # Merge scale parameters for FP8 quantization (if present)
+        # # Check if scale parameters exist (after weight_scale_inv -> scale conversion)
+        # if l == 0:  # Debug: print for first layer
+        #     print(f"\n=== DEBUG: Checking scale parameters for layer {l} ===")
+        #     has_w1_scale = f"layers.{l}.block_sparse_moe.experts.0.w1.scale" in neuron_state_dict
+        #     print(f"  Has w1.scale: {has_w1_scale}")
+        #     if has_w1_scale:
+        #         scale_shape = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w1.scale"].shape
+        #         print(f"  w1.scale shape: {scale_shape}")
+
+        # if f"layers.{l}.block_sparse_moe.experts.0.w1.scale" in neuron_state_dict:
+        #     # Get scale shape from first expert
+        #     scale_h, scale_w = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w1.scale"].shape
+        #     scale_device = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w1.scale"].device
+        #     scale_dtype = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w1.scale"].dtype
+
+        #     # Merge gate_up_proj scales (concatenate w1 and w3 scales)
+        #     gate_up_proj_scale = torch.empty(
+        #         config.num_local_experts,
+        #         scale_h,
+        #         2 * scale_w,
+        #         dtype=scale_dtype,
+        #         device=scale_device,
+        #     )
+        #     for e in range(config.num_local_experts):
+        #         w1_scale = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w1.scale"]
+        #         w3_scale = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w3.scale"]
+
+        #         gate_up_proj_scale_slice = torch.narrow(gate_up_proj_scale, 0, e, 1)
+        #         gate_scale_slice = torch.narrow(gate_up_proj_scale_slice, 2, 0, scale_w)
+        #         gate_scale_slice.copy_(w1_scale)
+        #         up_scale_slice = torch.narrow(gate_up_proj_scale_slice, 2, scale_w, scale_w)
+        #         up_scale_slice.copy_(w3_scale)
+
+        #         del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w1.scale"]
+        #         del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w3.scale"]
+        #     neuron_state_dict[f"layers.{l}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"] = gate_up_proj_scale
+
         down_proj = torch.empty(
             config.num_local_experts,
             intermediate_size,
@@ -272,6 +360,27 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
             down_proj_slice.copy_(down_proj_weights)
             del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w2.weight"]
         neuron_state_dict[f"layers.{l}.block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+
+        # # Merge down_proj scale parameters for FP8 quantization (if present)
+        # if f"layers.{l}.block_sparse_moe.experts.0.w2.scale" in neuron_state_dict:
+        #     # Get scale shape from first expert
+        #     scale_h, scale_w = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w2.scale"].shape
+        #     scale_device = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w2.scale"].device
+        #     scale_dtype = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w2.scale"].dtype
+
+        #     down_proj_scale = torch.empty(
+        #         config.num_local_experts,
+        #         scale_h,
+        #         scale_w,
+        #         dtype=scale_dtype,
+        #         device=scale_device,
+        #     )
+        #     for e in range(config.num_local_experts):
+        #         w2_scale = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w2.scale"]
+        #         down_proj_scale_slice = torch.narrow(down_proj_scale, 0, e, 1)
+        #         down_proj_scale_slice.copy_(w2_scale)
+        #         del neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.{e}.w2.scale"]
+        #     neuron_state_dict[f"layers.{l}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"] = down_proj_scale
 
         gc.collect()
 
@@ -548,7 +657,8 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         from safetensors import safe_open
         import json
         
-        model_name_or_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
+        # model_name_or_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
+        model_name_or_path = '/home/ubuntu/model_hf/MiniMax-M2-BF16/'  # TODO Set to a fixed path
 
         print(f"\n=== CUSTOM get_state_dict CALLED ===")
         print(f"  model_name_or_path: {model_name_or_path}")
@@ -579,16 +689,16 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
 
                 print(f"  Loaded {len(model_sd)} parameters from {len(shard_files)} shards")
 
-                # Check for scale parameters BEFORE any conversion
-                weight_scale_inv_keys = [k for k in model_sd.keys() if 'weight_scale_inv' in k]
-                print(f"  Found {len(weight_scale_inv_keys)} parameters with 'weight_scale_inv'")
-                if weight_scale_inv_keys:
-                    print(f"  First 3 weight_scale_inv keys:")
-                    for k in weight_scale_inv_keys[:3]:
-                        print(f"    {k}")
+                # # Check for scale parameters BEFORE any conversion
+                # weight_scale_inv_keys = [k for k in model_sd.keys() if 'weight_scale_inv' in k]
+                # print(f"  Found {len(weight_scale_inv_keys)} parameters with 'weight_scale_inv'")
+                # if weight_scale_inv_keys:
+                #     print(f"  First 3 weight_scale_inv keys:")
+                #     for k in weight_scale_inv_keys[:3]:
+                #         print(f"    {k}")
 
-                scale_keys = [k for k in model_sd.keys() if 'scale' in k and 'weight_scale_inv' not in k]
-                print(f"  Found {len(scale_keys)} parameters with 'scale' (excluding weight_scale_inv)")
+                # scale_keys = [k for k in model_sd.keys() if 'scale' in k and 'weight_scale_inv' not in k]
+                # print(f"  Found {len(scale_keys)} parameters with 'scale' (excluding weight_scale_inv)")
             else:
                 # Fall back to standard loading for non-sharded models
                 from neuronx_distributed_inference.modules.checkpoint import load_state_dict
@@ -602,8 +712,8 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
                     updated_param_name = param_name.replace(
                         cls._STATE_DICT_MODEL_PREFIX, cls._NEW_STATE_DICT_MODEL_PREFIX, 1
                     )
-                if param_name.endswith(".weight_scale"):
-                    updated_param_name = updated_param_name.replace(".weight_scale", ".scale")
+                # if param_name.endswith(".weight_scale"):
+                #     updated_param_name = updated_param_name.replace(".weight_scale", ".scale")
                 if updated_param_name != param_name:
                     model_sd[updated_param_name] = model_sd[param_name]
                     del model_sd[param_name]
@@ -631,7 +741,8 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
 
         print('model_path:', model_path)
         print('kwargs:', kwargs)
-        model_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
+        # model_path = '/home/ubuntu/model_hf/MiniMax-M2/'  # TODO Set to a fixed path
+        model_path = '/home/ubuntu/model_hf/MiniMax-M2-BF16/'  # TODO Set to a fixed path
 
         # For FP8 quantized models, transformers will check for GPU/XPU even with device_map="cpu"
         # We need to temporarily remove quantization_config from config.json to bypass the check
