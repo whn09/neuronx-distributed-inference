@@ -3,14 +3,14 @@ import torch
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
-from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2 import MiniMaxM2InferenceConfig, NeuronMiniMaxM2ForCausalLM
+from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_v2 import MiniMaxM2InferenceConfig, NeuronMiniMaxM2ForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 
 # Use BF16 checkpoint (converted from FP8 on GPU)
 model_path = "/home/ubuntu/model_hf/MiniMax-M2-BF16/"
 # Original FP8 checkpoint:
 # model_path = "/home/ubuntu/model_hf/MiniMax-M2/"
-traced_model_path = "/home/ubuntu/traced_model/MiniMax-M2-BF16-weights/"
+traced_model_path = "/home/ubuntu/traced_model/MiniMax-M2-BF16-weights-v2/"
 
 torch.manual_seed(0)
 
@@ -50,17 +50,17 @@ def generate(skip_compile=False):
         config = MiniMaxM2InferenceConfig(
             neuron_config,
             load_config=load_pretrained_config(model_path),
-        )      
+        )
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
         tokenizer.pad_token = tokenizer.eos_token
         # Compile and save model.
-        print("\nCompiling and saving model...")
+        print("\nCompiling and saving model (V2 - QK norm disabled)...")
         model = NeuronMiniMaxM2ForCausalLM(model_path, config)
         model.compile(traced_model_path)
         tokenizer.save_pretrained(traced_model_path)
 
     # Load from compiled checkpoint.
-    print("\nLoading model from compiled checkpoint...")
+    print("\nLoading model from compiled checkpoint (V2)...")
     model = NeuronMiniMaxM2ForCausalLM(traced_model_path)
     model.load(traced_model_path)
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
@@ -138,7 +138,7 @@ def generate(skip_compile=False):
 
 if __name__ == "__main__":
     # Step 1: Compile and save sharded checkpoint (run once, takes time)
-    # generate(skip_compile=False)
+    generate(skip_compile=False)
 
     # Step 2: After compilation, use this for fast loading
-    generate(skip_compile=True)
+    # generate(skip_compile=True)

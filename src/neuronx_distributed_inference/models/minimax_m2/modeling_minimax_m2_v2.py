@@ -233,28 +233,15 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         print(f"  {key}")
 
     for l in range(config.num_hidden_layers):  # noqa: E741
-        # Handle QK norm if present
+        # V2: Skip QK norm conversion - per-head QK norm is incompatible with Neuron's shared norm
+        # MiniMax M2 has per-head QK norm [num_heads * head_dim], but Neuron expects shared [head_dim]
+        # For now, we delete the per-head norm weights and disable QK norm
         if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
-            # MiniMax M2 uses per-head QK norm: [num_heads, head_dim]
-            # Neuron expects shared QK norm: [head_dim]
-            # We average across all heads to convert per-head to shared
-
-            # k_norm: [num_kv_heads * head_dim] -> [head_dim]
-            # Try using the first head instead of averaging (averaging might lose important information)
-            k_norm_full = neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
-            k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)
-            neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
-                k_norm_reshaped[0].detach().clone()  # Use first head instead of mean
-            )
-            del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
-
-            # q_norm: [num_attention_heads * head_dim] -> [head_dim]
-            q_norm_full = neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
-            q_norm_reshaped = q_norm_full.reshape(config.num_attention_heads, config.head_dim)
-            neuron_state_dict[f"layers.{l}.self_attn.q_layernorm.weight"] = (
-                q_norm_reshaped[0].detach().clone()  # Use first head instead of mean
-            )
-            del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
+            # Delete per-head QK norm weights
+            if f"layers.{l}.self_attn.k_norm.weight" in neuron_state_dict:
+                del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
+            if f"layers.{l}.self_attn.q_norm.weight" in neuron_state_dict:
+                del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
 
         # Copy router weights from block_sparse_moe
         neuron_state_dict[f"layers.{l}.block_sparse_moe.router.linear_router.weight"] = (
@@ -462,11 +449,12 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             use_qk_norm=False,
         )
 
-        # Override q_layernorm and k_layernorm with RMSNorm if use_qk_norm is enabled
-        use_qk_norm = getattr(config, 'use_qk_norm', False)
-        if use_qk_norm:
-            self.q_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
-            self.k_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
+        # V2: Disable QK norm for now (testing if this is the source of garbled output)
+        # MiniMax M2 has per-head norm [num_heads * head_dim], not shared norm [head_dim]
+        # Neuron's base class expects shared norm, which is incompatible
+        # TODO: Implement proper per-head QK norm if needed
+        self.q_norm = None
+        self.k_norm = None
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(

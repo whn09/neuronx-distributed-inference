@@ -24,7 +24,8 @@ def generate(skip_compile=False):
             seq_len=1024,
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
-            flash_decoding_enabled=False
+            flash_decoding_enabled=False,
+            save_sharded_checkpoint=True
         )
         config = Qwen3MoeInferenceConfig(
             neuron_config,
