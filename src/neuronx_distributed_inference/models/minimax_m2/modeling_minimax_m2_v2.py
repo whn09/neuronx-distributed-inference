@@ -233,15 +233,10 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         print(f"  {key}")
 
     for l in range(config.num_hidden_layers):  # noqa: E741
-        # V2: Skip QK norm conversion - per-head QK norm is incompatible with Neuron's shared norm
-        # MiniMax M2 has per-head QK norm [num_heads * head_dim], but Neuron expects shared [head_dim]
-        # For now, we delete the per-head norm weights and disable QK norm
-        if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
-            # Delete per-head QK norm weights
-            if f"layers.{l}.self_attn.k_norm.weight" in neuron_state_dict:
-                del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
-            if f"layers.{l}.self_attn.q_norm.weight" in neuron_state_dict:
-                del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
+        # V2: Keep per-head QK norm weights (don't delete them!)
+        # MiniMax M2 has per-head QK norm [num_heads * head_dim]
+        # We handle this correctly in NeuronMiniMaxM2Attention.prepare_qkv_for_forward
+        # No conversion needed - just keep the weights as-is
 
         # Copy router weights from block_sparse_moe
         neuron_state_dict[f"layers.{l}.block_sparse_moe.router.linear_router.weight"] = (
@@ -449,12 +444,23 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             use_qk_norm=False,
         )
 
-        # V2: Disable QK norm for now (testing if this is the source of garbled output)
+        # V2: Implement per-head QK norm correctly
         # MiniMax M2 has per-head norm [num_heads * head_dim], not shared norm [head_dim]
-        # Neuron's base class expects shared norm, which is incompatible
-        # TODO: Implement proper per-head QK norm if needed
-        self.q_norm = None
-        self.k_norm = None
+        # We apply norm AFTER projection but BEFORE reshape
+        use_qk_norm = getattr(config, 'use_qk_norm', False)
+        if use_qk_norm:
+            # Create per-head norm (same as GPU version)
+            self.q_norm = get_rmsnorm_cls()(
+                config.num_attention_heads * config.head_dim,  # [6144]
+                self.rms_norm_eps
+            )
+            self.k_norm = get_rmsnorm_cls()(
+                config.num_key_value_heads * config.head_dim,  # [1024]
+                self.rms_norm_eps
+            )
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
@@ -517,6 +523,58 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
                 Q, K = Q.transpose(1, 2), K.transpose(1, 2)
 
         return Q, K, cos_cache, sin_cache
+
+    def prepare_qkv_for_forward(
+        self,
+        hidden_states,
+        position_ids,
+        past_key_value=None,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+        skip_rope=False,
+        residual=None,
+        use_polar_compatible_rope=False,
+    ):
+        """Override to apply per-head QK norm before reshape.
+
+        This method is called from NeuronAttentionBase to prepare Q, K, V tensors.
+        The key difference is applying per-head norm AFTER projection but BEFORE reshape.
+        """
+        # Get Q, K, V from projection (shape: [B, S, num_heads * head_dim])
+        Q, K, V, residual = self.get_qkv_proj()(
+            hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids, residual=residual
+        )
+
+        # V2: Apply per-head QK norm BEFORE reshape (like GPU version)
+        # This is the key fix! MiniMax M2 needs per-head norm applied here.
+        if hasattr(self, 'q_norm') and self.q_norm is not None:
+            Q = self.q_norm(Q)  # [B, S, 6144] -> [B, S, 6144]
+        if hasattr(self, 'k_norm') and self.k_norm is not None:
+            K = self.k_norm(K)  # [B, S, 1024] -> [B, S, 1024]
+
+        # Now reshape and continue with base class logic
+        # Note: We set q_layernorm=None and k_layernorm=None to prevent double normalization
+        bsz, q_len, _ = hidden_states.size()
+        if self.sequence_parallel_enabled:
+            q_len *= self.tensor_model_parallel_group.size()
+
+        # Import here to avoid circular dependency
+        from neuronx_distributed_inference.modules.attention.utils import move_heads_front
+
+        # Reshape without applying shared norm (layernorm=None)
+        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=None)
+        K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+
+        if not skip_rope:
+            # Apply rotary embeddings
+            Q, K, cos_cache, sin_cache = self.apply_rotary_embedding(
+                Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
+            )
+
+        return Q, K, V, cos_cache, sin_cache, residual
 
 
 class NeuronMiniMaxM2DecoderLayer(nn.Module):
