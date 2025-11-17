@@ -23,6 +23,7 @@ from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_v2 impo
     NeuronMiniMaxM2ForCausalLM
 )
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
+from neuronx_distributed_inference.models.model_base import get_layer_hidden_states
 
 # 路径配置
 MODEL_PATH = "/home/ubuntu/model_hf/MiniMax-M2-BF16/"
@@ -118,24 +119,8 @@ def test_with_layer_recording(skip_compile=False):
         print("✓ 推理成功")
         print(f"  输出类型: {type(outputs)}")
 
-        # 从模型属性中读取layer_hidden_states
-        # 尝试从不同的位置读取
-        layer_hidden_states = None
-
-        # 尝试1: 直接从model读取
-        if hasattr(model, 'layer_hidden_states'):
-            layer_hidden_states = model.layer_hidden_states
-            print(f"  ✓ 从 model.layer_hidden_states 读取")
-        # 尝试2: 从model.models[0]读取（编译后的结构）
-        elif hasattr(model, 'models') and len(model.models) > 0:
-            if hasattr(model.models[0], 'layer_hidden_states'):
-                layer_hidden_states = model.models[0].layer_hidden_states
-                print(f"  ✓ 从 model.models[0].layer_hidden_states 读取")
-            # 尝试3: 从model.models[0].model读取
-            elif hasattr(model.models[0], 'model') and hasattr(model.models[0].model, 'layer_hidden_states'):
-                layer_hidden_states = model.models[0].model.layer_hidden_states
-                print(f"  ✓ 从 model.models[0].model.layer_hidden_states 读取")
-
+        # 从线程局部存储中读取layer_hidden_states
+        layer_hidden_states = get_layer_hidden_states()
         print(f"  Layer hidden states 类型: {type(layer_hidden_states)}")
 
         if isinstance(layer_hidden_states, list) and len(layer_hidden_states) > 0:

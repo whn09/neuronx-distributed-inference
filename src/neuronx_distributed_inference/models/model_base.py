@@ -2,6 +2,7 @@ import copy
 import inspect
 import logging
 import os
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import neuronx_distributed as nxd
@@ -83,6 +84,23 @@ except ImportError:
     gen_cache_mask_for_attention_tkg_kernel = None
 
 
+# 线程局部存储，用于在推理期间传递layer_hidden_states
+_thread_local_storage = threading.local()
+
+
+def get_layer_hidden_states():
+    """
+    从线程局部存储中获取layer_hidden_states。
+
+    这个函数用于在推理后获取记录的层输出。
+    需要在编译时启用 record_layer_outputs=True。
+
+    Returns:
+        list或None: 包含每层输出的列表，如果未启用记录或没有可用数据则返回None
+    """
+    return getattr(_thread_local_storage, 'layer_hidden_states', None)
+
+
 class NeuronBaseModel(nn.Module):
     """
     Base model that NeuronXXXModel classes inherit from.
@@ -132,9 +150,6 @@ class NeuronBaseModel(nn.Module):
             wrap_model_with_lora(self, lora_config)
             self.lora_checkpoint = LoraCheckpoint(lora_config)
         self.sliced_hidden = False
-
-        # 初始化层输出记录属性
-        self.layer_hidden_states = None
 
     def setup_attr_for_model(self, config: InferenceConfig):
         """
@@ -1335,9 +1350,9 @@ class NeuronBaseModel(nn.Module):
             )  # (B, 1, H)
             self.sliced_hidden = True
 
-        # 保存layer_hidden_states为模型属性（不改变返回值结构）
+        # 保存layer_hidden_states到线程局部存储（不改变返回值结构）
         if self.neuron_config.record_layer_outputs:
-            self.layer_hidden_states = layer_hidden_states
+            _thread_local_storage.layer_hidden_states = layer_hidden_states
 
         if self.config.neuron_config.layer_boundary_markers:
             hidden_states = ModuleMarkerEndWrapper()(hidden_states)

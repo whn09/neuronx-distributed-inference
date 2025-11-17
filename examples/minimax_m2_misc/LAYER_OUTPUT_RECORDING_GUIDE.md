@@ -18,15 +18,17 @@ neuron_config = MoENeuronConfig(
 
 ### 2. 模型层面 (`model_base.py`)
 
-修改了 `get_model_output` 方法：
+使用**线程局部存储（Thread-Local Storage）**来传递层输出，避免改变模型的输出签名：
 
 ```python
-# 在层循环开始前
+# 全局线程局部存储
+_thread_local_storage = threading.local()
+
+# 在 get_model_output 方法中记录层输出
 layer_hidden_states = []
 if self.neuron_config.record_layer_outputs:
     layer_hidden_states.append(hidden_states.clone())  # 记录embedding输出
 
-# 在每层循环后
 for idx, decoder_layer in enumerate(self.layers):
     layer_outputs = decoder_layer(...)
     hidden_states = layer_outputs[0]
@@ -34,16 +36,27 @@ for idx, decoder_layer in enumerate(self.layers):
     if self.neuron_config.record_layer_outputs:
         layer_hidden_states.append(hidden_states.clone())  # 记录当前层输出
 
-# 返回时包含层输出
+# 保存到线程局部存储（不改变返回值结构）
 if self.neuron_config.record_layer_outputs:
-    return (hidden_states, next_decoder_cache, layer_hidden_states)
+    _thread_local_storage.layer_hidden_states = layer_hidden_states
+
+# 辅助函数用于获取层输出
+def get_layer_hidden_states():
+    return getattr(_thread_local_storage, 'layer_hidden_states', None)
 ```
 
 ### 3. 使用层面 (`test_layer_by_layer_v2.py`)
 
 - 在编译时启用 `record_layer_outputs=True`
-- 在推理后从 `outputs` 中提取 `layer_hidden_states`
+- 在推理后调用 `get_layer_hidden_states()` 获取层输出
 - 保存每层输出到文件
+
+```python
+from neuronx_distributed_inference.models.model_base import get_layer_hidden_states
+
+outputs = model(**inputs)
+layer_hidden_states = get_layer_hidden_states()  # 从线程局部存储获取
+```
 
 ## 使用方法
 
@@ -224,11 +237,13 @@ A:
 ## 代码修改位置
 
 1. **config.py:113** - 添加 `record_layer_outputs` 配置
-2. **model_base.py:1233-1237** - 初始化 `layer_hidden_states` 并记录embedding输出
-3. **model_base.py:1280-1282** - 在每层循环后记录输出
-4. **model_base.py:1334-1340** - 修改返回值包含 `layer_hidden_states`
-5. **model_base.py:888-893** - 解包 `layer_hidden_states`
-6. **model_base.py:963-965** - 将 `layer_hidden_states` 添加到输出列表
+2. **model_base.py:5** - 添加 `threading` 导入
+3. **model_base.py:87-101** - 添加线程局部存储和 `get_layer_hidden_states()` 辅助函数
+4. **model_base.py:1247-1251** - 初始化 `layer_hidden_states` 并记录embedding输出
+5. **model_base.py:1294-1296** - 在每层循环后记录输出
+6. **model_base.py:1357-1359** - 保存到线程局部存储
+7. **test_layer_by_layer_v2.py:26** - 导入 `get_layer_hidden_states`
+8. **test_layer_by_layer_v2.py:122-130** - 使用 `get_layer_hidden_states()` 获取层输出
 
 ## 总结
 
