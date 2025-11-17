@@ -860,7 +860,7 @@ class NeuronBaseModel(nn.Module):
             logging.debug("CP8 and SP enabled, reordering the input on S", ordering)
             input_ids = chunk_and_reorder_tensor(input_ids, ordering, 1)
 
-        hidden_states, updated_kv_cache = self.get_model_output(
+        model_outputs = self.get_model_output(
             input_ids=input_ids,
             seq_ids=seq_ids,
             attention_mask=attn_mask,
@@ -884,6 +884,13 @@ class NeuronBaseModel(nn.Module):
             vision_mask=vision_mask,
             local_attn_mask=local_attn_mask,
         )
+
+        # 解包model_outputs
+        if self.neuron_config.record_layer_outputs:
+            hidden_states, updated_kv_cache, layer_hidden_states = model_outputs
+        else:
+            hidden_states, updated_kv_cache = model_outputs
+            layer_hidden_states = None
 
         batch_size = input_ids.shape[0]
         if not self.sliced_hidden:
@@ -952,6 +959,10 @@ class NeuronBaseModel(nn.Module):
                 outputs = outputs + [hidden_states] + [self.full_hidden_states]
             else:
                 outputs = outputs + [self.full_hidden_states]
+
+        # 添加层输出到返回值
+        if self.neuron_config.record_layer_outputs:
+            outputs = outputs + [layer_hidden_states]
 
         return outputs
 
@@ -1229,6 +1240,13 @@ class NeuronBaseModel(nn.Module):
         if self.attention_chunk_size and not self.has_mixed_attn:
             attention_mask = local_attn_mask
             local_attn_mask = None
+
+        # 记录每层输出（用于调试）
+        layer_hidden_states = []
+        if self.neuron_config.record_layer_outputs:
+            # 记录embedding输出
+            layer_hidden_states.append(hidden_states.clone())
+
         for idx, decoder_layer in enumerate(self.layers):
             if self.config.neuron_config.layer_boundary_markers:
                 hidden_states = ModuleMarkerStartWrapper()(hidden_states)
@@ -1269,6 +1287,10 @@ class NeuronBaseModel(nn.Module):
                 hidden_states, k, v = ModuleMarkerEndWrapper()(hidden_states, k, v)
                 kv = (k, v)
                 cos_cache, sin_cache = None, None
+
+            # 记录当前层的输出
+            if self.neuron_config.record_layer_outputs:
+                layer_hidden_states.append(hidden_states.clone())
 
         if update_cache and not update_kv_per_layer:
             next_decoder_cache = self.kv_mgr.update_cache(
@@ -1320,8 +1342,12 @@ class NeuronBaseModel(nn.Module):
 
         if self.config.neuron_config.layer_boundary_markers:
             hidden_states = ModuleMarkerEndWrapper()(hidden_states)
+            if self.neuron_config.record_layer_outputs:
+                return (hidden_states, next_decoder_cache, layer_hidden_states)
             return (hidden_states, next_decoder_cache)
 
+        if self.neuron_config.record_layer_outputs:
+            return (hidden_states, next_decoder_cache, layer_hidden_states)
         return (hidden_states, next_decoder_cache)
 
     def validate_sequence_parallel(self, seq_length):

@@ -110,6 +110,7 @@ class NeuronConfig:
         self.n_positions = kwargs.pop("n_positions", self.seq_len)
         self.on_cpu = kwargs.pop("on_cpu", False)
         self.output_logits = kwargs.pop("output_logits", False)
+        self.record_layer_outputs = kwargs.pop("record_layer_outputs", False)  # 记录每一层的输出用于调试
         self.is_prefill_stage = None  # set only in enable_<>() in NeuronBaseForCausalLM
 
         # Torch dtype

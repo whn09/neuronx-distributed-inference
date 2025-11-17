@@ -254,6 +254,19 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         device = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w1.weight"].device
         dtype = neuron_state_dict[f"layers.{l}.block_sparse_moe.experts.0.w1.weight"].dtype
 
+        # FIX: 确保dtype是bfloat16，避免创建巨大的FP32 tensor（单层13.5GB，62层~837GB）
+        if dtype != torch.bfloat16:
+            print(f"  ⚠️  WARNING: Layer {l} experts.0.w1.weight has dtype={dtype}, forcing bfloat16")
+            dtype = torch.bfloat16
+        if l == 0:
+            print(f"  Layer {l} MoE dtype: {dtype}, device: {device}")
+            # 计算单层临时tensor大小
+            gate_up_elements = config.num_local_experts * hidden_size * 2 * intermediate_size
+            down_elements = config.num_local_experts * intermediate_size * hidden_size
+            size_bf16 = (gate_up_elements + down_elements) * 2 / 1024 / 1024 / 1024
+            size_fp32 = (gate_up_elements + down_elements) * 4 / 1024 / 1024 / 1024
+            print(f"  Estimated temp memory per layer: BF16={size_bf16:.2f}GB, FP32={size_fp32:.2f}GB")
+
         # copy the MLP parameters (w1 is gate_proj, w3 is up_proj, w2 is down_proj in MiniMax M2)
         gate_up_proj = torch.empty(
             config.num_local_experts,
@@ -750,6 +763,23 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
                 # Fall back to standard loading for non-sharded models
                 from neuronx_distributed_inference.modules.checkpoint import load_state_dict
                 model_sd = load_state_dict(model_name_or_path)
+
+            # FIX: 强制转换为bfloat16以避免1TB内存占用问题
+            # 问题：某些操作可能导致权重变成float32，创建临时tensor时会占用双倍内存
+            print(f"\n=== Enforcing bfloat16 dtype for all weights ===")
+            fp32_count = 0
+            fp32_large_count = 0
+            for key in list(model_sd.keys()):
+                if isinstance(model_sd[key], torch.Tensor):
+                    if model_sd[key].dtype == torch.float32:
+                        fp32_count += 1
+                        # 只转换大的权重tensor（跳过小的bias等）
+                        if model_sd[key].numel() > 1000:
+                            model_sd[key] = model_sd[key].to(torch.bfloat16)
+                            fp32_large_count += 1
+                            if fp32_large_count <= 3:
+                                print(f"  Converted {key} from float32 to bfloat16 (shape: {model_sd[key].shape})")
+            print(f"  Found {fp32_count} float32 tensors, converted {fp32_large_count} large tensors to bfloat16")
 
             # Remove model. prefix and handle other transformations
             param_name_list = list(model_sd.keys())
