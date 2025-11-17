@@ -117,17 +117,32 @@ def test_with_layer_recording(skip_compile=False):
 
         print("✓ 推理成功")
         print(f"  输出类型: {type(outputs)}")
-        print(f"  输出长度: {len(outputs)}")
 
-        # 提取layer_hidden_states（应该在outputs的最后一个位置）
-        layer_hidden_states = outputs[-1] if len(outputs) > 0 else None
+        # 从模型属性中读取layer_hidden_states
+        # 尝试从不同的位置读取
+        layer_hidden_states = None
+
+        # 尝试1: 直接从model读取
+        if hasattr(model, 'layer_hidden_states'):
+            layer_hidden_states = model.layer_hidden_states
+            print(f"  ✓ 从 model.layer_hidden_states 读取")
+        # 尝试2: 从model.models[0]读取（编译后的结构）
+        elif hasattr(model, 'models') and len(model.models) > 0:
+            if hasattr(model.models[0], 'layer_hidden_states'):
+                layer_hidden_states = model.models[0].layer_hidden_states
+                print(f"  ✓ 从 model.models[0].layer_hidden_states 读取")
+            # 尝试3: 从model.models[0].model读取
+            elif hasattr(model.models[0], 'model') and hasattr(model.models[0].model, 'layer_hidden_states'):
+                layer_hidden_states = model.models[0].model.layer_hidden_states
+                print(f"  ✓ 从 model.models[0].model.layer_hidden_states 读取")
+
         print(f"  Layer hidden states 类型: {type(layer_hidden_states)}")
 
-        if isinstance(layer_hidden_states, list):
+        if isinstance(layer_hidden_states, list) and len(layer_hidden_states) > 0:
             print(f"  ✓ 成功获取层输出！共 {len(layer_hidden_states)} 层")
             print(f"    第一层shape: {layer_hidden_states[0].shape if len(layer_hidden_states) > 0 else 'N/A'}")
         else:
-            print(f"  ⚠️  layer_hidden_states 不是list类型: {layer_hidden_states}")
+            print(f"  ⚠️  layer_hidden_states 不是list或为空: {layer_hidden_states}")
 
     except Exception as e:
         print(f"✗ 推理失败: {e}")

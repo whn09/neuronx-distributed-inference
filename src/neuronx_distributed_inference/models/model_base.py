@@ -133,6 +133,9 @@ class NeuronBaseModel(nn.Module):
             self.lora_checkpoint = LoraCheckpoint(lora_config)
         self.sliced_hidden = False
 
+        # 初始化层输出记录属性
+        self.layer_hidden_states = None
+
     def setup_attr_for_model(self, config: InferenceConfig):
         """
         Please provide model-specific definition for the following attributes
@@ -885,12 +888,8 @@ class NeuronBaseModel(nn.Module):
             local_attn_mask=local_attn_mask,
         )
 
-        # 解包model_outputs
-        if self.neuron_config.record_layer_outputs:
-            hidden_states, updated_kv_cache, layer_hidden_states = model_outputs
-        else:
-            hidden_states, updated_kv_cache = model_outputs
-            layer_hidden_states = None
+        # 解包model_outputs（layer_hidden_states保存为模型属性，不在返回值中）
+        hidden_states, updated_kv_cache = model_outputs
 
         batch_size = input_ids.shape[0]
         if not self.sliced_hidden:
@@ -959,10 +958,6 @@ class NeuronBaseModel(nn.Module):
                 outputs = outputs + [hidden_states] + [self.full_hidden_states]
             else:
                 outputs = outputs + [self.full_hidden_states]
-
-        # 添加层输出到返回值
-        if self.neuron_config.record_layer_outputs:
-            outputs = outputs + [layer_hidden_states]
 
         return outputs
 
@@ -1340,14 +1335,14 @@ class NeuronBaseModel(nn.Module):
             )  # (B, 1, H)
             self.sliced_hidden = True
 
+        # 保存layer_hidden_states为模型属性（不改变返回值结构）
+        if self.neuron_config.record_layer_outputs:
+            self.layer_hidden_states = layer_hidden_states
+
         if self.config.neuron_config.layer_boundary_markers:
             hidden_states = ModuleMarkerEndWrapper()(hidden_states)
-            if self.neuron_config.record_layer_outputs:
-                return (hidden_states, next_decoder_cache, layer_hidden_states)
             return (hidden_states, next_decoder_cache)
 
-        if self.neuron_config.record_layer_outputs:
-            return (hidden_states, next_decoder_cache, layer_hidden_states)
         return (hidden_states, next_decoder_cache)
 
     def validate_sequence_parallel(self, seq_length):
