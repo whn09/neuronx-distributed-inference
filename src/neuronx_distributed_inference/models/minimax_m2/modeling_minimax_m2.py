@@ -38,14 +38,124 @@ from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecode
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
-# from neuronx_distributed_inference.modules.moe import initialize_moe_module
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_process_group
+
+# Import MoE components for custom router
+from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
+from neuronx_distributed.modules.moe.model import MoE
+from neuronx_distributed.modules.moe.routing import RouterTopK
+from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig, MoEFusedTKGConfig
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
+
+
+class RouterTopKWithBias(RouterTopK):
+    """
+    RouterTopK with e_score_correction_bias support for MiniMax M2.
+
+    MiniMax M2 uses sigmoid activation with a bias term added to scores for expert selection,
+    but the final weights do not include the bias.
+    """
+
+    def __init__(self, num_experts: int, *args, **kwargs):
+        super().__init__(num_experts=num_experts, *args, **kwargs)
+        # Register e_score_correction_bias buffer (will be loaded from checkpoint)
+        self.register_buffer(
+            "e_score_correction_bias",
+            torch.zeros(num_experts, dtype=torch.float32)
+        )
+
+    def forward(self, hidden_states):
+        # Get router_logits
+        router_logits = self.get_router_logits(hidden_states)
+
+        # Apply activation function to get expert affinities
+        expert_affinities = self.apply_activation_fn(router_logits)
+
+        # For expert selection, add bias to affinities (MiniMax M2 specific)
+        # This affects which experts are selected, but not the final weights
+        scores_for_choice = expert_affinities + self.e_score_correction_bias.unsqueeze(0)
+
+        # Select top-k experts based on biased scores
+        _, expert_index = torch.topk(scores_for_choice, self.top_k, dim=-1)
+
+        # Cast to required dtype (affinities without bias are used as final weights)
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
+        expert_index = expert_index.detach().to(dtype=torch.long)
+
+        return router_logits, expert_affinities, expert_index
+
+
+def initialize_minimax_m2_moe_module(config: InferenceConfig):
+    """
+    Initialize MoE module for MiniMax M2 with custom router that supports e_score_correction_bias.
+    """
+    enabled_hybrid_sharding = config.neuron_config.hybrid_sharding_config is not None
+    moe_tkg_tensor_model_parallel_group, moe_tkg_expert_model_parallel_group, \
+        moe_cte_tensor_model_parallel_group, moe_cte_expert_model_parallel_group = \
+        initialize_moe_process_group(config, enabled_hybrid_sharding)
+
+    # Use custom router with e_score_correction_bias support
+    router = RouterTopKWithBias(
+        num_experts=config.num_local_experts,
+        top_k=config.num_experts_per_tok,
+        hidden_size=config.hidden_size,
+        dtype=config.neuron_config.router_config.dtype,
+        act_fn=config.neuron_config.router_config.act_fn,  # Should be 'sigmoid' for MiniMax M2
+        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        sequence_dimension=1,
+        bias=False,
+        apply_act_fn_over_topk=False,
+        store_transposed_weights=False,
+    )
+
+    expert_mlps = ExpertMLPsV2(
+        routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(
+            num_experts=config.num_local_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            top_k=config.num_experts_per_tok,
+            hidden_act=config.hidden_act,
+            bias=False,
+            glu_mlp=config.neuron_config.glu_mlp,
+            glu_type=config.neuron_config.glu_type,
+            hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
+            hidden_act_bias=config.neuron_config.hidden_act_bias,
+            early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
+            normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities,
+            enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping
+        ),
+        blockwise_matmul_config=config.neuron_config.blockwise_matmul_config,
+        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        dtype=config.neuron_config.torch_dtype,
+        is_prefill=config.neuron_config.is_prefill_stage,
+        enabled_hybrid_sharding=enabled_hybrid_sharding,
+        tensor_model_parallel_group=parallel_state.get_tensor_model_parallel_group(),
+        expert_model_parallel_group=parallel_state.get_expert_model_parallel_group(),
+        cte_tensor_model_parallel_group=moe_cte_tensor_model_parallel_group,
+        cte_expert_model_parallel_group=moe_cte_expert_model_parallel_group,
+        tkg_tensor_model_parallel_group=moe_tkg_tensor_model_parallel_group,
+        tkg_expert_model_parallel_group=moe_tkg_expert_model_parallel_group,
+    )
+
+    moe = MoE(
+        router=router,
+        expert_mlps=expert_mlps,
+        shared_experts=None,  # MiniMax M2 doesn't have shared experts
+        rmsnorm=None,
+        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
+        return_expert_index=config.neuron_config.return_expert_index,
+        sequence_dimension=1,
+        init_tkg_module=False,
+        tkg_config=None,
+    )
+
+    moe.eval()
+    return moe
 
 
 # Get the modules_to_not_convert from the neuron configs
@@ -211,9 +321,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
             new_param_name = param_name.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
         elif '.self_attn.v_proj.' in param_name:
             new_param_name = param_name.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
-        # Also handle o_proj
-        elif '.self_attn.o_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.o_proj.', '.self_attn.o_proj.o_proj.')
+        # NOTE: Do NOT rename o_proj here - GroupQueryAttention_O.preshard_hook will handle it
 
         if new_param_name:
             neuron_state_dict[new_param_name] = neuron_state_dict.pop(param_name)
@@ -234,27 +342,12 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
 
     for l in range(config.num_hidden_layers):  # noqa: E741
         # Handle QK norm if present
+        # MiniMax M2 qk_norm is applied on the full [num_heads * head_dim] dimension BEFORE reshape
+        # So we keep the full weight and rename it for NeuronMiniMaxM2Attention to use
         if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
-            # MiniMax M2 uses per-head QK norm: [num_heads, head_dim]
-            # Neuron expects shared QK norm: [head_dim]
-            # We average across all heads to convert per-head to shared
-
-            # k_norm: [num_kv_heads * head_dim] -> [head_dim]
-            # Try using the first head instead of averaging (averaging might lose important information)
-            k_norm_full = neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
-            k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)
-            neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
-                k_norm_reshaped[0].detach().clone()  # Use first head instead of mean
-            )
-            del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
-
-            # q_norm: [num_attention_heads * head_dim] -> [head_dim]
-            q_norm_full = neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
-            q_norm_reshaped = q_norm_full.reshape(config.num_attention_heads, config.head_dim)
-            neuron_state_dict[f"layers.{l}.self_attn.q_layernorm.weight"] = (
-                q_norm_reshaped[0].detach().clone()  # Use first head instead of mean
-            )
-            del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
+            # Rename q_norm -> q_norm (keep as-is, NeuronMiniMaxM2Attention will handle it)
+            # The weight shape is [num_attention_heads * head_dim] for q and [num_kv_heads * head_dim] for k
+            pass  # Keys are already correct: layers.{l}.self_attn.q_norm.weight, layers.{l}.self_attn.k_norm.weight
 
         # Copy router weights from block_sparse_moe
         neuron_state_dict[f"layers.{l}.block_sparse_moe.router.linear_router.weight"] = (
@@ -262,8 +355,11 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         )
         del neuron_state_dict[f"layers.{l}.block_sparse_moe.gate.weight"]
 
-        # Handle e_score_correction_bias if present
+        # Handle e_score_correction_bias: rename to router path for RouterTopKWithBias
         if f"layers.{l}.block_sparse_moe.e_score_correction_bias" in neuron_state_dict:
+            neuron_state_dict[f"layers.{l}.block_sparse_moe.router.e_score_correction_bias"] = (
+                neuron_state_dict[f"layers.{l}.block_sparse_moe.e_score_correction_bias"].detach().clone()
+            )
             del neuron_state_dict[f"layers.{l}.block_sparse_moe.e_score_correction_bias"]
 
         intermediate_size, hidden_size = neuron_state_dict[
@@ -424,6 +520,8 @@ class MiniMaxM2InferenceConfig(InferenceConfig):
             "rope_theta",
             "tie_word_embeddings",
             "vocab_size",
+            "use_qk_norm",  # MiniMax M2 uses per-head QK normalization
+            "rotary_dim",  # MiniMax M2 uses partial rotary (rotary_dim=64, head_dim=128)
         ]
 
     @classmethod
@@ -458,21 +556,79 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             head_dim=config.head_dim,
             rotary_emb=rotary_emb,
             rms_norm_eps=config.rms_norm_eps,
-            # qk_norm in the base class is different from MiniMaxM2RMSNorm
+            # Don't use base class qk_norm - MiniMax M2 has different qk_norm implementation
             use_qk_norm=False,
         )
 
-        # Override q_layernorm and k_layernorm with RMSNorm if use_qk_norm is enabled
-        use_qk_norm = getattr(config, 'use_qk_norm', False)
-        if use_qk_norm:
-            self.q_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
-            self.k_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
+        # MiniMax M2 qk_norm: RMSNorm applied on full [num_heads * head_dim] BEFORE reshape
+        # This is different from typical per-head qk_norm
+        self.use_minimax_qk_norm = getattr(config, 'use_qk_norm', False)
+        # Debug: Print qk_norm config (only for first layer to avoid spam)
+        if not hasattr(NeuronMiniMaxM2Attention, '_qk_norm_debug_printed'):
+            print(f"\n=== DEBUG: NeuronMiniMaxM2Attention config ===")
+            print(f"  use_qk_norm from config: {getattr(config, 'use_qk_norm', 'NOT FOUND')}")
+            print(f"  self.use_minimax_qk_norm: {self.use_minimax_qk_norm}")
+            print(f"  num_attention_heads: {config.num_attention_heads}")
+            print(f"  num_key_value_heads: {config.num_key_value_heads}")
+            print(f"  head_dim: {config.head_dim}")
+            print(f"  rotary_dim: {self.rotary_dim}")
+            NeuronMiniMaxM2Attention._qk_norm_debug_printed = True
+        if self.use_minimax_qk_norm:
+            # q_norm: [num_attention_heads * head_dim]
+            self.q_norm = get_rmsnorm_cls()(config.num_attention_heads * config.head_dim, self.rms_norm_eps)
+            # k_norm: [num_key_value_heads * head_dim]
+            self.k_norm = get_rmsnorm_cls()(config.num_key_value_heads * config.head_dim, self.rms_norm_eps)
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
                 "NeuronMiniMaxM2Attention has to be initialized in a distributed env. Please use neuronx_distributed"
                 " module to initialize a distributed env."
             )
+
+    def prep_qkv_tensors(
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+        skip_rope=False,
+        residual=None,
+        use_polar_compatible_rope=False,
+    ):
+        """Override to apply MiniMax M2 qk_norm on full projection output BEFORE reshape."""
+        from neuronx_distributed_inference.modules.attention.utils import move_heads_front
+
+        Q, K, V, residual = self.get_qkv_proj()(
+            hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids, residual=residual
+        )
+
+        # MiniMax M2 qk_norm: apply RMSNorm on full [B, S, num_heads * head_dim] BEFORE reshape
+        # This is different from typical per-head qk_norm which applies after reshape
+        if self.use_minimax_qk_norm:
+            Q = self.q_norm(Q)
+            K = self.k_norm(K)
+
+        # Divide hidden_dim across heads for MHA
+        # Change layout: BSHD -> BHSD
+        bsz, q_len, _ = hidden_states.size()
+        if self.sequence_parallel_enabled:
+            q_len *= self.tensor_model_parallel_group.size()
+
+        # Don't use q_layernorm/k_layernorm here since we already applied qk_norm above
+        Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=None)
+        K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+
+        if not skip_rope:
+            # Rotate Q and K
+            Q, K, cos_cache, sin_cache = self.apply_rotary_embedding(
+                Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
+            )
+
+        return Q, K, V, cos_cache, sin_cache, residual
 
     def apply_rotary_embedding(self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope):
         """Override to handle partial rotary embeddings (rotary_dim=64, head_dim=128)."""
@@ -541,7 +697,8 @@ class NeuronMiniMaxM2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronMiniMaxM2Attention(config=config)
 
-        self.block_sparse_moe = initialize_moe_module(config=config)
+        # Use custom MoE module with e_score_correction_bias support
+        self.block_sparse_moe = initialize_minimax_m2_moe_module(config=config)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,

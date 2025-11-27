@@ -2,8 +2,8 @@
 
 **项目名称**: MiniMax-M2 (230B, 256 Experts) 适配 AWS Trainium2
 **基准模型**: Qwen3-30B-A3B MoE (128 Experts)
-**日期**: 2025-11-10 (更新)
-**状态**: 编译成功 ✓ | FP8量化 ✓ | 加载成功 ✓ | 推理可运行 ✓ | 输出质量待优化 ⚠️
+**日期**: 2025-11-27 (更新)
+**状态**: 编译成功 ✓ | FP8量化 ✓ | 加载成功 ✓ | 推理可运行 ✓ | QK Norm ✓ | Router sigmoid ✓
 
 ---
 
@@ -212,59 +212,177 @@ class MiniMaxM2InferenceConfig(InferenceConfig):
 
 ---
 
-### 4.2 修改二：QK Norm 权重转换
+### 4.2 修改二：QK Norm 正确实现 ✅ (已修复)
 
 **文件**: `modeling_minimax_m2.py`
 
-**问题**: MiniMax M2 使用 per-head QK norm，Neuron 只支持 shared QK norm
+**问题**: MiniMax M2 使用 per-head QK norm，在完整的 `[num_heads * head_dim]` 维度上应用 RMSNorm，而不是 reshape 后的 per-head。
 
-#### 4.2.1 修改前（错误）
-
-```python
-# 简单重命名 - 假设形状已经正确
-neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
-    neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"].detach().clone()
-)
-```
-
-**问题**:
-- 期望形状: `[128]`
-- 实际形状: `[1024]` (k_norm) 或 `[6144]` (q_norm)
-- 运行时错误: `Incorrect tensor shape`
-
-#### 4.2.2 修改后（正确）
+#### 4.2.1 GPU 版本实现 (modeling_minimax_m2_gpu.py)
 
 ```python
-# k_norm: [num_kv_heads * head_dim] -> [head_dim]
-k_norm_full = neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
-k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)
-neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
-    k_norm_reshaped.mean(dim=0).detach().clone()
-)
+# MiniMax M2 的 qk_norm 在 projection 之后、reshape 之前应用
+self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
+self.k_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_key_value_heads, eps=config.rms_norm_eps)
 
-# q_norm: [num_attention_heads * head_dim] -> [head_dim]
-q_norm_full = neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
-q_norm_reshaped = q_norm_full.reshape(config.num_attention_heads, config.head_dim)
-neuron_state_dict[f"layers.{l}.self_attn.q_layernorm.weight"] = (
-    q_norm_reshaped.mean(dim=0).detach().clone()
-)
+def forward(...):
+    query_states = self.q_proj(hidden_states)  # [B, S, num_heads * head_dim]
+    key_states = self.k_proj(hidden_states)    # [B, S, num_kv_heads * head_dim]
+
+    if self.use_qk_norm:
+        query_states = self.q_norm(query_states)  # 在整个维度上做 RMSNorm
+        key_states = self.k_norm(key_states)
+
+    # 然后才 reshape 到 [B, S, num_heads, head_dim]
 ```
 
-**位置**: Lines 114-128
+#### 4.2.2 Neuron 正确实现
 
-**原理**:
-1. 将 per-head 权重 reshape 为 `[num_heads, head_dim]`
-2. 沿 `dim=0` (heads 维度) 求平均
-3. 得到 shared norm 权重 `[head_dim]`
+**1. NeuronMiniMaxM2Attention 初始化**:
+```python
+class NeuronMiniMaxM2Attention(NeuronAttentionBase):
+    def __init__(self, config):
+        super().__init__(..., use_qk_norm=False)  # 不使用基类的 per-head qk_norm
 
-**⚠️ 潜在影响**:
-- **精度损失**: 如果各 head 的 norm 参数差异较大，平均会损失信息
-- **归一化特性改变**: 从 per-head 独立归一化变为全局统一归一化
-- **可能导致**: 输出分布改变，影响生成质量
+        # MiniMax M2 qk_norm: 在完整的 [num_heads * head_dim] 上应用
+        self.use_minimax_qk_norm = getattr(config, 'use_qk_norm', False)
+        if self.use_minimax_qk_norm:
+            self.q_norm = get_rmsnorm_cls()(config.num_attention_heads * config.head_dim, self.rms_norm_eps)
+            self.k_norm = get_rmsnorm_cls()(config.num_key_value_heads * config.head_dim, self.rms_norm_eps)
+```
+
+**2. 覆盖 prep_qkv_tensors 方法**:
+```python
+def prep_qkv_tensors(self, ...):
+    Q, K, V, residual = self.get_qkv_proj()(hidden_states=hidden_states, ...)
+
+    # 在 reshape 之前应用 qk_norm (与 GPU 版本一致)
+    if self.use_minimax_qk_norm:
+        Q = self.q_norm(Q)  # Q shape: [B, S, num_heads * head_dim]
+        K = self.k_norm(K)  # K shape: [B, S, num_kv_heads * head_dim]
+
+    # 然后才 reshape 和 move_heads_front
+    Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=None)
+    K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+    V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+    ...
+```
+
+**3. convert_minimax_m2_hf_to_neuron_state_dict 保留原始权重**:
+```python
+# 不再 reshape 或取平均，保留原始的 q_norm/k_norm 权重
+if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
+    pass  # Keys 保持不变: layers.{l}.self_attn.q_norm.weight, layers.{l}.self_attn.k_norm.weight
+```
+
+**关键区别**:
+
+| 方面 | 旧实现 (错误) | 新实现 (正确) |
+|------|-------------|--------------|
+| qk_norm 应用位置 | reshape 之后 (per-head) | reshape 之前 (full dimension) |
+| 权重维度 | `[head_dim]` | `[num_heads * head_dim]` |
+| 信息保留 | ❌ 只用第一个 head / 取平均 | ✅ 完整保留所有参数 |
+| 与 GPU 一致性 | ❌ 不一致 | ✅ 完全一致 |
 
 ---
 
-### 4.3 修改三：RouterConfig dtype 转换
+### 4.3 修改三：Router sigmoid 激活函数和 e_score_correction_bias ✅ (新增)
+
+**文件**: `modeling_minimax_m2.py`, `generation_minimax_m2_demo.py`
+
+**问题**: MiniMax M2 的 MoE router 使用 sigmoid 激活函数（而非常见的 softmax），并且有 `e_score_correction_bias` 影响 expert 选择。
+
+#### 4.3.1 GPU 版本实现 (modeling_minimax_m2_gpu.py)
+
+```python
+class MiniMaxM2SparseMoeBlock(nn.Module):
+    def __init__(self, config):
+        self.gate = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
+        self.register_buffer("e_score_correction_bias", torch.zeros(config.num_local_experts))
+
+    def route_tokens_to_experts(self, router_logits):
+        # sigmoid 而非 softmax
+        routing_weights = torch.nn.functional.sigmoid(router_logits.float())
+
+        # bias 只影响 expert 选择，不影响最终权重
+        scores_for_choice = routing_weights + self.e_score_correction_bias
+        _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
+
+        # 最终权重来自 routing_weights（不含 bias）
+        top_k_weights = routing_weights.gather(1, top_k_index)
+        top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
+        return top_k_index, top_k_weights
+```
+
+**关键发现**: `e_score_correction_bias` 不是全零！实际值范围在 4.7 到 8.7 之间，显著影响 expert 选择。
+
+#### 4.3.2 Neuron 正确实现
+
+**1. 创建自定义 RouterTopKWithBias 类**:
+```python
+class RouterTopKWithBias(RouterTopK):
+    """RouterTopK with e_score_correction_bias support for MiniMax M2."""
+
+    def __init__(self, num_experts: int, *args, **kwargs):
+        super().__init__(num_experts=num_experts, *args, **kwargs)
+        self.register_buffer("e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32))
+
+    def forward(self, hidden_states):
+        router_logits = self.get_router_logits(hidden_states)
+        expert_affinities = self.apply_activation_fn(router_logits)  # sigmoid
+
+        # bias 只影响选择，不影响最终权重
+        scores_for_choice = expert_affinities + self.e_score_correction_bias.unsqueeze(0)
+        _, expert_index = torch.topk(scores_for_choice, self.top_k, dim=-1)
+
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
+        expert_index = expert_index.detach().to(dtype=torch.long)
+        return router_logits, expert_affinities, expert_index
+```
+
+**2. 创建专用 MoE 初始化函数**:
+```python
+def initialize_minimax_m2_moe_module(config: InferenceConfig):
+    router = RouterTopKWithBias(
+        num_experts=config.num_local_experts,
+        act_fn=config.neuron_config.router_config.act_fn,  # 'sigmoid'
+        ...
+    )
+    # ... 其余配置
+```
+
+**3. 配置 router_config 使用 sigmoid**:
+```python
+# generation_minimax_m2_demo.py
+neuron_config = MoENeuronConfig(
+    ...
+    router_config={
+        'act_fn': 'sigmoid',  # MiniMax M2 使用 sigmoid 而非 softmax
+    },
+)
+```
+
+**4. convert_minimax_m2_hf_to_neuron_state_dict 重命名 bias**:
+```python
+# 重命名 e_score_correction_bias 到 router 路径
+if f"layers.{l}.block_sparse_moe.e_score_correction_bias" in neuron_state_dict:
+    neuron_state_dict[f"layers.{l}.block_sparse_moe.router.e_score_correction_bias"] = (
+        neuron_state_dict[f"layers.{l}.block_sparse_moe.e_score_correction_bias"].detach().clone()
+    )
+    del neuron_state_dict[f"layers.{l}.block_sparse_moe.e_score_correction_bias"]
+```
+
+**对比**:
+
+| 方面 | 默认 RouterTopK | RouterTopKWithBias (MiniMax M2) |
+|------|----------------|-------------------------------|
+| 激活函数 | softmax | sigmoid |
+| e_score_correction_bias | ❌ 不支持 | ✅ 支持 |
+| expert 选择 | 基于 logits | 基于 affinities + bias |
+
+---
+
+### 4.4 修改四：RouterConfig dtype 转换
 
 **文件**: `config.py`
 
@@ -357,7 +475,41 @@ class HuggingFaceGenerationAdapter(GenerationMixin, PreTrainedModel):
 
 ---
 
-### 4.5 修改五：load_hf_model 改用 AutoModel （未来MiniMax-M2进入Transformers主代码分支后这样修改，目前仍使用modeling_minimax_m2_gpu.py）
+### 4.5 修改五：o_proj 权重路径修复 ✅ (新增)
+
+**文件**: `modeling_minimax_m2.py`
+
+**问题**: 编译日志显示冗余 key 警告：`layers.X.self_attn.o_proj.o_proj.o_proj.weight`（三层 o_proj）
+
+**根因分析**:
+1. `convert_minimax_m2_hf_to_neuron_state_dict` 将 `self_attn.o_proj.weight` 重命名为 `self_attn.o_proj.o_proj.weight`
+2. `GroupQueryAttention_O.preshard_hook` 又会自动重命名，导致三层嵌套
+
+**解决方案**: 移除手动重命名，让 `preshard_hook` 自动处理
+
+```python
+# ❌ 错误（之前的实现）
+elif '.self_attn.o_proj.' in param_name:
+    new_param_name = param_name.replace('.self_attn.o_proj.', '.self_attn.o_proj.o_proj.')
+
+# ✅ 正确（现在的实现）
+# NOTE: Do NOT rename o_proj here - GroupQueryAttention_O.preshard_hook will handle it
+```
+
+**GroupQueryAttention_O.preshard_hook 的行为**:
+```python
+# gqa.py 中的 preshard_hook
+def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
+    self.replace_prefixes(
+        old_prefix=f"{hf_prefix}.{self.layer_name}",  # self_attn.o_proj
+        new_prefix=f"{prefix}.o_proj",                # self_attn.o_proj.o_proj
+        model_state_dict=model_state_dict,
+    )
+```
+
+---
+
+### 4.6 修改六：load_hf_model 改用 AutoModel （未来MiniMax-M2进入Transformers主代码分支后这样修改，目前仍使用modeling_minimax_m2_gpu.py）
 
 **文件**: `modeling_minimax_m2.py`
 
@@ -1035,7 +1187,7 @@ neuron_config = MoENeuronConfig(
     moe_tp_degree=16,  # 实际未使用
     moe_ep_degree=4,   # 实际未使用
     batch_size=1,
-    max_context_length=128,
+    max_context_length=1024,
     seq_len=1024,
     on_device_sampling_config=OnDeviceSamplingConfig(
         do_sample=True,
@@ -1047,6 +1199,10 @@ neuron_config = MoENeuronConfig(
     flash_decoding_enabled=False,
     blockwise_matmul_config={
         'use_torch_block_wise': True,
+    },
+    # ✅ MiniMax M2 使用 sigmoid 激活函数（关键配置）
+    router_config={
+        'act_fn': 'sigmoid',
     },
     # ✅ FP8 量化支持（关键配置）
     quantized_mlp_kernel_enabled=True,  # 启用 FP8 量化
@@ -1150,19 +1306,33 @@ INFO:Neuron:Warmup completed in 2.39 seconds.
 
 ✅ **技术可行性验证**: 编译、加载、推理全流程打通
 ✅ **关键问题解决**: DGE 限制、权重兼容性、版本冲突
-⚠️ **质量待优化**: 由于 QK norm 简化和 FP8 精度损失，输出质量不佳
+✅ **QK Norm 修复**: 正确实现在完整维度上应用 RMSNorm（与 GPU 版本一致）
+✅ **Router 修复**: 实现 sigmoid 激活函数和 e_score_correction_bias 支持
+✅ **o_proj 修复**: 移除重复重命名，让 preshard_hook 自动处理
 
 **核心贡献**:
 1. 识别并解决了 `moe_v2` vs `moe` 的配置传播问题
-2. 设计了 per-head → shared QK norm 的转换方案
-3. 建立了完整的 transformers 版本兼容性处理
+2. 正确实现 MiniMax M2 的 QK norm（在 projection 后、reshape 前应用）
+3. 创建 `RouterTopKWithBias` 支持 sigmoid 和 e_score_correction_bias
+4. 建立了完整的 transformers 版本兼容性处理
+5. 修复 o_proj 权重路径重复命名问题
+
+**GPU vs Neuron 实现对比**:
+
+| 组件 | GPU 版本 | Neuron 版本 | 状态 |
+|------|---------|------------|------|
+| QK Norm | 在 `[num_heads * head_dim]` 上应用 | 同左 | ✅ 一致 |
+| Router 激活函数 | sigmoid | sigmoid (via router_config) | ✅ 一致 |
+| e_score_correction_bias | 支持 | 支持 (RouterTopKWithBias) | ✅ 一致 |
+| Partial Rotary | `rotary_dim=64` | 同左 | ✅ 一致 |
+| RMSNorm | `MiniMaxM2RMSNorm` | `CustomRMSNorm` | ✅ 等价 |
 
 **下一步**:
-- **优先级 1**: 实现 per-head QK norm 支持（恢复生成质量）
-- **优先级 2**: 使用未量化 checkpoint（消除 FP8 损失）
-- **优先级 3**: 启用 NKI kernel（提升性能）
+- **优先级 1**: 验证输出质量（使用标准 benchmark）
+- **优先级 2**: 启用 NKI kernel（提升性能）
+- **优先级 3**: 性能优化和调优
 
 ---
 
-**报告生成时间**: 2025-11-05
+**报告生成时间**: 2025-11-27
 **技术栈**: AWS Trainium2, Neuron SDK 2.21, PyTorch 2.8, Transformers 4.57.1

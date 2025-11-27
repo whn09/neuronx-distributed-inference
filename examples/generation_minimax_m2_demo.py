@@ -34,11 +34,15 @@ def generate(skip_compile=False):
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
             flash_decoding_enabled=False,
-            save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
+            # save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
             # Use torch implementation to bypass NKI kernel's DGE limitation
             # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
             blockwise_matmul_config={
                 'use_torch_block_wise': True,
+            },
+            # MiniMax M2 uses sigmoid activation for router (not softmax)
+            router_config={
+                'act_fn': 'sigmoid',
             },
             # Dequantize FP8 weights to bfloat16 (quantized_mlp_kernel_enabled=False)
             # This avoids scale sharding issues with block-wise quantization
@@ -68,10 +72,33 @@ def generate(skip_compile=False):
     # Debug: Check if model weights are loaded correctly
     print("\n=== Debug: Checking loaded model ===")
     print(f"Model type: {type(model)}")
-    print(f"Model attributes: {[attr for attr in dir(model) if not attr.startswith('_')][:20]}")
     print(f"Model config neuron_config.quantized: {model.config.neuron_config.quantized}")
     print(f"Model config neuron_config.quantized_mlp_kernel_enabled: {model.config.neuron_config.quantized_mlp_kernel_enabled}")
     print(f"Model config torch_dtype: {model.config.neuron_config.torch_dtype}")
+    print(f"Model config use_qk_norm: {getattr(model.config, 'use_qk_norm', 'NOT FOUND')}")
+    print(f"Model config rotary_dim: {getattr(model.config, 'rotary_dim', 'NOT FOUND')}")
+
+    # Check if qk_norm modules exist and have correct shapes
+    print("\n=== Debug: Checking qk_norm modules ===")
+    try:
+        # Try to access model internals
+        if hasattr(model, 'models') and len(model.models) > 0:
+            # During inference, the model structure might be different
+            first_model = model.models[0]
+            if hasattr(first_model, 'layers'):
+                first_layer = first_model.layers[0]
+                if hasattr(first_layer, 'self_attn'):
+                    attn = first_layer.self_attn
+                    print(f"  Attention module type: {type(attn)}")
+                    print(f"  Has q_norm: {hasattr(attn, 'q_norm')}")
+                    print(f"  Has k_norm: {hasattr(attn, 'k_norm')}")
+                    print(f"  use_minimax_qk_norm: {getattr(attn, 'use_minimax_qk_norm', 'NOT FOUND')}")
+                    if hasattr(attn, 'q_norm'):
+                        print(f"  q_norm weight shape: {attn.q_norm.weight.shape if hasattr(attn.q_norm, 'weight') else 'no weight attr'}")
+                    if hasattr(attn, 'k_norm'):
+                        print(f"  k_norm weight shape: {attn.k_norm.weight.shape if hasattr(attn.k_norm, 'weight') else 'no weight attr'}")
+    except Exception as e:
+        print(f"  Error accessing model internals: {e}")
 
     # Check a sample weight - try different possible structures
     try:
@@ -119,12 +146,29 @@ def generate(skip_compile=False):
     generation_model = HuggingFaceGenerationAdapter(model)
     print(f"\nGenerating with max_length={model.config.neuron_config.max_length}...")
 
-    outputs = generation_model.generate(
-        inputs.input_ids,
-        generation_config=generation_config,
-        attention_mask=inputs.attention_mask,
-        max_length=model.config.neuron_config.max_length,
-    )
+    # Try greedy decoding first to check if model works correctly
+    # If greedy works but sampling doesn't, it's a sampling parameter issue
+    use_greedy = True  # Set to False to use sampling
+
+    if use_greedy:
+        print("Using GREEDY decoding (do_sample=False)")
+        outputs = generation_model.generate(
+            inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            max_length=model.config.neuron_config.max_length,
+            do_sample=False,
+        )
+    else:
+        print("Using SAMPLING with temperature=0.6, top_k=20, top_p=0.95")
+        outputs = generation_model.generate(
+            inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            max_length=model.config.neuron_config.max_length,
+            do_sample=True,
+            temperature=0.6,
+            top_k=20,
+            top_p=0.95,
+        )
     print(f"Output token IDs shape: {outputs.shape}")
     print(f"Output token IDs (first 20): {outputs[0, :20].tolist()}")
 
