@@ -340,14 +340,56 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     for key in sorted(layer0_attn_keys):
         print(f"  {key}")
 
+    # Calculate sharded num_heads for q_norm/k_norm
+    # Use same logic as GQA sharding: with REPLICATE_TO_TP_DEGREE, heads are padded to tp_degree
+    tp_degree = config.neuron_config.tp_degree
+    # For REPLICATE_TO_TP_DEGREE: num_attention_heads is padded to tp_degree, then divided by tp_degree
+    # So each rank has tp_degree/tp_degree = 1 head for Q
+    # And KV heads are replicated to tp_degree, so each rank also has 1 KV head
+    from neuronx_distributed_inference.modules.attention.gqa import get_shardable_head_counts, GQA
+    sharding_strategy = GQA.REPLICATE_TO_TP_DEGREE  # Same as GQA_SHARDING_STRATEGY
+    padded_num_attention_heads, padded_num_kv_heads = get_shardable_head_counts(
+        tp_degree, config.num_attention_heads, config.num_key_value_heads, sharding_strategy
+    )
+    num_heads_per_rank = padded_num_attention_heads // tp_degree
+    num_kv_heads_per_rank = padded_num_kv_heads // tp_degree
+    print(f"\n=== QK norm sharding info ===")
+    print(f"  tp_degree: {tp_degree}")
+    print(f"  padded_num_attention_heads: {padded_num_attention_heads}")
+    print(f"  padded_num_kv_heads: {padded_num_kv_heads}")
+    print(f"  num_heads_per_rank: {num_heads_per_rank}")
+    print(f"  num_kv_heads_per_rank: {num_kv_heads_per_rank}")
+
     for l in range(config.num_hidden_layers):  # noqa: E741
         # Handle QK norm if present
-        # MiniMax M2 qk_norm is applied on the full [num_heads * head_dim] dimension BEFORE reshape
-        # So we keep the full weight and rename it for NeuronMiniMaxM2Attention to use
+        # MiniMax M2 qk_norm weights need to be sharded to match the sharded Q/K dimensions
         if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
-            # Rename q_norm -> q_norm (keep as-is, NeuronMiniMaxM2Attention will handle it)
-            # The weight shape is [num_attention_heads * head_dim] for q and [num_kv_heads * head_dim] for k
-            pass  # Keys are already correct: layers.{l}.self_attn.q_norm.weight, layers.{l}.self_attn.k_norm.weight
+            # q_norm: [num_attention_heads * head_dim] -> shard to [num_heads_per_rank * head_dim]
+            q_norm_key = f"layers.{l}.self_attn.q_norm.weight"
+            if q_norm_key in neuron_state_dict:
+                q_norm_full = neuron_state_dict[q_norm_key]  # [num_attention_heads * head_dim]
+                # Reshape to [num_attention_heads, head_dim]
+                q_norm_reshaped = q_norm_full.reshape(config.num_attention_heads, config.head_dim)
+                # For REPLICATE_TO_TP_DEGREE: Q heads are interleaved with padding
+                # But since all heads share the same q_norm per dimension, we can just take first num_heads_per_rank heads
+                # and repeat them (since RMSNorm is element-wise on the last dim)
+                # Actually, since padding heads should use same norm as original heads, we just take first chunk
+                q_norm_sharded = q_norm_reshaped[:num_heads_per_rank].reshape(-1)  # [num_heads_per_rank * head_dim]
+                neuron_state_dict[q_norm_key] = q_norm_sharded
+                if l == 0:
+                    print(f"  q_norm: {q_norm_full.shape} -> {q_norm_sharded.shape}")
+
+            # k_norm: [num_kv_heads * head_dim] -> shard to [num_kv_heads_per_rank * head_dim]
+            k_norm_key = f"layers.{l}.self_attn.k_norm.weight"
+            if k_norm_key in neuron_state_dict:
+                k_norm_full = neuron_state_dict[k_norm_key]  # [num_kv_heads * head_dim]
+                # Reshape to [num_kv_heads, head_dim]
+                k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)
+                # For REPLICATE_TO_TP_DEGREE: KV heads are replicated, so we just take first num_kv_heads_per_rank heads
+                k_norm_sharded = k_norm_reshaped[:num_kv_heads_per_rank].reshape(-1)  # [num_kv_heads_per_rank * head_dim]
+                neuron_state_dict[k_norm_key] = k_norm_sharded
+                if l == 0:
+                    print(f"  k_norm: {k_norm_full.shape} -> {k_norm_sharded.shape}")
 
         # Copy router weights from block_sparse_moe
         neuron_state_dict[f"layers.{l}.block_sparse_moe.router.linear_router.weight"] = (
@@ -487,6 +529,61 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     return neuron_state_dict
 
 
+class DistributedRMSNorm(nn.Module):
+    """
+    Distributed RMSNorm for MiniMax M2 qk_norm.
+
+    MiniMax M2's qk_norm applies RMSNorm on the full Q/K output (e.g., [6144] dims for Q)
+    BEFORE reshape. In TP parallel, Q/K are sharded, so we need distributed RMS computation:
+    1. Each rank computes local sum(x²)
+    2. All-reduce to get global sum
+    3. Compute global RMS
+    4. Each rank normalizes with global RMS and local weights
+
+    This implementation uses all-reduce to compute the correct global RMS, matching
+    the GPU behavior exactly.
+    """
+    def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None):
+        super().__init__()
+        self.hidden_size = hidden_size  # Per-rank hidden size (e.g., 128)
+        self.full_hidden_size = full_hidden_size or hidden_size  # Full hidden size (e.g., 6144)
+        self.variance_epsilon = eps
+        self.tp_degree = tp_degree
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, hidden_states):
+        original_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+
+        # Compute local sum of squares (not mean yet)
+        # hidden_states shape: [batch, seq, hidden_size]
+        local_sum_sq = hidden_states.pow(2).sum(-1, keepdim=True)
+
+        # All-reduce to get global sum of squares across all TP ranks
+        # This is necessary because GPU RMSNorm computes RMS over all 6144 elements
+        if self.tp_degree > 1 and parallel_state.model_parallel_is_initialized():
+            # All-reduce sum across TP group
+            global_sum_sq = local_sum_sq.clone()
+            torch.distributed.all_reduce(
+                global_sum_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=parallel_state.get_tensor_model_parallel_group()
+            )
+        else:
+            global_sum_sq = local_sum_sq
+
+        # Compute global RMS: sqrt(sum(x²) / total_elements)
+        # total_elements = full_hidden_size (e.g., 6144 for Q, 1024 for K)
+        global_variance = global_sum_sq / self.full_hidden_size
+        rsqrt_variance = torch.rsqrt(global_variance + self.variance_epsilon)
+
+        # Normalize with global RMS and apply local weights
+        hidden_states = hidden_states * rsqrt_variance
+        result = self.weight * hidden_states
+
+        return result.to(original_dtype)
+
+
 def get_rmsnorm_cls():
     # Initialize to the appropriate implementation of RMSNorm
     # If infer on NXD -> CustomRMSNorm
@@ -496,6 +593,22 @@ def get_rmsnorm_cls():
         return MiniMaxM2RMSNorm
     else:
         return CustomRMSNorm
+
+
+def get_distributed_rmsnorm_cls():
+    """Get the distributed RMSNorm class for qk_norm."""
+    if cpu_mode():
+        from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_gpu import MiniMaxM2RMSNorm
+
+        # Wrapper to make MiniMaxM2RMSNorm accept the same args as DistributedRMSNorm
+        class CPUCompatibleRMSNorm(MiniMaxM2RMSNorm):
+            def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None):
+                # CPU mode doesn't need distributed computation, just use standard RMSNorm
+                super().__init__(hidden_size, eps=eps)
+
+        return CPUCompatibleRMSNorm
+    else:
+        return DistributedRMSNorm
 
 
 class MiniMaxM2InferenceConfig(InferenceConfig):
@@ -560,24 +673,46 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             use_qk_norm=False,
         )
 
-        # MiniMax M2 qk_norm: RMSNorm applied on full [num_heads * head_dim] BEFORE reshape
-        # This is different from typical per-head qk_norm
+        # MiniMax M2 qk_norm: RMSNorm applied on QKV projection output BEFORE reshape
+        # In TP parallel, Q/K are already sharded, so we need to use sharded dimensions
+        # self.num_heads and self.num_key_value_heads are already divided by tp_degree in base class
         self.use_minimax_qk_norm = getattr(config, 'use_qk_norm', False)
         # Debug: Print qk_norm config (only for first layer to avoid spam)
         if not hasattr(NeuronMiniMaxM2Attention, '_qk_norm_debug_printed'):
             print(f"\n=== DEBUG: NeuronMiniMaxM2Attention config ===")
             print(f"  use_qk_norm from config: {getattr(config, 'use_qk_norm', 'NOT FOUND')}")
             print(f"  self.use_minimax_qk_norm: {self.use_minimax_qk_norm}")
-            print(f"  num_attention_heads: {config.num_attention_heads}")
-            print(f"  num_key_value_heads: {config.num_key_value_heads}")
+            print(f"  self.num_heads (per TP rank): {self.num_heads}")
+            print(f"  self.num_key_value_heads (per TP rank): {self.num_key_value_heads}")
+            print(f"  config.num_attention_heads (total): {config.num_attention_heads}")
+            print(f"  config.num_key_value_heads (total): {config.num_key_value_heads}")
             print(f"  head_dim: {config.head_dim}")
             print(f"  rotary_dim: {self.rotary_dim}")
+            print(f"  tp_degree: {self.tp_degree}")
             NeuronMiniMaxM2Attention._qk_norm_debug_printed = True
         if self.use_minimax_qk_norm:
-            # q_norm: [num_attention_heads * head_dim]
-            self.q_norm = get_rmsnorm_cls()(config.num_attention_heads * config.head_dim, self.rms_norm_eps)
-            # k_norm: [num_key_value_heads * head_dim]
-            self.k_norm = get_rmsnorm_cls()(config.num_key_value_heads * config.head_dim, self.rms_norm_eps)
+            # q_norm dimension: num_heads_per_rank * head_dim (sharded)
+            # self.num_heads is already num_attention_heads / tp_degree
+            q_norm_dim = self.num_heads * config.head_dim
+            k_norm_dim = self.num_key_value_heads * config.head_dim
+            # Full dimensions for GPU-equivalent RMS computation
+            full_q_norm_dim = config.num_attention_heads * config.head_dim
+            full_k_norm_dim = config.num_key_value_heads * config.head_dim
+            print(f"  Creating q_norm with dim={q_norm_dim} (full: {full_q_norm_dim})")
+            print(f"  Creating k_norm with dim={k_norm_dim} (full: {full_k_norm_dim})")
+            # Use DistributedRMSNorm with all-reduce for correct global RMS
+            self.q_norm = get_distributed_rmsnorm_cls()(
+                q_norm_dim,
+                eps=self.rms_norm_eps,
+                tp_degree=self.tp_degree,
+                full_hidden_size=full_q_norm_dim
+            )
+            self.k_norm = get_distributed_rmsnorm_cls()(
+                k_norm_dim,
+                eps=self.rms_norm_eps,
+                tp_degree=self.tp_degree,
+                full_hidden_size=full_k_norm_dim
+            )
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
