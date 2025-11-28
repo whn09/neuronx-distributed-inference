@@ -360,36 +360,52 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     print(f"  num_heads_per_rank: {num_heads_per_rank}")
     print(f"  num_kv_heads_per_rank: {num_kv_heads_per_rank}")
 
+    # Import padding function for qk_norm
+    from neuronx_distributed_inference.modules.attention.gqa import _maybe_pad_interleaved
+
     for l in range(config.num_hidden_layers):  # noqa: E741
-        # Handle QK norm if present
-        # MiniMax M2 qk_norm weights need to be sharded to match the sharded Q/K dimensions
+        # Handle QK norm weights: apply interleaved padding to match Q/K projection sharding
+        # MiniMax M2 qk_norm applies RMSNorm on the full Q/K output BEFORE reshape.
+        # The weights are organized as [num_heads * head_dim], e.g., [6144] for Q.
+        #
+        # With GQA REPLICATE_TO_TP_DEGREE sharding:
+        # - Q heads are padded from 48 to 64 using interleaved padding
+        # - The padding is done in groups: [6 real heads, 2 padding heads] x 8 groups
+        # - KV heads are replicated from 8 to 64
+        #
+        # The qk_norm weights need the same interleaved padding to match the sharded Q/K data.
         if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
-            # q_norm: [num_attention_heads * head_dim] -> shard to [num_heads_per_rank * head_dim]
+            # q_norm: apply interleaved padding [48 heads -> 64 heads]
             q_norm_key = f"layers.{l}.self_attn.q_norm.weight"
             if q_norm_key in neuron_state_dict:
-                q_norm_full = neuron_state_dict[q_norm_key]  # [num_attention_heads * head_dim]
-                # Reshape to [num_attention_heads, head_dim]
-                q_norm_reshaped = q_norm_full.reshape(config.num_attention_heads, config.head_dim)
-                # For REPLICATE_TO_TP_DEGREE: Q heads are interleaved with padding
-                # But since all heads share the same q_norm per dimension, we can just take first num_heads_per_rank heads
-                # and repeat them (since RMSNorm is element-wise on the last dim)
-                # Actually, since padding heads should use same norm as original heads, we just take first chunk
-                q_norm_sharded = q_norm_reshaped[:num_heads_per_rank].reshape(-1)  # [num_heads_per_rank * head_dim]
-                neuron_state_dict[q_norm_key] = q_norm_sharded
+                q_norm_full = neuron_state_dict[q_norm_key]  # [num_attention_heads * head_dim] = [6144]
+                # Apply the same interleaved padding as Q projection weights
+                # source_group_size = num_attention_heads / num_kv_heads = 48 / 8 = 6
+                source_group_size = config.num_attention_heads // config.num_key_value_heads
+                q_norm_padded = _maybe_pad_interleaved(
+                    q_norm_full.unsqueeze(0),  # Add batch dim for the function: [1, 6144]
+                    pad_dim=1,  # Pad along the second dimension
+                    source_heads=config.num_attention_heads,  # 48
+                    target_heads=padded_num_attention_heads,  # 64
+                    source_group_size=source_group_size,  # 6
+                ).squeeze(0)  # Remove batch dim: [8192]
+                neuron_state_dict[q_norm_key] = q_norm_padded
                 if l == 0:
-                    print(f"  q_norm: {q_norm_full.shape} -> {q_norm_sharded.shape}")
+                    print(f"  q_norm: {q_norm_full.shape} -> {q_norm_padded.shape} (interleaved padding)")
 
-            # k_norm: [num_kv_heads * head_dim] -> shard to [num_kv_heads_per_rank * head_dim]
+            # k_norm: replicate from 8 to 64 heads
             k_norm_key = f"layers.{l}.self_attn.k_norm.weight"
             if k_norm_key in neuron_state_dict:
-                k_norm_full = neuron_state_dict[k_norm_key]  # [num_kv_heads * head_dim]
-                # Reshape to [num_kv_heads, head_dim]
-                k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)
-                # For REPLICATE_TO_TP_DEGREE: KV heads are replicated, so we just take first num_kv_heads_per_rank heads
-                k_norm_sharded = k_norm_reshaped[:num_kv_heads_per_rank].reshape(-1)  # [num_kv_heads_per_rank * head_dim]
-                neuron_state_dict[k_norm_key] = k_norm_sharded
+                k_norm_full = neuron_state_dict[k_norm_key]  # [num_kv_heads * head_dim] = [1024]
+                # KV heads are replicated: each of the 8 original heads is replicated 8 times (64/8=8)
+                # Reshape to [num_kv_heads, head_dim] then repeat
+                k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)  # [8, 128]
+                repeats = padded_num_kv_heads // config.num_key_value_heads  # 64 / 8 = 8
+                k_norm_replicated = k_norm_reshaped.repeat_interleave(repeats, dim=0)  # [64, 128]
+                k_norm_padded = k_norm_replicated.reshape(-1)  # [8192]
+                neuron_state_dict[k_norm_key] = k_norm_padded
                 if l == 0:
-                    print(f"  k_norm: {k_norm_full.shape} -> {k_norm_sharded.shape}")
+                    print(f"  k_norm: {k_norm_full.shape} -> {k_norm_padded.shape} (replicated {repeats}x)")
 
         # Copy router weights from block_sparse_moe
         neuron_state_dict[f"layers.{l}.block_sparse_moe.router.linear_router.weight"] = (
@@ -692,14 +708,24 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             NeuronMiniMaxM2Attention._qk_norm_debug_printed = True
         if self.use_minimax_qk_norm:
             # q_norm dimension: num_heads_per_rank * head_dim (sharded)
-            # self.num_heads is already num_attention_heads / tp_degree
-            q_norm_dim = self.num_heads * config.head_dim
-            k_norm_dim = self.num_key_value_heads * config.head_dim
+            # self.num_heads is already padded_num_attention_heads / tp_degree from base class
+            # After interleaved padding: [48 heads * 128] -> [64 heads * 128]
+            q_norm_dim = self.num_heads * config.head_dim  # = 1 * 128 = 128 per rank
+            k_norm_dim = self.num_key_value_heads * config.head_dim  # = 1 * 128 = 128 per rank
+
             # Full dimensions for GPU-equivalent RMS computation
-            full_q_norm_dim = config.num_attention_heads * config.head_dim
-            full_k_norm_dim = config.num_key_value_heads * config.head_dim
+            # IMPORTANT: Use ORIGINAL (unpadded) dimensions for the RMS normalization!
+            # The global RMS should be computed over the original 48 heads (6144 elements),
+            # NOT the padded 64 heads (8192 elements), because:
+            # 1. Padding heads contain zeros that shouldn't contribute to the RMS
+            # 2. GPU computes RMS over original 6144 elements
+            # 3. After all-reduce, we need to divide by original full_hidden_size
+            full_q_norm_dim = config.num_attention_heads * config.head_dim  # 48 * 128 = 6144
+            full_k_norm_dim = config.num_key_value_heads * config.head_dim  # 8 * 128 = 1024
+
             print(f"  Creating q_norm with dim={q_norm_dim} (full: {full_q_norm_dim})")
             print(f"  Creating k_norm with dim={k_norm_dim} (full: {full_k_norm_dim})")
+
             # Use DistributedRMSNorm with all-reduce for correct global RMS
             self.q_norm = get_distributed_rmsnorm_cls()(
                 q_norm_dim,
