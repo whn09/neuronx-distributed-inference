@@ -467,6 +467,8 @@ class BaseGroupQueryAttention(nn.Module):
 
         for key_index in range(len(old_keys)):
             model_state_dict[new_keys[key_index]] = model_state_dict[old_keys[key_index]]
+            # Delete old key after copying to avoid "redundant keys" warning
+            del model_state_dict[old_keys[key_index]]
 
 
 class GroupQueryAttention_QKV(BaseGroupQueryAttention):
@@ -913,9 +915,18 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             model_state_dict[f"{prefix}.{layer_name}.bias"] = tensor
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
+        # Debug: Check if preshard_hook is being called
+        print(f"\n=== GroupQueryAttention_QKV.preshard_hook called ===")
+        print(f"  prefix: {prefix}")
+        print(f"  fused_qkv: {self.fused_qkv}")
+
         prefix_parts = prefix.split(".")
         prefix = ".".join(prefix_parts[:-1])
         hf_prefix = ".".join(prefix_parts[:-2])
+
+        print(f"  prefix (after split): {prefix}")
+        print(f"  hf_prefix: {hf_prefix}")
+
         if self.fused_qkv:
             self.replace_prefixes(
                 old_prefix=f"{hf_prefix}.Wqkv",
@@ -1320,9 +1331,19 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         )
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
+        # Debug: Check if preshard_hook is being called
+        print(f"\n=== GroupQueryAttention_O.preshard_hook called ===")
+        print(f"  prefix: {prefix}")
+        print(f"  layer_name: {self.layer_name}")
+
         prefix_parts = prefix.split(".")
         prefix = ".".join(prefix_parts[:-1])
         hf_prefix = ".".join(prefix_parts[:-2])
+
+        print(f"  prefix (after split): {prefix}")
+        print(f"  hf_prefix: {hf_prefix}")
+        print(f"  old_prefix: {hf_prefix}.{self.layer_name}")
+        print(f"  new_prefix: {prefix}.o_proj")
 
         self.replace_prefixes(
             old_prefix=f"{hf_prefix}.{self.layer_name}",

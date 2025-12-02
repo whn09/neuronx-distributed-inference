@@ -58,7 +58,10 @@ class RouterTopKWithBias(RouterTopK):
     RouterTopK with e_score_correction_bias support for MiniMax M2.
 
     MiniMax M2 uses sigmoid activation with a bias term added to scores for expert selection,
-    but the final weights do not include the bias.
+    but the final weights (affinities without bias) are passed to experts.
+
+    NOTE: The normalization (weights sum to 1) is handled by ExpertMLPsV2 via
+    normalize_top_k_affinities=True in the config.
     """
 
     def __init__(self, num_experts: int, *args, **kwargs):
@@ -73,7 +76,8 @@ class RouterTopKWithBias(RouterTopK):
         # Get router_logits
         router_logits = self.get_router_logits(hidden_states)
 
-        # Apply activation function to get expert affinities
+        # Apply activation function (sigmoid) to get expert affinities
+        # expert_affinities: [T, num_experts]
         expert_affinities = self.apply_activation_fn(router_logits)
 
         # For expert selection, add bias to affinities (MiniMax M2 specific)
@@ -83,10 +87,15 @@ class RouterTopKWithBias(RouterTopK):
         # Select top-k experts based on biased scores
         _, expert_index = torch.topk(scores_for_choice, self.top_k, dim=-1)
 
-        # Cast to required dtype (affinities without bias are used as final weights)
+        # Cast to required dtype
         expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
         expert_index = expert_index.detach().to(dtype=torch.long)
 
+        # Return format expected by ExpertMLPsV2:
+        # - router_logits: raw logits (for potential auxiliary loss)
+        # - expert_affinities: [T, num_experts] - FULL affinities (not just top-k)
+        # - expert_index: [T, top_k] - indices of selected experts
+        # ExpertMLPsV2 will mask and normalize based on expert_index
         return router_logits, expert_affinities, expert_index
 
 
@@ -303,39 +312,15 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
-    # Rename attention projection keys to match Neuron's GQA module expectations
-    # Neuron GQA expects: layers.X.self_attn.qkv_proj.{q,k,v}_proj.{weight,scale}
-    # HF model has: layers.X.self_attn.{q,k,v}_proj.{weight,scale}
-    # NOTE: This must run AFTER FP8 scale conversion to capture both .weight and .scale
-    print("\n=== Renaming attention projections to add qkv_proj prefix ===")
-    param_name_list = list(neuron_state_dict.keys())
-    renamed_count = 0
-    weight_count = 0
-    scale_count = 0
-    for param_name in param_name_list:
-        new_param_name = None
-        # Add qkv_proj prefix to attention projections (handles both .weight and .scale)
-        if '.self_attn.q_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.q_proj.', '.self_attn.qkv_proj.q_proj.')
-        elif '.self_attn.k_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.k_proj.', '.self_attn.qkv_proj.k_proj.')
-        elif '.self_attn.v_proj.' in param_name:
-            new_param_name = param_name.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.v_proj.')
-        # NOTE: Do NOT rename o_proj here - GroupQueryAttention_O.preshard_hook will handle it
+    # NOTE: Do NOT rename q/k/v/o_proj keys here!
+    # GroupQueryAttention_QKV.preshard_hook and GroupQueryAttention_O.preshard_hook
+    # will handle the renaming from HF format to NXD format automatically.
+    # HF format: layers.X.self_attn.{q,k,v,o}_proj.weight
+    # NXD format: model.layers.X.self_attn.qkv_proj.{q,k,v}_proj.weight
+    #             model.layers.X.self_attn.o_proj.o_proj.weight
 
-        if new_param_name:
-            neuron_state_dict[new_param_name] = neuron_state_dict.pop(param_name)
-            renamed_count += 1
-            if param_name.endswith('.weight'):
-                weight_count += 1
-            elif param_name.endswith('.scale'):
-                scale_count += 1
-            if renamed_count <= 5:  # Print first 5
-                print(f"  Renamed: {param_name} -> {new_param_name}")
-    print(f"  Total renamed: {renamed_count} parameters ({weight_count} weights, {scale_count} scales)")
-
-    # Debug: Check if layer 0 qkv_proj keys exist
-    print("\n=== Checking layer 0 attention keys ===")
+    # Debug: Check layer 0 attention keys (should be HF format at this point)
+    print("\n=== Checking layer 0 attention keys (HF format, before preshard_hook) ===")
     layer0_attn_keys = [k for k in neuron_state_dict.keys() if k.startswith('layers.0.self_attn.')]
     for key in sorted(layer0_attn_keys):
         print(f"  {key}")
@@ -363,6 +348,13 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     # Import padding function for qk_norm
     from neuronx_distributed_inference.modules.attention.gqa import _maybe_pad_interleaved
 
+    # Debug: Print qk_norm status at the start
+    has_qk_norm = hasattr(config, 'use_qk_norm') and config.use_qk_norm
+    print(f"\n=== QK Norm processing ===")
+    print(f"  hasattr(config, 'use_qk_norm'): {hasattr(config, 'use_qk_norm')}")
+    print(f"  config.use_qk_norm: {getattr(config, 'use_qk_norm', 'NOT SET')}")
+    print(f"  Will process qk_norm: {has_qk_norm}")
+
     for l in range(config.num_hidden_layers):  # noqa: E741
         # Handle QK norm weights: apply interleaved padding to match Q/K projection sharding
         # MiniMax M2 qk_norm applies RMSNorm on the full Q/K output BEFORE reshape.
@@ -374,7 +366,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         # - KV heads are replicated from 8 to 64
         #
         # The qk_norm weights need the same interleaved padding to match the sharded Q/K data.
-        if hasattr(config, 'use_qk_norm') and config.use_qk_norm:
+        if has_qk_norm:
             # q_norm: apply interleaved padding [48 heads -> 64 heads]
             q_norm_key = f"layers.{l}.self_attn.q_norm.weight"
             if q_norm_key in neuron_state_dict:
@@ -558,16 +550,23 @@ class DistributedRMSNorm(nn.Module):
 
     This implementation uses all-reduce to compute the correct global RMS, matching
     the GPU behavior exactly.
+
+    IMPORTANT: Weight is stored as PER-RANK size [128]. The checkpoint has full [8192]
+    weights which are sharded during weight loading via preshard_hook in the model class.
     """
-    def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None):
+    def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None, padded_hidden_size=None):
         super().__init__()
         self.hidden_size = hidden_size  # Per-rank hidden size (e.g., 128)
-        self.full_hidden_size = full_hidden_size or hidden_size  # Full hidden size (e.g., 6144)
+        self.full_hidden_size = full_hidden_size or hidden_size  # For RMS divisor (e.g., 6144 for Q, 8192 for K)
+        self.padded_hidden_size = padded_hidden_size or (hidden_size * tp_degree)  # For preshard_hook reference
         self.variance_epsilon = eps
         self.tp_degree = tp_degree
+        # Store PER-RANK weights [128] - checkpoint [8192] weights are sharded during loading
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, hidden_states):
+        from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
+
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
 
@@ -577,27 +576,69 @@ class DistributedRMSNorm(nn.Module):
 
         # All-reduce to get global sum of squares across all TP ranks
         # This is necessary because GPU RMSNorm computes RMS over all 6144 elements
-        if self.tp_degree > 1 and parallel_state.model_parallel_is_initialized():
-            # All-reduce sum across TP group
-            global_sum_sq = local_sum_sq.clone()
-            torch.distributed.all_reduce(
-                global_sum_sq,
-                op=torch.distributed.ReduceOp.SUM,
-                group=parallel_state.get_tensor_model_parallel_group()
-            )
+        # Use NXD's reduce function which is XLA-compatible for proper tracing
+        if self.tp_degree > 1:
+            # reduce_from_tensor_model_parallel_region does all-reduce SUM
+            global_sum_sq = reduce_from_tensor_model_parallel_region(local_sum_sq)
         else:
             global_sum_sq = local_sum_sq
 
         # Compute global RMS: sqrt(sum(x²) / total_elements)
-        # total_elements = full_hidden_size (e.g., 6144 for Q, 1024 for K)
+        # total_elements = full_hidden_size (e.g., 6144 for Q, 8192 for K with replication)
         global_variance = global_sum_sq / self.full_hidden_size
         rsqrt_variance = torch.rsqrt(global_variance + self.variance_epsilon)
 
         # Normalize with global RMS and apply local weights
+        # self.weight is already the per-rank portion [128], sharded during weight loading
         hidden_states = hidden_states * rsqrt_variance
         result = self.weight * hidden_states
 
         return result.to(original_dtype)
+
+    def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
+        """
+        Shard the full [8192] qk_norm weight to per-rank [128] during weight loading.
+
+        This hook is automatically called by NXD during weight loading.
+        The checkpoint has full padded weights [8192], but each rank only needs [128].
+        """
+        print(f"\n=== DistributedRMSNorm.preshard_hook called ===")
+        print(f"  prefix: {prefix}")
+        print(f"  prefix in state_dict: {prefix in model_state_dict}")
+        print(f"  tp_degree: {self.tp_degree}")
+        print(f"  hidden_size (per rank): {self.hidden_size}")
+        print(f"  full_hidden_size: {self.full_hidden_size}")
+        print(f"  padded_hidden_size: {self.padded_hidden_size}")
+
+        if prefix not in model_state_dict:
+            print(f"  WARNING: prefix {prefix} not found in state_dict!")
+            print(f"  Available keys containing 'norm': {[k for k in model_state_dict.keys() if 'norm' in k][:10]}")
+            return
+
+        full_weight = model_state_dict[prefix]
+        print(f"  full_weight shape: {full_weight.shape}")
+
+        # Get current rank - during tracing, parallel_state is mocked
+        is_initialized = parallel_state.model_parallel_is_initialized()
+        print(f"  model_parallel_is_initialized: {is_initialized}")
+
+        if self.tp_degree > 1 and is_initialized:
+            rank = parallel_state.get_tensor_model_parallel_rank()
+        else:
+            rank = 0
+        print(f"  rank: {rank}")
+
+        # Extract this rank's portion of the weight
+        start_idx = rank * self.hidden_size
+        end_idx = start_idx + self.hidden_size
+        print(f"  slicing weight[{start_idx}:{end_idx}]")
+
+        sharded_weight = full_weight[start_idx:end_idx]
+        print(f"  sharded_weight shape: {sharded_weight.shape}")
+
+        # Update state_dict with sharded weight
+        model_state_dict[prefix] = sharded_weight
+        print(f"  Updated state_dict with sharded weight")
 
 
 def get_rmsnorm_cls():
@@ -618,9 +659,11 @@ def get_distributed_rmsnorm_cls():
 
         # Wrapper to make MiniMaxM2RMSNorm accept the same args as DistributedRMSNorm
         class CPUCompatibleRMSNorm(MiniMaxM2RMSNorm):
-            def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None):
+            def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None, padded_hidden_size=None):
                 # CPU mode doesn't need distributed computation, just use standard RMSNorm
-                super().__init__(hidden_size, eps=eps)
+                # Use full_hidden_size (original size) for CPU computation
+                actual_size = full_hidden_size or hidden_size
+                super().__init__(actual_size, eps=eps)
 
         return CPUCompatibleRMSNorm
     else:
@@ -713,31 +756,51 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             q_norm_dim = self.num_heads * config.head_dim  # = 1 * 128 = 128 per rank
             k_norm_dim = self.num_key_value_heads * config.head_dim  # = 1 * 128 = 128 per rank
 
-            # Full dimensions for GPU-equivalent RMS computation
-            # IMPORTANT: Use ORIGINAL (unpadded) dimensions for the RMS normalization!
-            # The global RMS should be computed over the original 48 heads (6144 elements),
-            # NOT the padded 64 heads (8192 elements), because:
-            # 1. Padding heads contain zeros that shouldn't contribute to the RMS
-            # 2. GPU computes RMS over original 6144 elements
-            # 3. After all-reduce, we need to divide by original full_hidden_size
-            full_q_norm_dim = config.num_attention_heads * config.head_dim  # 48 * 128 = 6144
-            full_k_norm_dim = config.num_key_value_heads * config.head_dim  # 8 * 128 = 1024
+            # Calculate padded KV heads (self.num_key_value_heads is already per-rank)
+            padded_num_kv_heads = self.num_key_value_heads * self.tp_degree  # 1 * 64 = 64
 
-            print(f"  Creating q_norm with dim={q_norm_dim} (full: {full_q_norm_dim})")
-            print(f"  Creating k_norm with dim={k_norm_dim} (full: {full_k_norm_dim})")
+            # Full dimensions for GPU-equivalent RMS computation
+            #
+            # For q_norm (interleaved padding):
+            # - Q heads are padded from 48 to 64 using interleaved padding (zeros)
+            # - Padding zeros contribute 0 to sum of squares
+            # - After all-reduce: global_sum_sq = original sum_sq
+            # - Division should be by ORIGINAL dimension (6144) to match GPU
+            #
+            # For k_norm (replication):
+            # - KV heads are REPLICATED from 8 to 64 (each original head appears 8 times)
+            # - Each original K value is summed 8 times in all-reduce
+            # - After all-reduce: global_sum_sq = 8 × original sum_sq
+            # - Division should be by PADDED dimension (8192) to get correct variance:
+            #   variance = (8 × original_sum_sq) / 8192 = original_sum_sq / 1024 = GPU variance
+            full_q_norm_dim = config.num_attention_heads * config.head_dim  # 48 * 128 = 6144
+            full_k_norm_dim = padded_num_kv_heads * config.head_dim  # 64 * 128 = 8192 (NOT 1024!)
+
+            # Padded dimensions for weight storage (matches checkpoint format)
+            # Both Q and K weights are padded/replicated to tp_degree heads
+            padded_q_norm_dim = self.num_heads * self.tp_degree * config.head_dim  # 1 * 64 * 128 = 8192
+            padded_k_norm_dim = padded_num_kv_heads * config.head_dim  # 64 * 128 = 8192
+
+            print(f"  Creating q_norm with dim={q_norm_dim} (full: {full_q_norm_dim}, padded: {padded_q_norm_dim})")
+            print(f"  Creating k_norm with dim={k_norm_dim} (full: {full_k_norm_dim}, padded: {padded_k_norm_dim})")
 
             # Use DistributedRMSNorm with all-reduce for correct global RMS
+            # - hidden_size: per-rank size (128)
+            # - full_hidden_size: used for RMS computation divisor
+            # - padded_hidden_size: weight storage size (matches checkpoint)
             self.q_norm = get_distributed_rmsnorm_cls()(
                 q_norm_dim,
                 eps=self.rms_norm_eps,
                 tp_degree=self.tp_degree,
-                full_hidden_size=full_q_norm_dim
+                full_hidden_size=full_q_norm_dim,
+                padded_hidden_size=padded_q_norm_dim
             )
             self.k_norm = get_distributed_rmsnorm_cls()(
                 k_norm_dim,
                 eps=self.rms_norm_eps,
                 tp_degree=self.tp_degree,
-                full_hidden_size=full_k_norm_dim
+                full_hidden_size=full_k_norm_dim,
+                padded_hidden_size=padded_k_norm_dim
             )
 
         if not parallel_state.model_parallel_is_initialized():
