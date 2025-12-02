@@ -312,6 +312,12 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
+    # Add rank_util.rank for each attention layer
+    # Each NeuronAttentionBase creates its own SPMDRank, so we need to provide rank tensor per layer
+    rank_tensor = torch.arange(0, config.neuron_config.tp_degree, dtype=torch.int32)
+    for l in range(config.num_hidden_layers):
+        neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = rank_tensor.clone()
+
     # NOTE: Do NOT rename q/k/v/o_proj keys here!
     # GroupQueryAttention_QKV.preshard_hook and GroupQueryAttention_O.preshard_hook
     # will handle the renaming from HF format to NXD format automatically.
@@ -546,25 +552,25 @@ class DistributedRMSNorm(nn.Module):
     1. Each rank computes local sum(x²)
     2. All-reduce to get global sum
     3. Compute global RMS
-    4. Each rank normalizes with global RMS and local weights
+    4. Each rank normalizes with global RMS and local weights (sliced dynamically by rank)
 
-    This implementation uses all-reduce to compute the correct global RMS, matching
-    the GPU behavior exactly.
-
-    IMPORTANT: Weight is stored as PER-RANK size [128]. The checkpoint has full [8192]
-    weights which are sharded during weight loading via preshard_hook in the model class.
+    IMPORTANT: Weights are stored as FULL padded size [8192] because during compilation,
+    preshard_hook doesn't have access to the actual target rank. Instead, we slice weights
+    dynamically during forward() using rank_util which is set during tracing.
     """
     def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None, padded_hidden_size=None):
         super().__init__()
         self.hidden_size = hidden_size  # Per-rank hidden size (e.g., 128)
         self.full_hidden_size = full_hidden_size or hidden_size  # For RMS divisor (e.g., 6144 for Q, 8192 for K)
-        self.padded_hidden_size = padded_hidden_size or (hidden_size * tp_degree)  # For preshard_hook reference
+        self.padded_hidden_size = padded_hidden_size or (hidden_size * tp_degree)  # Full weight size
         self.variance_epsilon = eps
         self.tp_degree = tp_degree
-        # Store PER-RANK weights [128] - checkpoint [8192] weights are sharded during loading
-        self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, hidden_states):
+        # Store FULL weights [8192] - slicing happens dynamically in forward() based on rank
+        # This is necessary because preshard_hook doesn't know the target rank during compilation
+        self.weight = nn.Parameter(torch.ones(self.padded_hidden_size))
+
+    def forward(self, hidden_states, rank_util=None):
         from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
 
         original_dtype = hidden_states.dtype
@@ -588,57 +594,48 @@ class DistributedRMSNorm(nn.Module):
         global_variance = global_sum_sq / self.full_hidden_size
         rsqrt_variance = torch.rsqrt(global_variance + self.variance_epsilon)
 
-        # Normalize with global RMS and apply local weights
-        # self.weight is already the per-rank portion [128], sharded during weight loading
+        # Normalize with global RMS
         hidden_states = hidden_states * rsqrt_variance
-        result = self.weight * hidden_states
+
+        # Slice weights dynamically based on rank
+        # self.weight has full size [8192], each rank uses its portion [rank*128:(rank+1)*128]
+        if rank_util is not None and self.tp_degree > 1:
+            # Reshape weight to [tp_degree, hidden_size] for rank-based indexing
+            weight_reshaped = self.weight.view(self.tp_degree, self.hidden_size)
+            # rank_util.rank is [0, 1, 2, ..., 63], each SPMD device gets its rank value
+            # Use index_select which is XLA-compatible
+            rank_index = rank_util.rank[:1]  # Get first element as 1D tensor for index_select
+            local_weight = torch.index_select(weight_reshaped, 0, rank_index).squeeze(0)
+        else:
+            # Single rank or no rank_util - use first slice
+            local_weight = self.weight[:self.hidden_size]
+
+        result = local_weight * hidden_states
 
         return result.to(original_dtype)
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
         """
-        Shard the full [8192] qk_norm weight to per-rank [128] during weight loading.
+        Validate qk_norm weights during weight loading.
 
-        This hook is automatically called by NXD during weight loading.
-        The checkpoint has full padded weights [8192], but each rank only needs [128].
+        Unlike other modules, we do NOT shard weights here because preshard_hook
+        doesn't know the target rank during compilation. Instead, weights are kept
+        at full size and sliced dynamically in forward() using rank_util.
         """
         print(f"\n=== DistributedRMSNorm.preshard_hook called ===")
         print(f"  prefix: {prefix}")
         print(f"  prefix in state_dict: {prefix in model_state_dict}")
         print(f"  tp_degree: {self.tp_degree}")
         print(f"  hidden_size (per rank): {self.hidden_size}")
-        print(f"  full_hidden_size: {self.full_hidden_size}")
-        print(f"  padded_hidden_size: {self.padded_hidden_size}")
+        print(f"  padded_hidden_size (full weight): {self.padded_hidden_size}")
 
         if prefix not in model_state_dict:
             print(f"  WARNING: prefix {prefix} not found in state_dict!")
-            print(f"  Available keys containing 'norm': {[k for k in model_state_dict.keys() if 'norm' in k][:10]}")
             return
 
         full_weight = model_state_dict[prefix]
         print(f"  full_weight shape: {full_weight.shape}")
-
-        # Get current rank - during tracing, parallel_state is mocked
-        is_initialized = parallel_state.model_parallel_is_initialized()
-        print(f"  model_parallel_is_initialized: {is_initialized}")
-
-        if self.tp_degree > 1 and is_initialized:
-            rank = parallel_state.get_tensor_model_parallel_rank()
-        else:
-            rank = 0
-        print(f"  rank: {rank}")
-
-        # Extract this rank's portion of the weight
-        start_idx = rank * self.hidden_size
-        end_idx = start_idx + self.hidden_size
-        print(f"  slicing weight[{start_idx}:{end_idx}]")
-
-        sharded_weight = full_weight[start_idx:end_idx]
-        print(f"  sharded_weight shape: {sharded_weight.shape}")
-
-        # Update state_dict with sharded weight
-        model_state_dict[prefix] = sharded_weight
-        print(f"  Updated state_dict with sharded weight")
+        print(f"  Keeping full weight (slicing happens in forward())")
 
 
 def get_rmsnorm_cls():
@@ -832,8 +829,8 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
         # MiniMax M2 qk_norm: apply RMSNorm on full [B, S, num_heads * head_dim] BEFORE reshape
         # This is different from typical per-head qk_norm which applies after reshape
         if self.use_minimax_qk_norm:
-            Q = self.q_norm(Q)
-            K = self.k_norm(K)
+            Q = self.q_norm(Q, self.rank_util)
+            K = self.k_norm(K, self.rank_util)
 
         # Divide hidden_dim across heads for MHA
         # Change layout: BSHD -> BHSD
