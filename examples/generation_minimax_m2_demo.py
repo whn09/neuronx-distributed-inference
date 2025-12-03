@@ -34,7 +34,7 @@ def generate(skip_compile=False):
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
             flash_decoding_enabled=False,
-            save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
+            # save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
             # Use torch implementation to bypass NKI kernel's DGE limitation
             # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
             blockwise_matmul_config={
@@ -80,25 +80,77 @@ def generate(skip_compile=False):
 
     # Check if qk_norm modules exist and have correct shapes
     print("\n=== Debug: Checking qk_norm modules ===")
+    print(f"  Model type: {type(model)}")
+    print(f"  Model attributes: {[a for a in dir(model) if not a.startswith('_')][:20]}")
+
+    # Explore model structure more thoroughly
+    def explore_model(obj, path="model", depth=0, max_depth=5):
+        if depth > max_depth:
+            return
+        indent = "  " * depth
+        if hasattr(obj, 'q_norm'):
+            print(f"{indent}FOUND q_norm at {path}")
+            q_norm = obj.q_norm
+            if hasattr(q_norm, 'weight'):
+                w = q_norm.weight
+                print(f"{indent}  q_norm weight shape: {w.shape}, dtype: {w.dtype}")
+                try:
+                    w_cpu = w.detach().cpu().float()
+                    print(f"{indent}  q_norm weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}")
+                except:
+                    print(f"{indent}  (cannot get weight stats)")
+        if hasattr(obj, 'k_norm'):
+            print(f"{indent}FOUND k_norm at {path}")
+            k_norm = obj.k_norm
+            if hasattr(k_norm, 'weight'):
+                w = k_norm.weight
+                print(f"{indent}  k_norm weight shape: {w.shape}, dtype: {w.dtype}")
+                try:
+                    w_cpu = w.detach().cpu().float()
+                    print(f"{indent}  k_norm weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}")
+                except:
+                    print(f"{indent}  (cannot get weight stats)")
+
+        # Recurse into common container attributes
+        for attr_name in ['model', 'models', 'layers', 'decoder', 'encoder']:
+            if hasattr(obj, attr_name):
+                attr = getattr(obj, attr_name)
+                if isinstance(attr, (list, tuple)) and len(attr) > 0:
+                    explore_model(attr[0], f"{path}.{attr_name}[0]", depth + 1, max_depth)
+                elif attr is not None and not isinstance(attr, (str, int, float, bool)):
+                    explore_model(attr, f"{path}.{attr_name}", depth + 1, max_depth)
+
+        # Also check self_attn
+        if hasattr(obj, 'self_attn'):
+            explore_model(obj.self_attn, f"{path}.self_attn", depth + 1, max_depth)
+
     try:
-        # Try to access model internals
-        if hasattr(model, 'models') and len(model.models) > 0:
-            # During inference, the model structure might be different
-            first_model = model.models[0]
-            if hasattr(first_model, 'layers'):
-                first_layer = first_model.layers[0]
-                if hasattr(first_layer, 'self_attn'):
-                    attn = first_layer.self_attn
-                    print(f"  Attention module type: {type(attn)}")
-                    print(f"  Has q_norm: {hasattr(attn, 'q_norm')}")
-                    print(f"  Has k_norm: {hasattr(attn, 'k_norm')}")
-                    print(f"  use_minimax_qk_norm: {getattr(attn, 'use_minimax_qk_norm', 'NOT FOUND')}")
-                    if hasattr(attn, 'q_norm'):
-                        print(f"  q_norm weight shape: {attn.q_norm.weight.shape if hasattr(attn.q_norm, 'weight') else 'no weight attr'}")
-                    if hasattr(attn, 'k_norm'):
-                        print(f"  k_norm weight shape: {attn.k_norm.weight.shape if hasattr(attn.k_norm, 'weight') else 'no weight attr'}")
+        explore_model(model)
     except Exception as e:
-        print(f"  Error accessing model internals: {e}")
+        import traceback
+        print(f"  Error exploring model: {e}")
+        traceback.print_exc()
+
+    # Also print named_modules to find qk_norm
+    print("\n=== Searching for qk_norm in named_modules ===")
+    try:
+        qk_norm_found = False
+        for name, module in model.named_modules():
+            if 'q_norm' in name or 'k_norm' in name:
+                print(f"  Found: {name} -> {type(module)}")
+                if hasattr(module, 'weight'):
+                    w = module.weight
+                    print(f"    weight shape: {w.shape}, dtype: {w.dtype}")
+                    try:
+                        w_cpu = w.detach().cpu().float()
+                        print(f"    weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}, min={w_cpu.min():.6f}, max={w_cpu.max():.6f}")
+                    except Exception as e:
+                        print(f"    (cannot get weight stats: {e})")
+                qk_norm_found = True
+        if not qk_norm_found:
+            print("  No qk_norm modules found in named_modules")
+    except Exception as e:
+        print(f"  Error searching named_modules: {e}")
 
     # Check a sample weight - try different possible structures
     try:
@@ -127,28 +179,67 @@ def generate(skip_compile=False):
 
     # Generate outputs.
     print("\n=== Generating outputs ===")
-    prompt = "Give me a short introduction to large language models."
-    messages = [
-        {"role": "user", "content": [{"type": "text", "text": prompt}]}
-    ]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=True # Switches between thinking and non-thinking modes if supported.
-    )
-    print(f"Formatted prompt (first 200 chars): {text[:200]}...")
+
+    # Test 1: Simple completion (no chat template) to verify model works
+    use_simple_completion = True  # Set to True for simple test
+
+    if use_simple_completion:
+        # Simple text completion - easier to verify model behavior
+        text = "The capital of France is"
+        print(f"Using SIMPLE COMPLETION test: '{text}'")
+    else:
+        # Full chat template
+        prompt = "Give me a short introduction to large language models."
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        ]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True # Switches between thinking and non-thinking modes if supported.
+        )
+        print(f"Formatted prompt (first 200 chars): {text[:200]}...")
 
     inputs = tokenizer([text], padding=True, return_tensors="pt")
     print(f"Input token IDs shape: {inputs.input_ids.shape}")
     print(f"Input token IDs (first 10): {inputs.input_ids[0, :10].tolist()}")
+
+    # Debug: Verify tokenization is correct by decoding back
+    decoded_text = tokenizer.decode(inputs.input_ids[0])
+    print(f"Decoded back from tokens: '{decoded_text}'")
+
+    # Debug: Check if token IDs are in valid range
+    vocab_size = tokenizer.vocab_size
+    max_token_id = inputs.input_ids.max().item()
+    min_token_id = inputs.input_ids.min().item()
+    print(f"Tokenizer vocab_size: {vocab_size}")
+    print(f"Model config vocab_size: {model.config.vocab_size}")
+    print(f"Token ID range in input: [{min_token_id}, {max_token_id}]")
+    if max_token_id >= vocab_size:
+        print(f"WARNING: Token ID {max_token_id} exceeds tokenizer vocab_size {vocab_size}!")
+    if max_token_id >= model.config.vocab_size:
+        print(f"WARNING: Token ID {max_token_id} exceeds model config vocab_size {model.config.vocab_size}!")
+
+    # Debug: Check vocab_size alignment with TP
+    tp_degree = model.config.neuron_config.tp_degree
+    print(f"TP degree: {tp_degree}")
+    print(f"vocab_size % tp_degree = {model.config.vocab_size % tp_degree}")
+    if model.config.vocab_size % tp_degree != 0:
+        print(f"WARNING: vocab_size {model.config.vocab_size} is not divisible by tp_degree {tp_degree}!")
+
+    # Debug: Check what per-rank vocab size would be
+    per_rank_vocab = model.config.vocab_size // tp_degree
+    print(f"Per-rank vocab size: {per_rank_vocab}")
+    print(f"Token 758 would be on rank: {758 // per_rank_vocab} (local idx: {758 % per_rank_vocab})")
+    print(f"Token 5969 would be on rank: {5969 // per_rank_vocab} (local idx: {5969 % per_rank_vocab})")
 
     generation_model = HuggingFaceGenerationAdapter(model)
     print(f"\nGenerating with max_length={model.config.neuron_config.max_length}...")
 
     # Try greedy decoding first to check if model works correctly
     # If greedy works but sampling doesn't, it's a sampling parameter issue
-    use_greedy = True  # Set to False to use sampling
+    use_greedy = True  # Set to True for deterministic test
 
     if use_greedy:
         print("Using GREEDY decoding (do_sample=False)")
@@ -175,9 +266,11 @@ def generate(skip_compile=False):
     output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     print("\n=== Generated outputs ===")
     for i, output_token in enumerate(output_tokens):
-        print(f"Output {i} (first 500 chars):\n{output_token[:500]}...")
-        if len(output_token) > 500:
-            print(f"...(total length: {len(output_token)} chars)")
+        # print(f"Output {i} (first 500 chars):\n{output_token[:500]}...")
+        # if len(output_token) > 500:
+        #     print(f"...(total length: {len(output_token)} chars)")
+        print(f"Output {i}:\n{output_token}...")
+        print(f"...(total length: {len(output_token)} chars)")
 
 
 if __name__ == "__main__":
