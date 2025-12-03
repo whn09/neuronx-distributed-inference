@@ -318,6 +318,26 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     for l in range(config.num_hidden_layers):
         neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = rank_tensor.clone()
 
+    # Debug: Check embedding weights
+    embed_key = "embed_tokens.weight"
+    if embed_key in neuron_state_dict:
+        embed_w = neuron_state_dict[embed_key]
+        print(f"\n=== Embedding weight check ===")
+        print(f"  embed_tokens.weight shape: {embed_w.shape}")
+        print(f"  embed_tokens.weight dtype: {embed_w.dtype}")
+        print(f"  Expected shape: [{config.vocab_size}, {config.hidden_size}]")
+        # Check if shape matches expected
+        if embed_w.shape[0] != config.vocab_size:
+            print(f"  WARNING: vocab_size mismatch! Weight has {embed_w.shape[0]}, config expects {config.vocab_size}")
+            # Pad embedding if needed
+            if embed_w.shape[0] < config.vocab_size:
+                print(f"  Padding embedding from {embed_w.shape[0]} to {config.vocab_size}")
+                padding = torch.zeros(config.vocab_size - embed_w.shape[0], config.hidden_size, dtype=embed_w.dtype)
+                neuron_state_dict[embed_key] = torch.cat([embed_w, padding], dim=0)
+                print(f"  New embed_tokens.weight shape: {neuron_state_dict[embed_key].shape}")
+    else:
+        print(f"\n=== WARNING: {embed_key} not found in state_dict! ===")
+
     # NOTE: Do NOT rename q/k/v/o_proj keys here!
     # GroupQueryAttention_QKV.preshard_hook and GroupQueryAttention_O.preshard_hook
     # will handle the renaming from HF format to NXD format automatically.
@@ -375,6 +395,15 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
         if has_qk_norm:
             # q_norm: apply interleaved padding [48 heads -> 64 heads]
             q_norm_key = f"layers.{l}.self_attn.q_norm.weight"
+            if l == 0:
+                print(f"  Looking for qk_norm keys in state_dict...")
+                print(f"    q_norm_key '{q_norm_key}' exists: {q_norm_key in neuron_state_dict}")
+                k_norm_key_check = f"layers.{l}.self_attn.k_norm.weight"
+                print(f"    k_norm_key '{k_norm_key_check}' exists: {k_norm_key_check in neuron_state_dict}")
+                # Also check for alternative key formats
+                alt_keys = [k for k in neuron_state_dict.keys() if 'norm' in k.lower() and 'layer' not in k.lower()]
+                if alt_keys:
+                    print(f"    Other 'norm' keys found (first 5): {alt_keys[:5]}")
             if q_norm_key in neuron_state_dict:
                 q_norm_full = neuron_state_dict[q_norm_key]  # [num_attention_heads * head_dim] = [6144]
                 # Apply the same interleaved padding as Q projection weights
@@ -622,12 +651,12 @@ class DistributedRMSNorm(nn.Module):
         doesn't know the target rank during compilation. Instead, weights are kept
         at full size and sliced dynamically in forward() using rank_util.
         """
-        print(f"\n=== DistributedRMSNorm.preshard_hook called ===")
-        print(f"  prefix: {prefix}")
-        print(f"  prefix in state_dict: {prefix in model_state_dict}")
-        print(f"  tp_degree: {self.tp_degree}")
-        print(f"  hidden_size (per rank): {self.hidden_size}")
-        print(f"  padded_hidden_size (full weight): {self.padded_hidden_size}")
+        # print(f"\n=== DistributedRMSNorm.preshard_hook called ===")
+        # print(f"  prefix: {prefix}")
+        # print(f"  prefix in state_dict: {prefix in model_state_dict}")
+        # print(f"  tp_degree: {self.tp_degree}")
+        # print(f"  hidden_size (per rank): {self.hidden_size}")
+        # print(f"  padded_hidden_size (full weight): {self.padded_hidden_size}")
 
         if prefix not in model_state_dict:
             print(f"  WARNING: prefix {prefix} not found in state_dict!")
