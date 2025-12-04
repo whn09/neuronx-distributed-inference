@@ -6,8 +6,10 @@ from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDevic
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig, NeuronQwen3MoeForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 
-model_path = "/home/ubuntu/model_hf/Qwen3-30B-A3B/"
-traced_model_path = "/home/ubuntu/traced_model/Qwen3-30B-A3B/"
+# model_path = "/home/ubuntu/model_hf/Qwen3-30B-A3B/"
+# traced_model_path = "/home/ubuntu/traced_model/Qwen3-30B-A3B/"
+model_path = "/home/ubuntu/model_hf/Qwen3-235B-A22B/"
+traced_model_path = "/home/ubuntu/traced_model/Qwen3-235B-A22B/"
 
 torch.manual_seed(0)
 
@@ -18,14 +20,16 @@ def generate(skip_compile=False):
 
     if not skip_compile:
         neuron_config = MoENeuronConfig(
-            tp_degree=8,
+            # tp_degree=8,
+            tp_degree=64,
             batch_size=1,
             max_context_length=128,
             seq_len=1024,
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
             flash_decoding_enabled=False,
-            save_sharded_checkpoint=True
+            # save_sharded_checkpoint=True
+            save_sharded_checkpoint=False
         )
         config = Qwen3MoeInferenceConfig(
             neuron_config,

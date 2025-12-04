@@ -31,7 +31,7 @@ def generate(skip_compile=False):
             batch_size=1,
             max_context_length=1024,  # default: 128
             seq_len=1024,
-            on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
+            # on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
             flash_decoding_enabled=False,
             # save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
@@ -185,7 +185,8 @@ def generate(skip_compile=False):
 
     if use_simple_completion:
         # Simple text completion - easier to verify model behavior
-        text = "The capital of France is"
+        # text = "The capital of France is"
+        text = "Who are you?"
         print(f"Using SIMPLE COMPLETION test: '{text}'")
     else:
         # Full chat template
@@ -276,7 +277,7 @@ def generate(skip_compile=False):
 
 if __name__ == "__main__":
     # Step 1: Compile and save sharded checkpoint (run once, takes time)
-    # generate(skip_compile=False)
+    generate(skip_compile=False)
 
     # Step 2: After compilation, use this for fast loading
-    generate(skip_compile=True)
+    # generate(skip_compile=True)
