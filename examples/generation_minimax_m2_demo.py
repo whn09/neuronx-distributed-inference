@@ -69,119 +69,119 @@ def generate(skip_compile=False):
     model.load(traced_model_path)
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
 
-    # Debug: Check if model weights are loaded correctly
-    print("\n=== Debug: Checking loaded model ===")
-    print(f"Model type: {type(model)}")
-    print(f"Model config neuron_config.quantized: {model.config.neuron_config.quantized}")
-    print(f"Model config neuron_config.quantized_mlp_kernel_enabled: {model.config.neuron_config.quantized_mlp_kernel_enabled}")
-    print(f"Model config torch_dtype: {model.config.neuron_config.torch_dtype}")
-    print(f"Model config use_qk_norm: {getattr(model.config, 'use_qk_norm', 'NOT FOUND')}")
-    print(f"Model config rotary_dim: {getattr(model.config, 'rotary_dim', 'NOT FOUND')}")
+    # # Debug: Check if model weights are loaded correctly
+    # print("\n=== Debug: Checking loaded model ===")
+    # print(f"Model type: {type(model)}")
+    # print(f"Model config neuron_config.quantized: {model.config.neuron_config.quantized}")
+    # print(f"Model config neuron_config.quantized_mlp_kernel_enabled: {model.config.neuron_config.quantized_mlp_kernel_enabled}")
+    # print(f"Model config torch_dtype: {model.config.neuron_config.torch_dtype}")
+    # print(f"Model config use_qk_norm: {getattr(model.config, 'use_qk_norm', 'NOT FOUND')}")
+    # print(f"Model config rotary_dim: {getattr(model.config, 'rotary_dim', 'NOT FOUND')}")
 
-    # Check if qk_norm modules exist and have correct shapes
-    print("\n=== Debug: Checking qk_norm modules ===")
-    print(f"  Model type: {type(model)}")
-    print(f"  Model attributes: {[a for a in dir(model) if not a.startswith('_')][:20]}")
+    # # Check if qk_norm modules exist and have correct shapes
+    # print("\n=== Debug: Checking qk_norm modules ===")
+    # print(f"  Model type: {type(model)}")
+    # print(f"  Model attributes: {[a for a in dir(model) if not a.startswith('_')][:20]}")
 
-    # Explore model structure more thoroughly
-    def explore_model(obj, path="model", depth=0, max_depth=5):
-        if depth > max_depth:
-            return
-        indent = "  " * depth
-        if hasattr(obj, 'q_norm'):
-            print(f"{indent}FOUND q_norm at {path}")
-            q_norm = obj.q_norm
-            if hasattr(q_norm, 'weight'):
-                w = q_norm.weight
-                print(f"{indent}  q_norm weight shape: {w.shape}, dtype: {w.dtype}")
-                try:
-                    w_cpu = w.detach().cpu().float()
-                    print(f"{indent}  q_norm weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}")
-                except:
-                    print(f"{indent}  (cannot get weight stats)")
-        if hasattr(obj, 'k_norm'):
-            print(f"{indent}FOUND k_norm at {path}")
-            k_norm = obj.k_norm
-            if hasattr(k_norm, 'weight'):
-                w = k_norm.weight
-                print(f"{indent}  k_norm weight shape: {w.shape}, dtype: {w.dtype}")
-                try:
-                    w_cpu = w.detach().cpu().float()
-                    print(f"{indent}  k_norm weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}")
-                except:
-                    print(f"{indent}  (cannot get weight stats)")
+    # # Explore model structure more thoroughly
+    # def explore_model(obj, path="model", depth=0, max_depth=5):
+    #     if depth > max_depth:
+    #         return
+    #     indent = "  " * depth
+    #     if hasattr(obj, 'q_norm'):
+    #         print(f"{indent}FOUND q_norm at {path}")
+    #         q_norm = obj.q_norm
+    #         if hasattr(q_norm, 'weight'):
+    #             w = q_norm.weight
+    #             print(f"{indent}  q_norm weight shape: {w.shape}, dtype: {w.dtype}")
+    #             try:
+    #                 w_cpu = w.detach().cpu().float()
+    #                 print(f"{indent}  q_norm weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}")
+    #             except:
+    #                 print(f"{indent}  (cannot get weight stats)")
+    #     if hasattr(obj, 'k_norm'):
+    #         print(f"{indent}FOUND k_norm at {path}")
+    #         k_norm = obj.k_norm
+    #         if hasattr(k_norm, 'weight'):
+    #             w = k_norm.weight
+    #             print(f"{indent}  k_norm weight shape: {w.shape}, dtype: {w.dtype}")
+    #             try:
+    #                 w_cpu = w.detach().cpu().float()
+    #                 print(f"{indent}  k_norm weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}")
+    #             except:
+    #                 print(f"{indent}  (cannot get weight stats)")
 
-        # Recurse into common container attributes
-        for attr_name in ['model', 'models', 'layers', 'decoder', 'encoder']:
-            if hasattr(obj, attr_name):
-                attr = getattr(obj, attr_name)
-                if isinstance(attr, (list, tuple)) and len(attr) > 0:
-                    explore_model(attr[0], f"{path}.{attr_name}[0]", depth + 1, max_depth)
-                elif attr is not None and not isinstance(attr, (str, int, float, bool)):
-                    explore_model(attr, f"{path}.{attr_name}", depth + 1, max_depth)
+    #     # Recurse into common container attributes
+    #     for attr_name in ['model', 'models', 'layers', 'decoder', 'encoder']:
+    #         if hasattr(obj, attr_name):
+    #             attr = getattr(obj, attr_name)
+    #             if isinstance(attr, (list, tuple)) and len(attr) > 0:
+    #                 explore_model(attr[0], f"{path}.{attr_name}[0]", depth + 1, max_depth)
+    #             elif attr is not None and not isinstance(attr, (str, int, float, bool)):
+    #                 explore_model(attr, f"{path}.{attr_name}", depth + 1, max_depth)
 
-        # Also check self_attn
-        if hasattr(obj, 'self_attn'):
-            explore_model(obj.self_attn, f"{path}.self_attn", depth + 1, max_depth)
+    #     # Also check self_attn
+    #     if hasattr(obj, 'self_attn'):
+    #         explore_model(obj.self_attn, f"{path}.self_attn", depth + 1, max_depth)
 
-    try:
-        explore_model(model)
-    except Exception as e:
-        import traceback
-        print(f"  Error exploring model: {e}")
-        traceback.print_exc()
+    # try:
+    #     explore_model(model)
+    # except Exception as e:
+    #     import traceback
+    #     print(f"  Error exploring model: {e}")
+    #     traceback.print_exc()
 
-    # Also print named_modules to find qk_norm
-    print("\n=== Searching for qk_norm in named_modules ===")
-    try:
-        qk_norm_found = False
-        for name, module in model.named_modules():
-            if 'q_norm' in name or 'k_norm' in name:
-                print(f"  Found: {name} -> {type(module)}")
-                if hasattr(module, 'weight'):
-                    w = module.weight
-                    print(f"    weight shape: {w.shape}, dtype: {w.dtype}")
-                    try:
-                        w_cpu = w.detach().cpu().float()
-                        print(f"    weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}, min={w_cpu.min():.6f}, max={w_cpu.max():.6f}")
-                    except Exception as e:
-                        print(f"    (cannot get weight stats: {e})")
-                qk_norm_found = True
-        if not qk_norm_found:
-            print("  No qk_norm modules found in named_modules")
-    except Exception as e:
-        print(f"  Error searching named_modules: {e}")
+    # # Also print named_modules to find qk_norm
+    # print("\n=== Searching for qk_norm in named_modules ===")
+    # try:
+    #     qk_norm_found = False
+    #     for name, module in model.named_modules():
+    #         if 'q_norm' in name or 'k_norm' in name:
+    #             print(f"  Found: {name} -> {type(module)}")
+    #             if hasattr(module, 'weight'):
+    #                 w = module.weight
+    #                 print(f"    weight shape: {w.shape}, dtype: {w.dtype}")
+    #                 try:
+    #                     w_cpu = w.detach().cpu().float()
+    #                     print(f"    weight stats: mean={w_cpu.mean():.6f}, std={w_cpu.std():.6f}, min={w_cpu.min():.6f}, max={w_cpu.max():.6f}")
+    #                 except Exception as e:
+    #                     print(f"    (cannot get weight stats: {e})")
+    #             qk_norm_found = True
+    #     if not qk_norm_found:
+    #         print("  No qk_norm modules found in named_modules")
+    # except Exception as e:
+    #     print(f"  Error searching named_modules: {e}")
 
-    # Check a sample weight - try different possible structures
-    try:
-        if hasattr(model, 'model'):
-            sample_weight = model.model.layers[0].self_attn.qkv_proj.q_proj.weight
-        elif hasattr(model, 'models'):
-            print(f"Model has 'models' attribute with {len(model.models)} model(s)")
-            sample_weight = model.models[0].layers[0].self_attn.qkv_proj.q_proj.weight
-        else:
-            print("Could not access model layers - skipping weight check")
-            sample_weight = None
+    # # Check a sample weight - try different possible structures
+    # try:
+    #     if hasattr(model, 'model'):
+    #         sample_weight = model.model.layers[0].self_attn.qkv_proj.q_proj.weight
+    #     elif hasattr(model, 'models'):
+    #         print(f"Model has 'models' attribute with {len(model.models)} model(s)")
+    #         sample_weight = model.models[0].layers[0].self_attn.qkv_proj.q_proj.weight
+    #     else:
+    #         print("Could not access model layers - skipping weight check")
+    #         sample_weight = None
 
-        if sample_weight is not None:
-            print(f"\nSample weight (layers.0.self_attn.qkv_proj.q_proj.weight):")
-            print(f"  dtype: {sample_weight.dtype}")
-            print(f"  shape: {sample_weight.shape}")
-            print(f"  device: {sample_weight.device}")
-            if sample_weight.device.type == 'cpu':
-                print(f"  value range: [{sample_weight.min():.6f}, {sample_weight.max():.6f}]")
-                print(f"  mean: {sample_weight.float().mean():.6f}")
-                print(f"  std: {sample_weight.float().std():.6f}")
-            else:
-                print(f"  (weight is on Neuron device, cannot inspect values)")
-    except Exception as e:
-        print(f"Error checking weights: {e}")
+    #     if sample_weight is not None:
+    #         print(f"\nSample weight (layers.0.self_attn.qkv_proj.q_proj.weight):")
+    #         print(f"  dtype: {sample_weight.dtype}")
+    #         print(f"  shape: {sample_weight.shape}")
+    #         print(f"  device: {sample_weight.device}")
+    #         if sample_weight.device.type == 'cpu':
+    #             print(f"  value range: [{sample_weight.min():.6f}, {sample_weight.max():.6f}]")
+    #             print(f"  mean: {sample_weight.float().mean():.6f}")
+    #             print(f"  std: {sample_weight.float().std():.6f}")
+    #         else:
+    #             print(f"  (weight is on Neuron device, cannot inspect values)")
+    # except Exception as e:
+    #     print(f"Error checking weights: {e}")
 
     # Generate outputs.
     print("\n=== Generating outputs ===")
 
     # Test 1: Simple completion (no chat template) to verify model works
-    use_simple_completion = True  # Set to True for simple test
+    use_simple_completion = False  # Set to True for simple test
 
     if use_simple_completion:
         # Simple text completion - easier to verify model behavior
@@ -209,37 +209,37 @@ def generate(skip_compile=False):
     decoded_text = tokenizer.decode(inputs.input_ids[0])
     print(f"Decoded back from tokens: '{decoded_text}'")
 
-    # Debug: Check if token IDs are in valid range
-    vocab_size = tokenizer.vocab_size
-    max_token_id = inputs.input_ids.max().item()
-    min_token_id = inputs.input_ids.min().item()
-    print(f"Tokenizer vocab_size: {vocab_size}")
-    print(f"Model config vocab_size: {model.config.vocab_size}")
-    print(f"Token ID range in input: [{min_token_id}, {max_token_id}]")
-    if max_token_id >= vocab_size:
-        print(f"WARNING: Token ID {max_token_id} exceeds tokenizer vocab_size {vocab_size}!")
-    if max_token_id >= model.config.vocab_size:
-        print(f"WARNING: Token ID {max_token_id} exceeds model config vocab_size {model.config.vocab_size}!")
+    # # Debug: Check if token IDs are in valid range
+    # vocab_size = tokenizer.vocab_size
+    # max_token_id = inputs.input_ids.max().item()
+    # min_token_id = inputs.input_ids.min().item()
+    # print(f"Tokenizer vocab_size: {vocab_size}")
+    # print(f"Model config vocab_size: {model.config.vocab_size}")
+    # print(f"Token ID range in input: [{min_token_id}, {max_token_id}]")
+    # if max_token_id >= vocab_size:
+    #     print(f"WARNING: Token ID {max_token_id} exceeds tokenizer vocab_size {vocab_size}!")
+    # if max_token_id >= model.config.vocab_size:
+    #     print(f"WARNING: Token ID {max_token_id} exceeds model config vocab_size {model.config.vocab_size}!")
 
-    # Debug: Check vocab_size alignment with TP
-    tp_degree = model.config.neuron_config.tp_degree
-    print(f"TP degree: {tp_degree}")
-    print(f"vocab_size % tp_degree = {model.config.vocab_size % tp_degree}")
-    if model.config.vocab_size % tp_degree != 0:
-        print(f"WARNING: vocab_size {model.config.vocab_size} is not divisible by tp_degree {tp_degree}!")
+    # # Debug: Check vocab_size alignment with TP
+    # tp_degree = model.config.neuron_config.tp_degree
+    # print(f"TP degree: {tp_degree}")
+    # print(f"vocab_size % tp_degree = {model.config.vocab_size % tp_degree}")
+    # if model.config.vocab_size % tp_degree != 0:
+    #     print(f"WARNING: vocab_size {model.config.vocab_size} is not divisible by tp_degree {tp_degree}!")
 
-    # Debug: Check what per-rank vocab size would be
-    per_rank_vocab = model.config.vocab_size // tp_degree
-    print(f"Per-rank vocab size: {per_rank_vocab}")
-    print(f"Token 758 would be on rank: {758 // per_rank_vocab} (local idx: {758 % per_rank_vocab})")
-    print(f"Token 5969 would be on rank: {5969 // per_rank_vocab} (local idx: {5969 % per_rank_vocab})")
+    # # Debug: Check what per-rank vocab size would be
+    # per_rank_vocab = model.config.vocab_size // tp_degree
+    # print(f"Per-rank vocab size: {per_rank_vocab}")
+    # print(f"Token 758 would be on rank: {758 // per_rank_vocab} (local idx: {758 % per_rank_vocab})")
+    # print(f"Token 5969 would be on rank: {5969 // per_rank_vocab} (local idx: {5969 % per_rank_vocab})")
 
     generation_model = HuggingFaceGenerationAdapter(model)
     print(f"\nGenerating with max_length={model.config.neuron_config.max_length}...")
 
     # Try greedy decoding first to check if model works correctly
     # If greedy works but sampling doesn't, it's a sampling parameter issue
-    use_greedy = True  # Set to True for deterministic test
+    use_greedy = False  # Set to True for deterministic test
 
     if use_greedy:
         print("Using GREEDY decoding (do_sample=False)")
@@ -275,7 +275,7 @@ def generate(skip_compile=False):
 
 if __name__ == "__main__":
     # Step 1: Compile and save sharded checkpoint (run once, takes time)
-    generate(skip_compile=False)
+    # generate(skip_compile=False)
 
     # Step 2: After compilation, use this for fast loading
-    # generate(skip_compile=True)
+    generate(skip_compile=True)

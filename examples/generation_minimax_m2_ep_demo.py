@@ -83,19 +83,43 @@ Total cores needed: {max(tp_degree, moe_ep_degree * moe_tp_degree)}
     return total_per_core < 24
 
 
-def generate_with_ep(tp_degree=8, moe_ep_degree=32, moe_tp_degree=1):
+def generate_with_ep(tp_degree=64, moe_ep_degree=1, moe_tp_degree=1):
     """
     Run MiniMax M2 with Expert Parallelism.
 
     Args:
-        tp_degree: Tensor parallelism for attention
-        moe_ep_degree: Expert parallelism degree
+        tp_degree: Tensor parallelism for attention (also used for expert distribution when ep_degree=1)
+        moe_ep_degree: Expert parallelism degree (separate from tp_degree)
         moe_tp_degree: Tensor parallelism within each expert
+
+    Configuration Options:
+
+    Option 1: Pure TP (current default, simplest)
+        tp_degree=64, ep_degree=1, moe_ep_degree=1
+        - 64 cores total
+        - Attention: TP=64
+        - Experts: Each core processes 256/64 = 4 experts
+        - world_size = 64 * 1 = 64
+
+    Option 2: TP + EP (requires more cores)
+        tp_degree=8, ep_degree=8, moe_ep_degree=8
+        - 64 cores total (8 * 8)
+        - Attention: TP=8
+        - Experts: EP=8, each EP rank has 32 experts
+        - More complex, but better for very large expert counts
+
+    For MiniMax M2 with 256 experts, Option 1 (pure TP=64) is simpler.
     """
+    # Calculate actual ep_degree for world_size
+    # If moe_ep_degree > 1 and we want separate EP, set ep_degree
+    # Otherwise, ep_degree=1 and TP handles everything
+    ep_degree = moe_ep_degree if moe_ep_degree > 1 else 1
+
     traced_model_path = traced_model_path_template.format(ep=moe_ep_degree, tp=tp_degree)
 
     print(f"\n{'='*60}")
-    print(f"MiniMax M2 with TP={tp_degree}, MoE EP={moe_ep_degree}")
+    print(f"MiniMax M2 with TP={tp_degree}, EP={ep_degree}, MoE EP={moe_ep_degree}")
+    print(f"World size: {tp_degree * ep_degree} cores")
     print(f"{'='*60}")
 
     if not calculate_configuration(tp_degree, moe_ep_degree, moe_tp_degree):
@@ -105,10 +129,13 @@ def generate_with_ep(tp_degree=8, moe_ep_degree=32, moe_tp_degree=1):
     generation_config = GenerationConfig.from_pretrained(model_path)
 
     # Configure with EP
+    # world_size = tp_degree * pp_degree * ep_degree
+    # For pure TP: tp_degree=64, ep_degree=1 -> world_size=64
+    # For TP+EP: tp_degree=8, ep_degree=8 -> world_size=64
     neuron_config = MoENeuronConfig(
         tp_degree=tp_degree,
-        # EP configuration
-        moe_ep_degree=moe_ep_degree,
+        ep_degree=ep_degree,  # For ModelBuilder world_size calculation
+        moe_ep_degree=moe_ep_degree,  # For MoE module internal sharding
         moe_tp_degree=moe_tp_degree,
         batch_size=1,
         max_context_length=1024,
@@ -212,9 +239,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="MiniMax M2 with Expert Parallelism")
-    parser.add_argument("--tp", type=int, default=8, help="Tensor parallelism degree for attention")
-    parser.add_argument("--ep", type=int, default=32, help="Expert parallelism degree")
-    parser.add_argument("--moe-tp", type=int, default=1, help="Tensor parallelism within experts")
+    parser.add_argument("--tp", type=int, default=64, help="Tensor parallelism degree for attention (default: 64)")
+    parser.add_argument("--ep", type=int, default=1, help="Expert parallelism degree (default: 1, meaning TP handles experts)")
+    parser.add_argument("--moe-tp", type=int, default=1, help="Tensor parallelism within experts (default: 1)")
     parser.add_argument("--list", action="store_true", help="List available configurations")
     args = parser.parse_args()
 

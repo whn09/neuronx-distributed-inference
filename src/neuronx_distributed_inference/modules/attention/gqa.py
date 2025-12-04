@@ -915,10 +915,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             model_state_dict[f"{prefix}.{layer_name}.bias"] = tensor
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
-        # Debug: Check if preshard_hook is being called
-        print(f"\n=== GroupQueryAttention_QKV.preshard_hook called ===")
-        print(f"  prefix: {prefix}")
-        print(f"  fused_qkv: {self.fused_qkv}")
+        # # Debug: Check if preshard_hook is being called
+        # print(f"\n=== GroupQueryAttention_QKV.preshard_hook called ===")
+        # print(f"  prefix: {prefix}")
+        # print(f"  fused_qkv: {self.fused_qkv}")
 
         prefix_parts = prefix.split(".")
         prefix = ".".join(prefix_parts[:-1])
@@ -1331,10 +1331,10 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         )
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
-        # Debug: Check if preshard_hook is being called
-        print(f"\n=== GroupQueryAttention_O.preshard_hook called ===")
-        print(f"  prefix: {prefix}")
-        print(f"  layer_name: {self.layer_name}")
+        # # Debug: Check if preshard_hook is being called
+        # print(f"\n=== GroupQueryAttention_O.preshard_hook called ===")
+        # print(f"  prefix: {prefix}")
+        # print(f"  layer_name: {self.layer_name}")
 
         prefix_parts = prefix.split(".")
         prefix = ".".join(prefix_parts[:-1])
