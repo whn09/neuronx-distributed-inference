@@ -345,11 +345,11 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict, config):
     # NXD format: model.layers.X.self_attn.qkv_proj.{q,k,v}_proj.weight
     #             model.layers.X.self_attn.o_proj.o_proj.weight
 
-    # Debug: Check layer 0 attention keys (should be HF format at this point)
-    print("\n=== Checking layer 0 attention keys (HF format, before preshard_hook) ===")
-    layer0_attn_keys = [k for k in neuron_state_dict.keys() if k.startswith('layers.0.self_attn.')]
-    for key in sorted(layer0_attn_keys):
-        print(f"  {key}")
+    # # Debug: Check layer 0 attention keys (should be HF format at this point)
+    # print("\n=== Checking layer 0 attention keys (HF format, before preshard_hook) ===")
+    # layer0_attn_keys = [k for k in neuron_state_dict.keys() if k.startswith('layers.0.self_attn.')]
+    # for key in sorted(layer0_attn_keys):
+    #     print(f"  {key}")
 
     # Calculate sharded num_heads for q_norm/k_norm
     # Use same logic as GQA sharding: with REPLICATE_TO_TP_DEGREE, heads are padded to tp_degree

@@ -181,7 +181,7 @@ def generate(skip_compile=False):
     print("\n=== Generating outputs ===")
 
     # Test 1: Simple completion (no chat template) to verify model works
-    use_simple_completion = False  # Set to True for simple test
+    use_simple_completion = True  # Set to True for simple test
 
     if use_simple_completion:
         # Simple text completion - easier to verify model behavior
@@ -204,6 +204,7 @@ def generate(skip_compile=False):
     inputs = tokenizer([text], padding=True, return_tensors="pt")
     print(f"Input token IDs shape: {inputs.input_ids.shape}")
     print(f"Input token IDs (first 10): {inputs.input_ids[0, :10].tolist()}")
+    print(f"Innputs: {inputs}")
 
     # Debug: Verify tokenization is correct by decoding back
     decoded_text = tokenizer.decode(inputs.input_ids[0])
@@ -239,7 +240,7 @@ def generate(skip_compile=False):
 
     # Try greedy decoding first to check if model works correctly
     # If greedy works but sampling doesn't, it's a sampling parameter issue
-    use_greedy = False  # Set to True for deterministic test
+    use_greedy = True  # Set to True for deterministic test
 
     if use_greedy:
         print("Using GREEDY decoding (do_sample=False)")
