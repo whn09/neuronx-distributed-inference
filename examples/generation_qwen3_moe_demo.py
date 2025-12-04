@@ -21,7 +21,7 @@ def generate(skip_compile=False):
     if not skip_compile:
         neuron_config = MoENeuronConfig(
             # tp_degree=8,
-            tp_degree=64,
+            tp_degree=32,
             batch_size=1,
             max_context_length=128,
             seq_len=1024,
@@ -76,4 +76,5 @@ def generate(skip_compile=False):
 
 
 if __name__ == "__main__":
-    generate()
+    # generate()
+    generate(skip_compile=True)
