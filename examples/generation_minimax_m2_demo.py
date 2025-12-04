@@ -24,22 +24,23 @@ def generate(skip_compile=False):
         # Model uses GQA: num_attention_heads=48, num_key_value_heads=8
         # tp_degree must be a multiple of num_key_value_heads (8) for proper KV head distribution
         neuron_config = MoENeuronConfig(
-            tp_degree=64,  # Must be multiple of num_key_value_heads=8
+            # tp_degree=64,  # Must be multiple of num_key_value_heads=8
+            tp_degree=32,
             # ep_degree=64,
             # moe_tp_degree=1,
             # moe_ep_degree=64,
             batch_size=1,
-            max_context_length=1024,  # default: 128
+            max_context_length=128,  # default: 128
             seq_len=1024,
-            # on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
+            on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
             flash_decoding_enabled=False,
-            # save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
-            # Use torch implementation to bypass NKI kernel's DGE limitation
-            # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
-            blockwise_matmul_config={
-                'use_torch_block_wise': True,
-            },
+            # # save_sharded_checkpoint=True,  # ← 启用！保存分片权重，加载时快很多
+            # # Use torch implementation to bypass NKI kernel's DGE limitation
+            # # (intermediate_size=1536 / tp_degree=64 = 24 < 32 required by DGE)
+            # blockwise_matmul_config={
+            #     'use_torch_block_wise': True,
+            # },
             # MiniMax M2 uses sigmoid activation for router (not softmax)
             router_config={
                 'act_fn': 'sigmoid',

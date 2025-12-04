@@ -20,6 +20,14 @@ from .modeling_minimax_m2 import (
     NeuronMiniMaxM2ForCausalLM,
     NeuronMiniMaxM2Model,
 )
+# v2 implementation following Qwen3 MoE pattern
+from .modeling_minimax_m2_v2 import (
+    MiniMaxM2InferenceConfig as MiniMaxM2InferenceConfigV2,
+    NeuronMiniMaxM2Attention as NeuronMiniMaxM2AttentionV2,
+    NeuronMiniMaxM2DecoderLayer as NeuronMiniMaxM2DecoderLayerV2,
+    NeuronMiniMaxM2ForCausalLM as NeuronMiniMaxM2ForCausalLMV2,
+    NeuronMiniMaxM2Model as NeuronMiniMaxM2ModelV2,
+)
 
 __all__ = [
     "MiniMaxM2Config",
@@ -28,4 +36,10 @@ __all__ = [
     "NeuronMiniMaxM2DecoderLayer",
     "NeuronMiniMaxM2ForCausalLM",
     "NeuronMiniMaxM2Model",
+    # v2 exports
+    "MiniMaxM2InferenceConfigV2",
+    "NeuronMiniMaxM2AttentionV2",
+    "NeuronMiniMaxM2DecoderLayerV2",
+    "NeuronMiniMaxM2ForCausalLMV2",
+    "NeuronMiniMaxM2ModelV2",
 ]
