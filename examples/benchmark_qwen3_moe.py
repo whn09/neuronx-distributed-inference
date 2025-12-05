@@ -356,6 +356,10 @@ def main():
         # Calculate max_length for the benchmark
         max_length = args.input_length + args.output_length
 
+        # For tp_degree=64, moe_intermediate_size=1536 / 64 = 24 < 32, which is below DGE minimum
+        # Use torch blockwise matmul to bypass NKI kernel DGE limitation
+        use_torch_blockwise = args.tp_degree >= 64
+
         neuron_config = MoENeuronConfig(
             tp_degree=args.tp_degree,
             batch_size=args.batch_size,
@@ -370,6 +374,10 @@ def main():
             enable_bucketing=False,
             flash_decoding_enabled=False,
             save_sharded_checkpoint=False,
+            # Use torch blockwise matmul when tp_degree is high to bypass DGE limitation
+            blockwise_matmul_config={
+                'use_torch_block_wise': use_torch_blockwise,
+            } if use_torch_blockwise else {},
         )
 
         config = Qwen3MoeInferenceConfig(
