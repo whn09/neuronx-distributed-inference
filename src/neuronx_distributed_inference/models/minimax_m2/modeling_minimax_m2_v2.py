@@ -599,6 +599,13 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
                         model_sd[updated_param_name] = model_sd[param_name]
                         del model_sd[param_name]
 
+                # Convert HF state dict to Neuron format (router, MoE weights, qk_norm, etc.)
+                model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
+
+                # Handle tied word embeddings if configured
+                if getattr(config, "tie_word_embeddings", False):
+                    cls.update_state_dict_for_tied_weights(model_sd)
+
                 return model_sd
             else:
                 from neuronx_distributed_inference.modules.checkpoint import load_state_dict
