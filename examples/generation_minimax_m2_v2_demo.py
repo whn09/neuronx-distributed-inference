@@ -90,4 +90,5 @@ def generate(skip_compile=False):
 
 if __name__ == "__main__":
     # Compile and run
-    generate(skip_compile=False)
+    generate()
+    # generate(skip_compile=False)

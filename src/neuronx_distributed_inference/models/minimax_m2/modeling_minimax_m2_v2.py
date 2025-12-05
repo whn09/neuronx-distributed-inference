@@ -34,7 +34,9 @@ from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.modules.moe.model import MoE
-from neuronx_distributed.modules.moe.expert_mlps import RoutedExpertsMLPOpsConfig
+from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig
+
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_process_group
 
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
@@ -42,10 +44,111 @@ from neuronx_distributed_inference.modules.attention.attention_base import Neuro
 from neuronx_distributed_inference.modules.attention.gqa import GQA
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_process_group
 
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
+
+
+# NOTE: RankUtil class removed - we use the inherited SPMDRank from NeuronAttentionBase
+# which is properly configured for SPMD parallel execution.
+
+
+class DistributedRMSNorm(nn.Module):
+    """
+    Distributed RMSNorm for MiniMax M2 qk_norm.
+
+    MiniMax M2's qk_norm applies RMSNorm on the full Q/K output (e.g., [6144] dims for Q)
+    BEFORE reshape. In TP parallel, Q/K are sharded, so we need distributed RMS computation:
+    1. Each rank computes local sum(x²)
+    2. All-reduce to get global sum
+    3. Compute global RMS
+    4. Each rank normalizes with global RMS and local weights (sliced dynamically by rank)
+
+    IMPORTANT: Weights are stored as FULL padded size [tp_degree * per_rank_size] because
+    during compilation, preshard_hook doesn't have access to the actual target rank.
+    Instead, we slice weights dynamically during forward() using rank_util.
+    """
+    def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None, padded_hidden_size=None):
+        super().__init__()
+        self.hidden_size = hidden_size  # Per-rank hidden size (e.g., 192 for Q with tp=32)
+        self.full_hidden_size = full_hidden_size or hidden_size  # For RMS divisor (original size, e.g., 6144)
+        self.padded_hidden_size = padded_hidden_size or (hidden_size * tp_degree)  # Full weight size
+        self.variance_epsilon = eps
+        self.tp_degree = tp_degree
+
+        # Store FULL weights - slicing happens dynamically in forward() based on rank
+        self.weight = nn.Parameter(torch.ones(self.padded_hidden_size))
+
+    def forward(self, hidden_states, rank_util=None):
+        from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
+
+        original_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+
+        # Compute local sum of squares (not mean yet)
+        # hidden_states shape: [batch, seq, hidden_size]
+        local_sum_sq = hidden_states.pow(2).sum(-1, keepdim=True)
+
+        # All-reduce to get global sum of squares across all TP ranks
+        if self.tp_degree > 1:
+            global_sum_sq = reduce_from_tensor_model_parallel_region(local_sum_sq)
+        else:
+            global_sum_sq = local_sum_sq
+
+        # Compute global RMS: sqrt(sum(x²) / total_elements)
+        global_variance = global_sum_sq / self.full_hidden_size
+        rsqrt_variance = torch.rsqrt(global_variance + self.variance_epsilon)
+
+        # Normalize with global RMS
+        hidden_states = hidden_states * rsqrt_variance
+
+        # Slice weights dynamically based on rank
+        if rank_util is not None and self.tp_degree > 1:
+            # Reshape weight to [tp_degree, hidden_size] for rank-based indexing
+            weight_reshaped = self.weight.view(self.tp_degree, self.hidden_size)
+            # rank_util.rank is [0, 1, 2, ..., tp_degree-1]
+            rank_index = rank_util.rank[:1]  # Get first element as 1D tensor for index_select
+            local_weight = torch.index_select(weight_reshaped, 0, rank_index).squeeze(0)
+        else:
+            # Single rank or no rank_util - use first slice
+            local_weight = self.weight[:self.hidden_size]
+
+        result = local_weight * hidden_states
+
+        return result.to(original_dtype)
+
+    def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
+        """
+        Validate qk_norm weights during weight loading.
+        Weights are kept at full size and sliced dynamically in forward().
+        """
+        if prefix not in model_state_dict:
+            return
+
+        full_weight = model_state_dict[prefix]
+        # Keep full weight - slicing happens in forward()
+
+
+def get_distributed_rmsnorm_cls():
+    """Get the distributed RMSNorm class for qk_norm."""
+    if cpu_mode():
+        # Wrapper for CPU mode
+        class CPUCompatibleRMSNorm(nn.Module):
+            def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None, padded_hidden_size=None):
+                super().__init__()
+                actual_size = full_hidden_size or hidden_size
+                self.weight = nn.Parameter(torch.ones(actual_size))
+                self.variance_epsilon = eps
+
+            def forward(self, hidden_states, rank_util=None):
+                input_dtype = hidden_states.dtype
+                hidden_states = hidden_states.to(torch.float32)
+                variance = hidden_states.pow(2).mean(-1, keepdim=True)
+                hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+                return (self.weight * hidden_states).to(input_dtype)
+
+        return CPUCompatibleRMSNorm
+    return DistributedRMSNorm
 
 
 def get_rmsnorm_cls():
@@ -113,6 +216,8 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
     """
     Convert HuggingFace MiniMax M2 state dict to Neuron-compatible format.
     """
+    from neuronx_distributed_inference.modules.attention.gqa import get_shardable_head_counts, _maybe_pad_interleaved, GQA
+
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported for MiniMax M2"
 
     # Add rank utility tensor for TP parallel operations
@@ -120,32 +225,36 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
-    # Calculate padded head counts for qk_norm sharding
-    tp_degree = config.neuron_config.tp_degree
-    from neuronx_distributed_inference.modules.attention.gqa import get_shardable_head_counts, _maybe_pad_interleaved
-    padded_num_attention_heads, padded_num_kv_heads = get_shardable_head_counts(
-        tp_degree, config.num_attention_heads, config.num_key_value_heads, GQA_SHARDING_STRATEGY
-    )
-
     # Add rank_util.rank for each attention layer
+    tp_degree = config.neuron_config.tp_degree
     rank_tensor = torch.arange(0, tp_degree, dtype=torch.int32)
     for layer_idx in range(config.num_hidden_layers):
         neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = rank_tensor.clone()
 
+    # Calculate sharded head counts using same logic as GQA sharding
+    sharding_strategy = GQA.REPLICATE_TO_TP_DEGREE
+    padded_num_attention_heads, padded_num_kv_heads = get_shardable_head_counts(
+        tp_degree, config.num_attention_heads, config.num_key_value_heads, sharding_strategy
+    )
+    print(f"\n=== QK norm sharding info ===")
+    print(f"  tp_degree: {tp_degree}")
+    print(f"  padded_num_attention_heads: {padded_num_attention_heads}")
+    print(f"  padded_num_kv_heads: {padded_num_kv_heads}")
+
+    head_dim = config.head_dim
+    has_qk_norm = getattr(config, 'use_qk_norm', True)
+
     for layer_idx in range(config.num_hidden_layers):
-        # Handle QK norm weights: apply interleaved padding to match Q/K projection sharding
-        # MiniMax M2 qk_norm applies RMSNorm on the full Q/K output BEFORE reshape.
-        # The weights are organized as [num_heads * head_dim], e.g., [6144] for Q.
-        has_qk_norm = getattr(config, 'use_qk_norm', False)
+        # Handle QK norm weights using the same interleaved padding as Q projection
         if has_qk_norm:
             # q_norm: apply interleaved padding [48 heads -> 64 heads]
             q_norm_key = f"layers.{layer_idx}.self_attn.q_norm.weight"
             if q_norm_key in neuron_state_dict:
-                q_norm_full = neuron_state_dict[q_norm_key]  # [num_attention_heads * head_dim] = [6144]
+                q_norm_full = neuron_state_dict[q_norm_key]  # [6144]
                 # Apply the same interleaved padding as Q projection weights
-                source_group_size = config.num_attention_heads // config.num_key_value_heads
+                source_group_size = config.num_attention_heads // config.num_key_value_heads  # 48/8 = 6
                 q_norm_padded = _maybe_pad_interleaved(
-                    q_norm_full.unsqueeze(0),  # Add batch dim for the function: [1, 6144]
+                    q_norm_full.unsqueeze(0),  # Add batch dim: [1, 6144]
                     pad_dim=1,
                     source_heads=config.num_attention_heads,  # 48
                     target_heads=padded_num_attention_heads,  # 64
@@ -158,10 +267,10 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
             # k_norm: replicate from 8 to 64 heads
             k_norm_key = f"layers.{layer_idx}.self_attn.k_norm.weight"
             if k_norm_key in neuron_state_dict:
-                k_norm_full = neuron_state_dict[k_norm_key]  # [num_kv_heads * head_dim] = [1024]
-                # KV heads are replicated: each of the 8 original heads is replicated 8 times (64/8=8)
-                k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, config.head_dim)  # [8, 128]
-                repeats = padded_num_kv_heads // config.num_key_value_heads  # 64 / 8 = 8
+                k_norm_full = neuron_state_dict[k_norm_key]  # [1024]
+                # KV heads are replicated: each of the 8 original heads is replicated
+                k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, head_dim)  # [8, 128]
+                repeats = padded_num_kv_heads // config.num_key_value_heads  # 64/8 = 8
                 k_norm_replicated = k_norm_reshaped.repeat_interleave(repeats, dim=0)  # [64, 128]
                 k_norm_padded = k_norm_replicated.reshape(-1)  # [8192]
                 neuron_state_dict[k_norm_key] = k_norm_padded
@@ -281,7 +390,7 @@ class MiniMaxM2InferenceConfig(InferenceConfig):
 class NeuronMiniMaxM2Attention(NeuronAttentionBase):
     """
     MiniMax M2 Attention with:
-    1. QK norm on full projection output (BEFORE reshape)
+    1. QK norm on full projection output (BEFORE reshape) - uses DistributedRMSNorm
     2. Partial RoPE (rotary_dim=64, head_dim=128)
     """
 
@@ -304,34 +413,69 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
             head_dim=config.head_dim,
             rotary_emb=rotary_emb,
             rms_norm_eps=config.rms_norm_eps,
-            # Disable base class qk_norm - we handle it differently
+            # Disable base class qk_norm - we handle it with DistributedRMSNorm
             use_qk_norm=False,
         )
 
-        # MiniMax M2 QK norm: applied on full projection output BEFORE reshape
-        # This is different from Qwen3 which applies per-head after reshape
-        self.use_minimax_qk_norm = getattr(config, 'use_qk_norm', False)
+        # MiniMax M2 qk_norm: applied on FULL projection output BEFORE reshape
+        # This is different from per-head qk_norm (like Qwen3)
+        self.use_distributed_qk_norm = getattr(config, 'use_qk_norm', True)
+        tp_degree = config.neuron_config.tp_degree
 
-        if self.use_minimax_qk_norm:
-            # Full Q dimension: num_attention_heads * head_dim (per TP rank after sharding)
-            # Full K dimension: num_key_value_heads * head_dim (per TP rank after sharding)
-            # Note: self.num_heads and self.num_key_value_heads are already divided by tp_degree
-            q_norm_dim = self.num_heads * self.head_dim
-            k_norm_dim = self.num_key_value_heads * self.head_dim
+        if self.use_distributed_qk_norm:
+            # Use same head count calculation as v1 (matching GQA sharding)
+            from neuronx_distributed_inference.modules.attention.gqa import get_shardable_head_counts, GQA
+            sharding_strategy = GQA.REPLICATE_TO_TP_DEGREE
+            padded_num_attention_heads, padded_num_kv_heads = get_shardable_head_counts(
+                tp_degree, config.num_attention_heads, config.num_key_value_heads, sharding_strategy
+            )
 
-            # Use q_norm/k_norm names to match HF checkpoint naming
-            self.q_norm = get_rmsnorm_cls()(q_norm_dim, config.rms_norm_eps)
-            self.k_norm = get_rmsnorm_cls()(k_norm_dim, config.rms_norm_eps)
+            # Q: self.num_heads is already padded_num_attention_heads / tp_degree from base class
+            q_per_rank_size = self.num_heads * self.head_dim  # e.g., 2 * 128 = 256 per rank
+            q_original_size = config.num_attention_heads * config.head_dim  # 48 * 128 = 6144
+            q_padded_size = padded_num_attention_heads * config.head_dim  # 64 * 128 = 8192
+
+            # K: self.num_key_value_heads is padded_num_kv_heads / tp_degree
+            # For REPLICATE_TO_TP_DEGREE, KV heads are replicated to match padded Q heads
+            k_per_rank_size = self.num_key_value_heads * self.head_dim  # 1 * 128 = 128 per rank
+            # For K normalization, use PADDED size for RMS denominator (because KV heads are replicated)
+            # After all-reduce: global_sum_sq = 8 × original_sum_sq, divide by 8192 to get correct variance
+            k_full_size = padded_num_kv_heads * config.head_dim  # 64 * 128 = 8192
+            k_padded_size = padded_num_kv_heads * config.head_dim  # 64 * 128 = 8192
+
+            DistRMSNorm = get_distributed_rmsnorm_cls()
+            self.q_norm = DistRMSNorm(
+                hidden_size=q_per_rank_size,
+                eps=config.rms_norm_eps,
+                tp_degree=tp_degree,
+                full_hidden_size=q_original_size,
+                padded_hidden_size=q_padded_size,
+            )
+            self.k_norm = DistRMSNorm(
+                hidden_size=k_per_rank_size,
+                eps=config.rms_norm_eps,
+                tp_degree=tp_degree,
+                full_hidden_size=k_full_size,
+                padded_hidden_size=k_padded_size,
+            )
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
+        # NOTE: self.rank_util is already inherited from NeuronAttentionBase (it's an SPMDRank)
+        # We use it directly for dynamic weight slicing in DistributedRMSNorm
+        # Don't override it with a custom RankUtil!
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
                 "NeuronMiniMaxM2Attention requires initialized distributed environment."
             )
 
-    def get_qkv_with_rope(
+    def prep_qkv_tensors(
         self,
-        hidden_states,
         position_ids,
+        hidden_states,
+        past_key_value,
         adapter_ids=None,
         cos_cache=None,
         sin_cache=None,
@@ -340,25 +484,33 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
         residual=None,
         use_polar_compatible_rope=False,
     ):
-        """Override to apply MiniMax M2 qk_norm BEFORE reshape and handle partial RoPE."""
-        from neuronx_distributed_inference.modules.attention.utils import move_heads_front, apply_rotary_pos_emb
+        """Override to handle qk_norm and partial RoPE for MiniMax M2.
+
+        MiniMax M2 applies qk_norm on FULL Q/K projection output BEFORE reshape.
+        This is different from per-head qk_norm (like Qwen3).
+        """
+        from neuronx_distributed_inference.modules.attention.utils import move_heads_front
 
         # Get Q, K, V projections
+        # Q shape: [batch, seq, num_heads * head_dim] (sharded)
+        # K shape: [batch, seq, num_kv_heads * head_dim] (replicated)
+        # V shape: [batch, seq, num_kv_heads * head_dim] (replicated)
         Q, K, V, residual = self.get_qkv_proj()(
             hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids, residual=residual
         )
 
-        # MiniMax M2 qk_norm: apply on full projection output BEFORE reshape
-        if self.use_minimax_qk_norm:
-            Q = self.q_norm(Q)
-            K = self.k_norm(K)
+        # Apply qk_norm BEFORE reshape (MiniMax M2 specific)
+        # This normalizes across the full hidden dimension, not per-head
+        if self.use_distributed_qk_norm and self.q_norm is not None:
+            Q = self.q_norm(Q, rank_util=self.rank_util)
+            K = self.k_norm(K, rank_util=self.rank_util)
 
         # Reshape to [batch, num_heads, seq_len, head_dim]
         bsz, q_len, _ = hidden_states.size()
         if self.sequence_parallel_enabled:
             q_len *= self.tensor_model_parallel_group.size()
 
-        # Don't pass layernorm to move_heads_front since we already applied qk_norm
+        # No per-head layernorm since we already applied qk_norm before reshape
         Q = move_heads_front(Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=None)
         K = move_heads_front(K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
@@ -401,7 +553,10 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
 
 
 def initialize_minimax_m2_moe_module(config: MiniMaxM2InferenceConfig):
-    """Initialize MoE module for MiniMax M2 with sigmoid router and bias support."""
+    """Initialize MoE module for MiniMax M2 with sigmoid router and bias support.
+
+    Uses ExpertMLPsV2 for optimized execution on Neuron, matching v1 implementation.
+    """
     enabled_hybrid_sharding = config.neuron_config.hybrid_sharding_config is not None
     moe_tkg_tensor_model_parallel_group, moe_tkg_expert_model_parallel_group, \
         moe_cte_tensor_model_parallel_group, moe_cte_expert_model_parallel_group = \
@@ -421,6 +576,7 @@ def initialize_minimax_m2_moe_module(config: MiniMaxM2InferenceConfig):
         store_transposed_weights=False,
     )
 
+    # Use ExpertMLPsV2 for optimized execution (matching v1 implementation)
     expert_mlps = ExpertMLPsV2(
         routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(
             num_experts=config.num_local_experts,
@@ -453,7 +609,7 @@ def initialize_minimax_m2_moe_module(config: MiniMaxM2InferenceConfig):
     moe = MoE(
         router=router,
         expert_mlps=expert_mlps,
-        shared_experts=None,
+        shared_experts=None,  # MiniMax M2 doesn't have shared experts
         rmsnorm=None,
         sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
         return_expert_index=config.neuron_config.return_expert_index,
