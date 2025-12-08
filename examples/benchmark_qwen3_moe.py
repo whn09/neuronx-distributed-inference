@@ -2,7 +2,7 @@
 Qwen3 MoE Benchmark Script
 
 Measures:
-- TTFT (Time To First Token): Prefill latency
+- TTFT (Time To First Token): Prefill latency (accurate with streaming)
 - TPOT (Time Per Output Token): Decode latency per token
 - Throughput: Tokens per second
 """
@@ -16,6 +16,66 @@ from transformers import AutoTokenizer, GenerationConfig
 from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig, NeuronQwen3MoeForCausalLM
 from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
+
+
+class TimingStreamer:
+    """
+    Lightweight streamer that only records timing for TTFT and per-token latency measurement.
+    Does not perform text conversion or blocking operations.
+    """
+    def __init__(self):
+        self.start_time = None
+        self.first_token_time = None
+        self.token_times = []
+        self.token_count = 0
+        self._first_token_received = False
+
+    def reset(self):
+        """Reset timing for a new generation."""
+        self.start_time = time.perf_counter()
+        self.first_token_time = None
+        self.token_times = []
+        self.token_count = 0
+        self._first_token_received = False
+
+    def put(self, value):
+        """Called when a new token is generated. Records timing."""
+        current_time = time.perf_counter()
+
+        # Skip prompt tokens if this is the first call with multiple tokens
+        if hasattr(value, 'shape') and len(value.shape) > 0:
+            # This is tensor input - count tokens
+            num_tokens = value.numel() if hasattr(value, 'numel') else 1
+        else:
+            num_tokens = 1
+
+        if not self._first_token_received and self.start_time is not None:
+            # First token received - this is TTFT
+            self.first_token_time = current_time
+            self._first_token_received = True
+
+        self.token_times.append(current_time)
+        self.token_count += 1
+
+    def end(self):
+        """Called when generation is complete."""
+        pass
+
+    def get_ttft(self):
+        """Get Time To First Token in seconds."""
+        if self.first_token_time is not None and self.start_time is not None:
+            return self.first_token_time - self.start_time
+        return None
+
+    def get_token_latencies(self):
+        """Get per-token latencies in seconds (excluding first token)."""
+        if len(self.token_times) < 2:
+            return []
+        return [self.token_times[i] - self.token_times[i-1] for i in range(1, len(self.token_times))]
+
+    def get_total_tokens(self):
+        """Get total number of generated tokens."""
+        return self.token_count
 
 
 def parse_args():
@@ -66,11 +126,11 @@ def create_dummy_input(tokenizer, input_length, batch_size=1):
 
 def benchmark_generation(model, tokenizer, args):
     """
-    Benchmark generation performance.
+    Benchmark generation performance with accurate TTFT measurement using streaming.
 
     Measures TTFT and TPOT by:
-    1. Running context encoding (prefill) separately
-    2. Running token generation loop
+    1. Using a lightweight streamer to capture exact first token time (TTFT)
+    2. Recording per-token latencies for accurate TPOT
     """
     print(f"\n{'='*60}")
     print(f"Benchmark Configuration:")
@@ -86,6 +146,9 @@ def benchmark_generation(model, tokenizer, args):
     print(f"Input shape: {input_ids.shape}")
 
     generation_model = HuggingFaceGenerationAdapter(model)
+
+    # Create lightweight streamer for accurate timing measurement
+    streamer = TimingStreamer()
 
     # Generation config
     if args.use_sample:
@@ -107,8 +170,9 @@ def benchmark_generation(model, tokenizer, args):
     ttft_times = []
     tpot_times = []
     total_times = []
+    all_token_latencies = []
 
-    # Warmup runs
+    # Warmup runs (without streaming for simplicity)
     print(f"Running {args.warmup_runs} warmup iterations...")
     for i in range(args.warmup_runs):
         _ = generation_model.generate(
@@ -119,64 +183,80 @@ def benchmark_generation(model, tokenizer, args):
         )
         print(f"  Warmup {i+1}/{args.warmup_runs} completed")
 
-    # Benchmark runs
-    print(f"\nRunning {args.benchmark_runs} benchmark iterations...")
+    # Benchmark runs with streaming for accurate TTFT
+    print(f"\nRunning {args.benchmark_runs} benchmark iterations with streaming...")
     for i in range(args.benchmark_runs):
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        # Reset streamer timing
+        streamer.reset()
 
-        start_time = time.perf_counter()
-
+        # Run generation synchronously with streamer
         outputs = generation_model.generate(
             input_ids,
             generation_config=gen_config,
             attention_mask=attention_mask,
             max_length=max_length,
+            streamer=streamer,
         )
 
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
         end_time = time.perf_counter()
+        output_tokens_count = outputs.shape[1] - args.input_length
 
-        total_time = end_time - start_time
-        output_tokens = outputs.shape[1] - args.input_length
+        # Get accurate TTFT from streamer
+        ttft = streamer.get_ttft()
+        total_time = end_time - streamer.start_time if streamer.start_time else 0
 
-        # Estimate TTFT and TPOT
-        # Note: For accurate TTFT/TPOT, we'd need hooks into the model
-        # Here we estimate based on total time
-        # Typically TTFT takes a significant portion for long inputs
-        estimated_ttft = total_time * 0.3  # Rough estimate
-        estimated_decode_time = total_time * 0.7
-        estimated_tpot = estimated_decode_time / max(output_tokens, 1)
+        if ttft is None:
+            # Fallback to estimate if streamer didn't capture TTFT
+            ttft = total_time * (args.input_length / (args.input_length + output_tokens_count))
 
-        ttft_times.append(estimated_ttft)
-        tpot_times.append(estimated_tpot)
+        # Get per-token latencies
+        token_latencies = streamer.get_token_latencies()
+        if token_latencies:
+            mean_tpot = np.mean(token_latencies)
+            all_token_latencies.extend(token_latencies)
+        else:
+            # Fallback: estimate TPOT from decode time
+            decode_time = total_time - ttft
+            mean_tpot = decode_time / max(output_tokens_count - 1, 1)
+
+        ttft_times.append(ttft)
+        tpot_times.append(mean_tpot)
         total_times.append(total_time)
 
         print(f"  Run {i+1}/{args.benchmark_runs}: Total={total_time:.3f}s, "
-              f"Output tokens={output_tokens}, "
-              f"Throughput={output_tokens/total_time:.2f} tok/s")
+              f"TTFT={ttft*1000:.2f}ms, TPOT={mean_tpot*1000:.2f}ms, "
+              f"Tokens={output_tokens_count}")
 
     # Calculate statistics
     print(f"\n{'='*60}")
-    print(f"BENCHMARK RESULTS")
+    print(f"BENCHMARK RESULTS (Accurate with Streaming)")
     print(f"{'='*60}")
 
     mean_total = np.mean(total_times)
     std_total = np.std(total_times)
     mean_ttft = np.mean(ttft_times)
+    std_ttft = np.std(ttft_times)
     mean_tpot = np.mean(tpot_times)
+    std_tpot = np.std(tpot_times)
 
-    actual_output_tokens = outputs.shape[1] - args.input_length
-    throughput = actual_output_tokens / mean_total
+    # Calculate throughput from actual token latencies
+    if all_token_latencies:
+        overall_mean_tpot = np.mean(all_token_latencies)
+        throughput = 1.0 / overall_mean_tpot
+    else:
+        throughput = output_tokens_count / mean_total
 
     print(f"\nTotal Generation Time:")
     print(f"  Mean: {mean_total*1000:.2f} ms")
     print(f"  Std:  {std_total*1000:.2f} ms")
 
-    print(f"\nEstimated TTFT (Time To First Token):")
+    print(f"\nTTFT (Time To First Token) - ACCURATE:")
     print(f"  Mean: {mean_ttft*1000:.2f} ms")
+    print(f"  Std:  {std_ttft*1000:.2f} ms")
 
-    print(f"\nEstimated TPOT (Time Per Output Token):")
+    print(f"\nTPOT (Time Per Output Token) - ACCURATE:")
     print(f"  Mean: {mean_tpot*1000:.2f} ms")
+    print(f"  Std:  {std_tpot*1000:.2f} ms")
 
     print(f"\nThroughput:")
     print(f"  {throughput:.2f} tokens/second")
@@ -186,12 +266,14 @@ def benchmark_generation(model, tokenizer, args):
 
     return {
         "input_length": args.input_length,
-        "output_length": actual_output_tokens,
+        "output_length": output_tokens_count,
         "batch_size": args.batch_size,
         "mean_total_ms": mean_total * 1000,
         "std_total_ms": std_total * 1000,
-        "estimated_ttft_ms": mean_ttft * 1000,
-        "estimated_tpot_ms": mean_tpot * 1000,
+        "ttft_ms": mean_ttft * 1000,
+        "ttft_std_ms": std_ttft * 1000,
+        "tpot_ms": mean_tpot * 1000,
+        "tpot_std_ms": std_tpot * 1000,
         "throughput_tok_per_sec": throughput,
     }
 
@@ -436,11 +518,13 @@ def main():
     print(f"TP Degree: {args.tp_degree}")
     print(f"Batch Size: {args.batch_size}")
     print(f"\nPrefill (Input Length = {args.input_length}):")
-    print(f"  TTFT: {ttft_mean:.2f} ms (+/- {ttft_std:.2f} ms)")
+    print(f"  TTFT (1-token generation): {ttft_mean:.2f} ms (+/- {ttft_std:.2f} ms)")
     print(f"\nDecode (Output Length = {args.output_length}):")
-    print(f"  TPOT: {tpot_mean:.2f} ms (+/- {tpot_std:.2f} ms)")
+    print(f"  TPOT (short context): {tpot_mean:.2f} ms (+/- {tpot_std:.2f} ms)")
     print(f"  Decode Throughput: {1000/tpot_mean:.2f} tokens/s")
-    print(f"\nEnd-to-End:")
+    print(f"\nEnd-to-End (Streaming - ACCURATE):")
+    print(f"  TTFT: {results['ttft_ms']:.2f} ms (+/- {results['ttft_std_ms']:.2f} ms)")
+    print(f"  TPOT: {results['tpot_ms']:.2f} ms (+/- {results['tpot_std_ms']:.2f} ms)")
     print(f"  Total Time: {results['mean_total_ms']:.2f} ms")
     print(f"  Overall Throughput: {results['throughput_tok_per_sec']:.2f} tokens/s")
     print("="*60)

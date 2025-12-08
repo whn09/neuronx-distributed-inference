@@ -159,6 +159,9 @@ class HuggingFaceGenerationAdapter(GenerationMixin, PreTrainedModel):
         )
         do_sample = generation_config.do_sample
 
+        # Extract streamer if provided
+        streamer = model_kwargs.pop("streamer", None)
+
         batch_size = model_kwargs["attention_mask"].shape[0]
         sampling_params = prepare_sampling_params(
             batch_size=batch_size,
@@ -229,6 +232,10 @@ class HuggingFaceGenerationAdapter(GenerationMixin, PreTrainedModel):
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
 
+            # Call streamer if provided
+            if streamer is not None:
+                streamer.put(next_tokens)
+
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
@@ -237,6 +244,10 @@ class HuggingFaceGenerationAdapter(GenerationMixin, PreTrainedModel):
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)
             this_peer_finished = unfinished_sequences.max() == 0
+
+        # Signal end of generation to streamer
+        if streamer is not None:
+            streamer.end()
 
         if return_dict_in_generate:
             return SampleDecoderOnlyOutput(
