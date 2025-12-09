@@ -243,4 +243,32 @@ python3 benchmark_qwen3_moe.py \
     --traced-model-path /home/ubuntu/traced_model/Qwen3-235B-A22B-benchmark-bs4/
 ```
 
+**Batch Size 8:**
+```bash
+python3 benchmark_qwen3_moe.py \
+    --compile \
+    --input-length 10240 \
+    --output-length 256 \
+    --tp-degree 32 \
+    --batch-size 8 \
+    --warmup-runs 3 \
+    --benchmark-runs 5 \
+    --traced-model-path /home/ubuntu/traced_model/Qwen3-235B-A22B-benchmark-bs8/
+```
+
+**Batch Size 16:**
+```bash
+python3 benchmark_qwen3_moe.py \
+    --compile \
+    --input-length 10240 \
+    --output-length 256 \
+    --tp-degree 64 \
+    --moe-tp-degree 2 \
+    --moe-ep-degree 32 \
+    --batch-size 16 \
+    --warmup-runs 3 \
+    --benchmark-runs 5 \
+    --traced-model-path /home/ubuntu/traced_model/Qwen3-235B-A22B-benchmark-bs16/
+```
+
 Script location: `/home/ubuntu/neuronx-distributed-inference/examples/benchmark_qwen3_moe.py`

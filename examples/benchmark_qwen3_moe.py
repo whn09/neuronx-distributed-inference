@@ -85,7 +85,11 @@ def parse_args():
     parser.add_argument("--traced-model-path", type=str, default="/home/ubuntu/traced_model/Qwen3-235B-A22B-benchmark/",
                         help="Path to save/load traced model")
     parser.add_argument("--tp-degree", type=int, default=32,
-                        help="Tensor parallel degree")
+                        help="Tensor parallel degree (total parallel degree = moe_tp * moe_ep)")
+    parser.add_argument("--moe-tp-degree", type=int, default=None,
+                        help="MoE Tensor parallel degree (default: tp_degree, no EP)")
+    parser.add_argument("--moe-ep-degree", type=int, default=1,
+                        help="MoE Expert parallel degree (default: 1)")
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Batch size")
     parser.add_argument("--input-length", type=int, default=10240,
@@ -438,12 +442,26 @@ def main():
         # Calculate max_length for the benchmark
         max_length = args.input_length + args.output_length
 
+        # Determine MoE TP/EP degrees
+        moe_ep_degree = args.moe_ep_degree
+        moe_tp_degree = args.moe_tp_degree if args.moe_tp_degree else args.tp_degree
+
+        # Validate: tp_degree should equal moe_tp_degree * moe_ep_degree when using EP
+        if moe_ep_degree > 1:
+            expected_tp = moe_tp_degree * moe_ep_degree
+            if args.tp_degree != expected_tp:
+                print(f"Warning: tp_degree ({args.tp_degree}) should equal moe_tp_degree ({moe_tp_degree}) * moe_ep_degree ({moe_ep_degree}) = {expected_tp}")
+                print(f"Adjusting tp_degree to {expected_tp}")
+                args.tp_degree = expected_tp
+
         # For tp_degree=64, moe_intermediate_size=1536 / 64 = 24 < 32, which is below DGE minimum
         # Use torch blockwise matmul to bypass NKI kernel DGE limitation
         use_torch_blockwise = args.tp_degree >= 64
 
         neuron_config = MoENeuronConfig(
             tp_degree=args.tp_degree,
+            moe_tp_degree=moe_tp_degree,
+            moe_ep_degree=moe_ep_degree,
             batch_size=args.batch_size,
             max_context_length=args.input_length,  # Support full input length for prefill
             seq_len=max_length,  # Total sequence length including generation
@@ -457,9 +475,9 @@ def main():
             flash_decoding_enabled=False,
             save_sharded_checkpoint=False,
             # Use torch blockwise matmul when tp_degree is high to bypass DGE limitation
-            blockwise_matmul_config={
-                'use_torch_block_wise': use_torch_blockwise,
-            } if use_torch_blockwise else {},
+            # blockwise_matmul_config={
+            #     'use_torch_block_wise': use_torch_blockwise,
+            # } if use_torch_blockwise else {},
         )
 
         config = Qwen3MoeInferenceConfig(
@@ -472,6 +490,8 @@ def main():
 
         print(f"\nCompiling with:")
         print(f"  TP Degree: {args.tp_degree}")
+        print(f"  MoE TP Degree: {moe_tp_degree}")
+        print(f"  MoE EP Degree: {moe_ep_degree}")
         print(f"  Batch Size: {args.batch_size}")
         print(f"  Max Context Length: {args.input_length}")
         print(f"  Max Sequence Length: {max_length}")
@@ -516,6 +536,10 @@ def main():
     print("="*60)
     print(f"Model: {args.model_path}")
     print(f"TP Degree: {args.tp_degree}")
+    if args.moe_ep_degree > 1:
+        moe_tp = args.moe_tp_degree if args.moe_tp_degree else args.tp_degree
+        print(f"MoE TP Degree: {moe_tp}")
+        print(f"MoE EP Degree: {args.moe_ep_degree}")
     print(f"Batch Size: {args.batch_size}")
     print(f"\nPrefill (Input Length = {args.input_length}):")
     print(f"  TTFT (1-token generation): {ttft_mean:.2f} ms (+/- {ttft_std:.2f} ms)")

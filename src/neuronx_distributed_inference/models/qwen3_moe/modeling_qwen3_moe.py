@@ -14,6 +14,7 @@
 """ Qwen3 MOE model for NXD inference."""
 import gc
 import warnings
+import copy
 from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
@@ -41,6 +42,7 @@ from neuronx_distributed_inference.models.config import InferenceConfig, MoENeur
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.moe import initialize_moe_module
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module as initialize_moe_module_v2
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
@@ -264,14 +266,27 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronQwen3MoEAttention(config=config)
 
-        self.mlp = initialize_moe_module(
-            config=config,
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        if config.neuron_config.blockwise_matmul_config.use_torch_block_wise is not True:
+            self.mlp = initialize_moe_module(
+                config=config,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                hidden_act=config.hidden_act,
+            )
+        else:
+            # Create a copy of config and adapt attribute names for moe_v2
+            # moe_v2 expects num_local_experts, intermediate_size, n_shared_experts
+            moe_config = copy.deepcopy(config)
+            moe_config.num_local_experts = config.num_experts
+            moe_config.intermediate_size = config.moe_intermediate_size
+            moe_config.n_shared_experts = 0  # Qwen3MOE does not have shared experts
+            # Set normalize_top_k_affinities based on Qwen3's norm_topk_prob
+            moe_config.neuron_config.normalize_top_k_affinities = config.norm_topk_prob
+            self.mlp = initialize_moe_module_v2(
+                config=moe_config
+            )
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
