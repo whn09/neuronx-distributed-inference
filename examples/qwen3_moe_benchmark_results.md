@@ -243,7 +243,7 @@ python3 benchmark_qwen3_moe.py \
     --traced-model-path /home/ubuntu/traced_model/Qwen3-235B-A22B-benchmark-bs4/
 ```
 
-**Batch Size 8:**
+**Batch Size 8 ([ERROR] [NCC_VRF009] Memory requirement exceeds target architecture's HBM limit. Needed 19004423264 bytes (17 GB) vs. available 17179869184 bytes (16 GB). TIP: Consider using smaller batches or applying model parallelism):**
 ```bash
 python3 benchmark_qwen3_moe.py \
     --compile \
@@ -260,7 +260,7 @@ python3 benchmark_qwen3_moe.py \
 ```bash
 python3 benchmark_qwen3_moe.py \
     --compile \
-    --input-length 10240 \
+    --input-length 4096 \
     --output-length 256 \
     --tp-degree 64 \
     --moe-tp-degree 2 \
@@ -269,6 +269,22 @@ python3 benchmark_qwen3_moe.py \
     --warmup-runs 3 \
     --benchmark-runs 5 \
     --traced-model-path /home/ubuntu/traced_model/Qwen3-235B-A22B-benchmark-bs16/
+```
+
+**Batch Size 16 (Qwen3-30B-A3B):**
+```bash
+python3 benchmark_qwen3_moe.py \
+    --model-path /home/ubuntu/model_hf/Qwen3-30B-A3B/ \
+    --compile \
+    --input-length 10240 \
+    --output-length 256 \
+    --tp-degree 8 \
+    --moe-tp-degree 2 \
+    --moe-ep-degree 4 \
+    --batch-size 16 \
+    --warmup-runs 3 \
+    --benchmark-runs 5 \
+    --traced-model-path /home/ubuntu/traced_model/Qwen3-30B-A3B-benchmark-bs16/
 ```
 
 Script location: `/home/ubuntu/neuronx-distributed-inference/examples/benchmark_qwen3_moe.py`

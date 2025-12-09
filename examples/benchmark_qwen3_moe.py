@@ -353,7 +353,7 @@ def benchmark_prefill_only(model, tokenizer, args):
 def benchmark_decode_only(model, tokenizer, args, short_context=128):
     """
     Benchmark decode (token generation) with short context.
-    This gives more accurate TPOT measurement.
+    This gives more accurate TPOT measurement by using streaming to capture exact timing.
     """
     print(f"\n{'='*60}")
     print(f"DECODE BENCHMARK (TPOT)")
@@ -375,6 +375,25 @@ def benchmark_decode_only(model, tokenizer, args, short_context=128):
 
     max_length = short_context + args.output_length
 
+    # First, measure prefill time accurately by generating just 1 token
+    print(f"\nMeasuring prefill time for context length {short_context}...")
+    prefill_gen_config = GenerationConfig(do_sample=False, max_new_tokens=1)
+    prefill_times = []
+    for _ in range(3):  # 3 measurements for accuracy
+        start = time.perf_counter()
+        _ = generation_model.generate(
+            input_ids,
+            generation_config=prefill_gen_config,
+            attention_mask=attention_mask,
+            max_length=short_context + 1,
+        )
+        prefill_times.append(time.perf_counter() - start)
+    measured_prefill = np.mean(prefill_times)
+    print(f"  Measured prefill time: {measured_prefill*1000:.2f} ms")
+
+    # Create streamer for accurate per-token timing
+    streamer = TimingStreamer()
+
     # Warmup
     print(f"\nWarmup runs...")
     for i in range(args.warmup_runs):
@@ -386,43 +405,64 @@ def benchmark_decode_only(model, tokenizer, args, short_context=128):
         )
         print(f"  Warmup {i+1}/{args.warmup_runs}")
 
-    # Benchmark
+    # Benchmark with streaming for accurate TPOT
     decode_times = []
     tpot_times = []
-    print(f"\nBenchmark runs...")
+    all_token_latencies = []
+    print(f"\nBenchmark runs (with streaming)...")
     for i in range(args.benchmark_runs):
-        start_time = time.perf_counter()
+        streamer.reset()
 
         outputs = generation_model.generate(
             input_ids,
             generation_config=gen_config,
             attention_mask=attention_mask,
             max_length=max_length,
+            streamer=streamer,
         )
 
         end_time = time.perf_counter()
-        total_time = end_time - start_time
+        total_time = end_time - streamer.start_time
         output_tokens = outputs.shape[1] - short_context
 
-        # Subtract estimated prefill time (for short context, it's small)
-        estimated_prefill = total_time * 0.05  # ~5% for short context
-        decode_time = total_time - estimated_prefill
-        tpot = decode_time / max(output_tokens, 1)
+        # Get accurate TTFT from streamer (this is prefill + first token)
+        ttft = streamer.get_ttft()
+        if ttft is None:
+            ttft = measured_prefill
+
+        # Calculate decode time (excluding prefill/first token)
+        decode_time = total_time - ttft
+
+        # Get per-token latencies from streamer (most accurate TPOT)
+        token_latencies = streamer.get_token_latencies()
+        if token_latencies:
+            mean_tpot = np.mean(token_latencies)
+            all_token_latencies.extend(token_latencies)
+        else:
+            # Fallback: calculate from decode time
+            mean_tpot = decode_time / max(output_tokens - 1, 1)
 
         decode_times.append(decode_time)
-        tpot_times.append(tpot)
-        print(f"  Run {i+1}: Decode={decode_time*1000:.2f}ms, "
-              f"TPOT={tpot*1000:.2f}ms, Tokens={output_tokens}")
+        tpot_times.append(mean_tpot)
+        print(f"  Run {i+1}: Total={total_time*1000:.2f}ms, TTFT={ttft*1000:.2f}ms, "
+              f"Decode={decode_time*1000:.2f}ms, TPOT={mean_tpot*1000:.2f}ms, Tokens={output_tokens}")
 
-    mean_tpot = np.mean(tpot_times)
-    std_tpot = np.std(tpot_times)
+    # Calculate final statistics from all token latencies (most accurate)
+    if all_token_latencies:
+        mean_tpot = np.mean(all_token_latencies)
+        std_tpot = np.std(all_token_latencies)
+    else:
+        mean_tpot = np.mean(tpot_times)
+        std_tpot = np.std(tpot_times)
 
     print(f"\n{'='*60}")
     print(f"TPOT Results (Output Length = {args.output_length}):")
     print(f"  Mean: {mean_tpot*1000:.2f} ms")
     print(f"  Std:  {std_tpot*1000:.2f} ms")
-    print(f"  Min:  {min(tpot_times)*1000:.2f} ms")
-    print(f"  Max:  {max(tpot_times)*1000:.2f} ms")
+    if all_token_latencies:
+        print(f"  Min:  {min(all_token_latencies)*1000:.2f} ms")
+        print(f"  Max:  {max(all_token_latencies)*1000:.2f} ms")
+        print(f"  Samples: {len(all_token_latencies)} token latencies")
     print(f"  Throughput: {1000/mean_tpot:.2f} tokens/s")
     print(f"{'='*60}")
 
@@ -475,9 +515,9 @@ def main():
             flash_decoding_enabled=False,
             save_sharded_checkpoint=False,
             # Use torch blockwise matmul when tp_degree is high to bypass DGE limitation
-            # blockwise_matmul_config={
-            #     'use_torch_block_wise': use_torch_blockwise,
-            # } if use_torch_blockwise else {},
+            blockwise_matmul_config={
+                'use_torch_block_wise': use_torch_blockwise,
+            } if use_torch_blockwise else {},
         )
 
         config = Qwen3MoeInferenceConfig(
