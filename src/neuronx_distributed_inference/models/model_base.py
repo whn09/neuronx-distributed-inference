@@ -2,6 +2,7 @@ import copy
 import inspect
 import logging
 import os
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import neuronx_distributed as nxd
