@@ -156,7 +156,7 @@ def get_rmsnorm_cls():
 
 class MiniMaxM2QKNorm(nn.Module):
     """
-    QK Norm for MiniMax M2 - applied BEFORE reshape (on full projection output).
+    Distributed QK Norm for MiniMax M2 - applied BEFORE reshape (on full projection output).
 
     In MiniMax M2, qk_norm is applied on the full Q/K projection output:
     - Q: [batch, seq, num_attention_heads * head_dim]
@@ -165,25 +165,40 @@ class MiniMaxM2QKNorm(nn.Module):
     This is different from Qwen3 MoE which applies per-head norm after reshape.
 
     For tensor parallel:
+    - Each rank computes local sum(x²)
+    - All-reduce to get global sum across all TP ranks
+    - Compute global RMS normalization
     - Stores FULL padded weights [tp_degree * per_rank_size]
     - Dynamically slices weights in forward() based on rank
-    - This avoids preshard_hook issues during weight loading
     """
     def __init__(self, hidden_size, eps=1e-6, tp_degree=1):
         super().__init__()
         self.hidden_size = hidden_size  # Per-rank hidden size
         self.variance_epsilon = eps
         self.tp_degree = tp_degree
+        # Full hidden size for RMS divisor (original full size across all ranks)
+        self.full_hidden_size = hidden_size * tp_degree
         # Store FULL weights - will be sliced dynamically in forward()
-        self.full_weight_size = hidden_size * tp_degree
-        self.weight = nn.Parameter(torch.ones(self.full_weight_size))
+        self.weight = nn.Parameter(torch.ones(self.full_hidden_size))
 
     def forward(self, hidden_states):
+        from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
+
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        # Apply RMSNorm on the last dimension (per-rank shard)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+
+        # Compute local sum of squares (not mean yet - need global normalization)
+        local_sum_sq = hidden_states.pow(2).sum(-1, keepdim=True)
+
+        # All-reduce to get global sum of squares across all TP ranks
+        if self.tp_degree > 1:
+            global_sum_sq = reduce_from_tensor_model_parallel_region(local_sum_sq)
+        else:
+            global_sum_sq = local_sum_sq
+
+        # Compute global RMS: sqrt(sum(x²) / total_elements)
+        global_variance = global_sum_sq / self.full_hidden_size
+        hidden_states = hidden_states * torch.rsqrt(global_variance + self.variance_epsilon)
 
         # Dynamically slice weight based on TP rank
         if self.tp_degree > 1:
@@ -232,6 +247,11 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
     """
     Convert HuggingFace MiniMax M2 state dict to Neuron-compatible format.
     Updated for v3 following Qwen3 MoE pattern.
+
+    Optimized for memory efficiency:
+    - Uses torch.no_grad() to avoid gradient tracking overhead
+    - Avoids unnecessary .clone() by using direct tensor views
+    - Periodic gc.collect() during expert processing
     """
     from neuronx_distributed_inference.modules.attention.gqa import get_shardable_head_counts, _maybe_pad_interleaved, GQA
 
@@ -240,144 +260,152 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
     # Dequantize layers if needed (v3: added from Qwen3 MoE)
     maybe_dequantize_layer(neuron_state_dict, config)
 
-    # Add rank utility tensor for TP parallel operations
-    neuron_state_dict["rank_util.rank"] = torch.arange(
-        0, config.neuron_config.tp_degree, dtype=torch.int32
-    )
-
-    # Calculate sharded head counts for qk_norm weight handling
-    tp_degree = config.neuron_config.tp_degree
-    sharding_strategy = GQA.REPLICATE_TO_TP_DEGREE
-    padded_num_attention_heads, padded_num_kv_heads = get_shardable_head_counts(
-        tp_degree, config.num_attention_heads, config.num_key_value_heads, sharding_strategy
-    )
-    head_dim = config.head_dim
-    has_qk_norm = getattr(config, 'use_qk_norm', True)
-
-    for layer_idx in range(config.num_hidden_layers):
-        # Add rank_util.rank for each attention layer
-        neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
+    # Wrap in no_grad to avoid any gradient tracking overhead
+    with torch.no_grad():
+        # Add rank utility tensor for TP parallel operations
+        neuron_state_dict["rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
         )
 
-        # MiniMax M2 qk_norm weights - need to shard for TP parallel
-        # HF model: q_norm.weight shape = [num_attention_heads * head_dim] = [6144]
-        # HF model: k_norm.weight shape = [num_key_value_heads * head_dim] = [1024]
-        if has_qk_norm:
-            # q_norm: apply interleaved padding [48 heads -> padded heads]
-            q_norm_key = f"layers.{layer_idx}.self_attn.q_norm.weight"
-            if q_norm_key in neuron_state_dict:
-                q_norm_full = neuron_state_dict[q_norm_key]  # [6144]
-                # Apply the same interleaved padding as Q projection weights
-                source_group_size = config.num_attention_heads // config.num_key_value_heads
-                q_norm_padded = _maybe_pad_interleaved(
-                    q_norm_full.unsqueeze(0),  # Add batch dim: [1, 6144]
-                    pad_dim=1,
-                    source_heads=config.num_attention_heads,
-                    target_heads=padded_num_attention_heads,
-                    source_group_size=source_group_size,
-                ).squeeze(0)  # [padded_num_attention_heads * head_dim]
-                neuron_state_dict[q_norm_key] = q_norm_padded
-                if layer_idx == 0:
-                    print(f"  q_norm: {q_norm_full.shape} -> {q_norm_padded.shape} (interleaved padding)")
-
-            # k_norm: replicate from original KV heads to padded KV heads
-            k_norm_key = f"layers.{layer_idx}.self_attn.k_norm.weight"
-            if k_norm_key in neuron_state_dict:
-                k_norm_full = neuron_state_dict[k_norm_key]  # [1024]
-                # KV heads are replicated: each of the original heads is replicated
-                k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, head_dim)
-                repeats = padded_num_kv_heads // config.num_key_value_heads
-                k_norm_replicated = k_norm_reshaped.repeat_interleave(repeats, dim=0)
-                k_norm_padded = k_norm_replicated.reshape(-1)  # [padded_num_kv_heads * head_dim]
-                neuron_state_dict[k_norm_key] = k_norm_padded
-                if layer_idx == 0:
-                    print(f"  k_norm: {k_norm_full.shape} -> {k_norm_padded.shape} (replicated {repeats}x)")
-
-        # Copy router weights: gate -> router.linear_router
-        neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.router.linear_router.weight"] = (
-            neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.gate.weight"].detach().clone()
+        # Calculate sharded head counts for qk_norm weight handling
+        tp_degree = config.neuron_config.tp_degree
+        sharding_strategy = GQA.REPLICATE_TO_TP_DEGREE
+        padded_num_attention_heads, padded_num_kv_heads = get_shardable_head_counts(
+            tp_degree, config.num_attention_heads, config.num_key_value_heads, sharding_strategy
         )
-        del neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.gate.weight"]
+        head_dim = config.head_dim
+        has_qk_norm = getattr(config, 'use_qk_norm', True)
 
-        # Handle e_score_correction_bias
-        bias_key = f"layers.{layer_idx}.block_sparse_moe.e_score_correction_bias"
-        if bias_key in neuron_state_dict:
-            neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.router.e_score_correction_bias"] = (
-                neuron_state_dict[bias_key].detach().clone()
-            )
-            del neuron_state_dict[bias_key]
+        # GC interval for expert processing (every N experts)
+        gc_interval = 64
 
-        # Get expert weight dimensions
-        w1_key = f"layers.{layer_idx}.block_sparse_moe.experts.0.w1.weight"
-        intermediate_size, hidden_size = neuron_state_dict[w1_key].shape
-        device = neuron_state_dict[w1_key].device
-        dtype = neuron_state_dict[w1_key].dtype
-
-        # Merge gate_proj (w1) and up_proj (w3) into gate_up_proj
-        gate_up_proj = torch.empty(
-            config.num_local_experts,
-            hidden_size,
-            2 * intermediate_size,
-            dtype=dtype,
-            device=device,
-        )
-
-        for expert_idx in range(config.num_local_experts):
-            gate_proj_weights = (
-                neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight"]
-                .T.detach().clone()
-            )
-            up_proj_weights = (
-                neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight"]
-                .T.detach().clone()
+        for layer_idx in range(config.num_hidden_layers):
+            # Add rank_util.rank for each attention layer
+            neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
+                0, config.neuron_config.tp_degree, dtype=torch.int32
             )
 
-            gate_up_proj_slice = torch.narrow(gate_up_proj, 0, expert_idx, 1)
-            gate_proj_slice = torch.narrow(gate_up_proj_slice, 2, 0, intermediate_size)
-            gate_proj_slice.copy_(gate_proj_weights)
-            up_proj_slice = torch.narrow(gate_up_proj_slice, 2, intermediate_size, intermediate_size)
-            up_proj_slice.copy_(up_proj_weights)
+            # MiniMax M2 qk_norm weights - need to shard for TP parallel
+            # HF model: q_norm.weight shape = [num_attention_heads * head_dim] = [6144]
+            # HF model: k_norm.weight shape = [num_key_value_heads * head_dim] = [1024]
+            if has_qk_norm:
+                # q_norm: apply interleaved padding [48 heads -> padded heads]
+                q_norm_key = f"layers.{layer_idx}.self_attn.q_norm.weight"
+                if q_norm_key in neuron_state_dict:
+                    q_norm_full = neuron_state_dict[q_norm_key]  # [6144]
+                    # Apply the same interleaved padding as Q projection weights
+                    source_group_size = config.num_attention_heads // config.num_key_value_heads
+                    q_norm_padded = _maybe_pad_interleaved(
+                        q_norm_full.unsqueeze(0),  # Add batch dim: [1, 6144]
+                        pad_dim=1,
+                        source_heads=config.num_attention_heads,
+                        target_heads=padded_num_attention_heads,
+                        source_group_size=source_group_size,
+                    ).squeeze(0)  # [padded_num_attention_heads * head_dim]
+                    neuron_state_dict[q_norm_key] = q_norm_padded
+                    if layer_idx == 0:
+                        print(f"  q_norm: {q_norm_full.shape} -> {q_norm_padded.shape} (interleaved padding)")
 
-            del neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight"]
-            del neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight"]
+                # k_norm: replicate from original KV heads to padded KV heads
+                k_norm_key = f"layers.{layer_idx}.self_attn.k_norm.weight"
+                if k_norm_key in neuron_state_dict:
+                    k_norm_full = neuron_state_dict[k_norm_key]  # [1024]
+                    # KV heads are replicated: each of the original heads is replicated
+                    k_norm_reshaped = k_norm_full.reshape(config.num_key_value_heads, head_dim)
+                    repeats = padded_num_kv_heads // config.num_key_value_heads
+                    k_norm_replicated = k_norm_reshaped.repeat_interleave(repeats, dim=0)
+                    k_norm_padded = k_norm_replicated.reshape(-1)  # [padded_num_kv_heads * head_dim]
+                    neuron_state_dict[k_norm_key] = k_norm_padded
+                    if layer_idx == 0:
+                        print(f"  k_norm: {k_norm_full.shape} -> {k_norm_padded.shape} (replicated {repeats}x)")
 
-        # v3: padding gate_up_proj on intermediate size (from Qwen3 MoE)
-        pad_size = getattr(config, "moe_intermediate_pad_size", 0)
-        if pad_size > 0:
-            gate_up_proj = gate_up_proj.reshape(config.num_local_experts, hidden_size, 2, -1)
-            gate_up_proj = torch.nn.functional.pad(gate_up_proj, (0, pad_size))
-            gate_up_proj = gate_up_proj.reshape(config.num_local_experts, hidden_size, -1)
-        neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
+            # Rename router weights: gate -> router.linear_router (use pop to avoid extra copy)
+            gate_key = f"layers.{layer_idx}.block_sparse_moe.gate.weight"
+            router_key = f"layers.{layer_idx}.block_sparse_moe.router.linear_router.weight"
+            neuron_state_dict[router_key] = neuron_state_dict.pop(gate_key)
 
-        # Handle down_proj (w2)
-        down_proj = torch.empty(
-            config.num_local_experts,
-            intermediate_size,
-            hidden_size,
-            dtype=dtype,
-            device=device,
-        )
+            # Handle e_score_correction_bias (rename only, no clone needed)
+            bias_key = f"layers.{layer_idx}.block_sparse_moe.e_score_correction_bias"
+            if bias_key in neuron_state_dict:
+                router_bias_key = f"layers.{layer_idx}.block_sparse_moe.router.e_score_correction_bias"
+                neuron_state_dict[router_bias_key] = neuron_state_dict.pop(bias_key)
 
-        for expert_idx in range(config.num_local_experts):
-            down_proj_weights = (
-                neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight"]
-                .T.detach().clone()
+            # Get expert weight dimensions
+            w1_key = f"layers.{layer_idx}.block_sparse_moe.experts.0.w1.weight"
+            intermediate_size, hidden_size = neuron_state_dict[w1_key].shape
+            device = neuron_state_dict[w1_key].device
+            dtype = neuron_state_dict[w1_key].dtype
+
+            # Merge gate_proj (w1) and up_proj (w3) into gate_up_proj
+            gate_up_proj = torch.empty(
+                config.num_local_experts,
+                hidden_size,
+                2 * intermediate_size,
+                dtype=dtype,
+                device=device,
             )
-            down_proj_slice = torch.narrow(down_proj, 0, expert_idx, 1)
-            down_proj_slice.copy_(down_proj_weights)
-            del neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight"]
 
-        # v3: padding down_proj on intermediate size (from Qwen3 MoE)
-        if pad_size > 0:
-            down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
-        neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+            for expert_idx in range(config.num_local_experts):
+                # Optimized: use transpose view directly without clone
+                w1_key = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight"
+                w3_key = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight"
 
-        gc.collect()
+                gate_up_proj_slice = torch.narrow(gate_up_proj, 0, expert_idx, 1)
+                gate_proj_slice = torch.narrow(gate_up_proj_slice, 2, 0, intermediate_size)
+                gate_proj_slice.copy_(neuron_state_dict[w1_key].T)
+                up_proj_slice = torch.narrow(gate_up_proj_slice, 2, intermediate_size, intermediate_size)
+                up_proj_slice.copy_(neuron_state_dict[w3_key].T)
 
-    # v3: fused_qkv support (from Qwen3 MoE)
-    if config.neuron_config.fused_qkv:
-        neuron_state_dict = convert_state_dict_to_fused_qkv(neuron_state_dict, config)
+                # Delete immediately after copy
+                del neuron_state_dict[w1_key]
+                del neuron_state_dict[w3_key]
+
+                # Periodic GC during expert processing
+                if (expert_idx + 1) % gc_interval == 0:
+                    gc.collect()
+
+            # v3: padding gate_up_proj on intermediate size (from Qwen3 MoE)
+            pad_size = getattr(config, "moe_intermediate_pad_size", 0)
+            if pad_size > 0:
+                gate_up_proj = gate_up_proj.reshape(config.num_local_experts, hidden_size, 2, -1)
+                gate_up_proj = torch.nn.functional.pad(gate_up_proj, (0, pad_size))
+                gate_up_proj = gate_up_proj.reshape(config.num_local_experts, hidden_size, -1)
+            neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
+
+            # Handle down_proj (w2)
+            down_proj = torch.empty(
+                config.num_local_experts,
+                intermediate_size,
+                hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+
+            for expert_idx in range(config.num_local_experts):
+                # Optimized: use transpose view directly without clone
+                w2_key = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight"
+                down_proj_slice = torch.narrow(down_proj, 0, expert_idx, 1)
+                down_proj_slice.copy_(neuron_state_dict[w2_key].T)
+                del neuron_state_dict[w2_key]
+
+                # Periodic GC during expert processing
+                if (expert_idx + 1) % gc_interval == 0:
+                    gc.collect()
+
+            # v3: padding down_proj on intermediate size (from Qwen3 MoE)
+            if pad_size > 0:
+                down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
+            neuron_state_dict[f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+
+            # GC after each layer
+            gc.collect()
+
+            if (layer_idx + 1) % 10 == 0:
+                print(f"  Processed layer {layer_idx + 1}/{config.num_hidden_layers}")
+
+        # v3: fused_qkv support (from Qwen3 MoE)
+        if config.neuron_config.fused_qkv:
+            neuron_state_dict = convert_state_dict_to_fused_qkv(neuron_state_dict, config)
 
     return neuron_state_dict
 

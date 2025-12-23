@@ -58,7 +58,8 @@ def benchmark_sampling(
     # token generation happens.
     modified_generation_config = copy.deepcopy(generation_config)
     if model.on_device_sampling:
-        modified_generation_config.eos_token_id = []
+        # Use None instead of [] for compatibility with newer transformers versions
+        modified_generation_config.eos_token_id = None
     # Benchmark E2E model
     if target in ["all", "e2e"]:
         # FIXME: fix pixel values generation
