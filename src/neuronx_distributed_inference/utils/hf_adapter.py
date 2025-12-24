@@ -46,6 +46,10 @@ def load_pretrained_config(
             if 'MiniMax-M2' in model_path_or_name:
                 from neuronx_distributed_inference.models.minimax_m2.configuration_minimax_m2 import MiniMaxM2Config
                 config: PretrainedConfig = MiniMaxM2Config.from_pretrained(model_path_or_name)
+            elif 'Qwen3-Next' in model_path_or_name or 'qwen3_next' in model_path_or_name.lower():
+                # Qwen3 Next uses custom config since it's not in standard transformers yet
+                from neuronx_distributed_inference.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
+                config: PretrainedConfig = Qwen3NextConfig.from_pretrained(model_path_or_name)
             else:
                 config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
         else:
