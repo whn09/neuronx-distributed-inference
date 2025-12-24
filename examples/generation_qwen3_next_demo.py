@@ -103,6 +103,8 @@ def generate(skip_compile=False):
             neuron_config,
             load_config=load_pretrained_config(model_path),
         )
+        # Set the original model path for weight loading
+        config._name_or_path = model_path
 
         # Initialize tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
@@ -131,9 +133,10 @@ def generate(skip_compile=False):
     print("\n" + "=" * 60)
     print("Loading model from compiled checkpoint...")
     print("=" * 60)
+    # Initialize from traced path (has neuron config with _name_or_path pointing to HF weights)
     model = NeuronQwen3NextForCausalLM(traced_model_path)
-    model.load(traced_model_path)
-    tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
+    model.load(traced_model_path)  # Weights loaded from config._name_or_path
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Generate outputs
     print("\n" + "=" * 60)
@@ -338,7 +341,8 @@ def generate_minimal_test(skip_compile=False):
 
 if __name__ == "__main__":
     # Full generation with tp_degree=64 (requires trn2.48xlarge)
-    generate(skip_compile=False)
+    # Use skip_compile=True to load existing compiled model
+    generate(skip_compile=True)  # Changed to True since model is already compiled
 
     # Use the minimal test config (tp_degree=8, for smaller instances)
     # generate_minimal_test(skip_compile=False)
