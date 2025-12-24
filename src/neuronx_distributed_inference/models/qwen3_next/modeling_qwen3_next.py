@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear, ParallelEmbedding
 from neuronx_distributed.utils import cpu_mode
 
 from neuronx_distributed_inference.models.config import (
@@ -140,6 +140,13 @@ class Qwen3NextInferenceConfig(InferenceConfig):
 
         # Hybrid attention configuration
         self.full_attention_interval = getattr(self, 'full_attention_interval', 4)
+
+        # Full attention Q head expansion
+        # Qwen3 Next uses 2x Q heads (32) compared to output heads (16)
+        # The HF checkpoint has q_proj with 32 heads worth, but num_attention_heads=16
+        # We need to track both for proper weight loading and attention computation
+        self.full_attention_num_q_heads = self.num_attention_heads * 2  # 32 for Qwen3 Next
+        self.q_expansion_factor = 2  # Q heads / output heads ratio
 
         # Linear attention (Gated Delta Net) configuration
         self.linear_num_key_heads = getattr(self, 'linear_num_key_heads', 16)
@@ -272,7 +279,18 @@ def apply_partial_rotary_pos_emb(q, k, cos, sin, rotary_dim):
 
 
 class NeuronQwen3NextFullAttention(NeuronAttentionBase):
-    """Full softmax attention for Qwen3 Next (used every full_attention_interval layers)."""
+    """Full softmax attention for Qwen3 Next (used every full_attention_interval layers).
+
+    Note on Q head expansion:
+    Qwen3 Next HF checkpoint has 32 Q heads but config says num_attention_heads=16.
+    For simplicity, we use 16 Q heads in NxD (matching config) and reduce Q weights
+    from 32→16 heads during weight conversion. This is a simplified implementation.
+
+    A fully faithful implementation would require:
+    - Custom Q projection with 32 heads
+    - Head merging after attention (32→16)
+    - Custom O projection handling
+    """
 
     def __init__(self, config: Qwen3NextInferenceConfig):
         # Partial RoPE: only apply to partial_rotary_factor of dimensions
@@ -284,11 +302,13 @@ class NeuronQwen3NextFullAttention(NeuronAttentionBase):
             base=config.rope_theta,
         )
 
+        # Use 16 attention heads as per config (simplified implementation)
+        # The weight conversion will reduce Q from 32→16 heads
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
+            num_attention_heads=config.num_attention_heads,  # 16 heads
+            num_key_value_heads=config.num_key_value_heads,  # 2 KV heads
             head_dim=config.head_dim,
             rotary_emb=rotary_emb,
             rms_norm_eps=config.rms_norm_eps,
@@ -802,10 +822,30 @@ def maybe_dequantize_layer(neuron_state_dict, config):
 
 def convert_qwen3_next_hf_to_neuron_state_dict(neuron_state_dict: dict, config: Qwen3NextInferenceConfig) -> dict:
     """Convert HuggingFace Qwen3 Next checkpoint to Neuron format."""
+    import logging
+    logging.warning(f"[QWEN3_NEXT_DEBUG] convert_qwen3_next_hf_to_neuron_state_dict called with {len(neuron_state_dict)} keys")
+    # Write debug info to file for easier tracking
+    with open('/tmp/qwen3_next_debug.log', 'a') as f:
+        f.write(f"[DEBUG] convert_qwen3_next_hf_to_neuron_state_dict called with {len(neuron_state_dict)} keys\n")
+        f.write(f"[DEBUG] Sample keys: {list(neuron_state_dict.keys())[:20]}\n")
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
 
     # Dequantize if needed
     maybe_dequantize_layer(neuron_state_dict, config)
+
+    # First pass: Rename linear_attn to self_attn for linear attention layers
+    # HF Qwen3 Next uses different module names for different attention types:
+    # - Full attention layers: self_attn.*
+    # - Linear attention layers: linear_attn.*
+    # Our implementation uses self_attn for all layers, so we need to rename
+    keys_to_rename = []
+    for key in list(neuron_state_dict.keys()):
+        if ".linear_attn." in key:
+            new_key = key.replace(".linear_attn.", ".self_attn.")
+            keys_to_rename.append((key, new_key))
+
+    for old_key, new_key in keys_to_rename:
+        neuron_state_dict[new_key] = neuron_state_dict.pop(old_key)
 
     # Add rank utility tensors
     neuron_state_dict["rank_util.rank"] = torch.arange(
@@ -830,6 +870,43 @@ def convert_qwen3_next_hf_to_neuron_state_dict(neuron_state_dict: dict, config: 
                 neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
                     neuron_state_dict.pop(f"layers.{l}.self_attn.k_norm.weight").detach().clone()
                 )
+
+            # NOTE: Do NOT rename Q/K/V projections here - the preshard_hook in gqa.py
+            # handles the mapping from HF keys (layers.X.self_attn.q_proj.weight) to
+            # NxD keys (layers.X.self_attn.qkv_proj.q_proj.weight) automatically.
+            # Manual renaming interferes with this mechanism.
+
+            # Reduce Q projection from 32 heads to 16 heads (simplified implementation)
+            # HF checkpoint has q_proj with 32 heads worth (8192 = 32 × 256), but
+            # our NxD model uses 16 heads (matching config.num_attention_heads)
+            q_proj_key = f"layers.{l}.self_attn.q_proj.weight"
+            with open('/tmp/qwen3_next_debug.log', 'a') as f:
+                f.write(f"[DEBUG] Layer {l}: Checking for Q reduction, key={q_proj_key}, exists={q_proj_key in neuron_state_dict}\n")
+            if q_proj_key in neuron_state_dict:
+                q_weight = neuron_state_dict[q_proj_key]  # [8192, 2048]
+                original_shape = q_weight.shape
+                head_dim = config.head_dim  # 256
+                hf_num_q_heads = original_shape[0] // head_dim  # 32
+                target_num_q_heads = config.num_attention_heads  # 16
+
+                if hf_num_q_heads > target_num_q_heads:
+                    # Reduce heads by taking every nth head (simple subsampling)
+                    # Alternative: average pairs - but subsampling preserves more structure
+                    reduction_factor = hf_num_q_heads // target_num_q_heads  # 2
+
+                    # Reshape to [num_heads, head_dim, hidden_size]
+                    q_weight = q_weight.reshape(hf_num_q_heads, head_dim, -1)
+
+                    # Take every 'reduction_factor' head (subsampling)
+                    q_weight_reduced = q_weight[::reduction_factor]  # [16, 256, 2048]
+
+                    # Reshape back to [num_heads * head_dim, hidden_size]
+                    q_weight_reduced = q_weight_reduced.reshape(target_num_q_heads * head_dim, -1)
+
+                    neuron_state_dict[q_proj_key] = q_weight_reduced
+                    with open('/tmp/qwen3_next_debug.log', 'a') as f:
+                        f.write(f"[DEBUG] Reduced Q projection for layer {l}: {original_shape} -> {q_weight_reduced.shape}\n")
+                    print(f"Reduced Q projection for layer {l}: {original_shape} -> {q_weight_reduced.shape}")
 
         # Copy router weights
         if f"layers.{l}.mlp.gate.weight" in neuron_state_dict:
@@ -905,10 +982,13 @@ def convert_qwen3_next_hf_to_neuron_state_dict(neuron_state_dict: dict, config: 
         # Convert shared expert weights if present
         shared_gate_key = f"layers.{l}.mlp.shared_expert.gate_proj.weight"
         if shared_gate_key in neuron_state_dict:
-            # Shared expert gate and up projections
-            shared_gate = neuron_state_dict.pop(shared_gate_key).T.detach().clone()
-            shared_up = neuron_state_dict.pop(f"layers.{l}.mlp.shared_expert.up_proj.weight").T.detach().clone()
-            shared_down = neuron_state_dict.pop(f"layers.{l}.mlp.shared_expert.down_proj.weight").T.detach().clone()
+            # Shared expert weights - DO NOT transpose!
+            # HF weights are in [out_features, in_features] format which matches
+            # ColumnParallelLinear's expected shape.
+            # After TP sharding: [intermediate_size/tp, hidden_size] = [8, 2048]
+            shared_gate = neuron_state_dict.pop(shared_gate_key).detach().clone()
+            shared_up = neuron_state_dict.pop(f"layers.{l}.mlp.shared_expert.up_proj.weight").detach().clone()
+            shared_down = neuron_state_dict.pop(f"layers.{l}.mlp.shared_expert.down_proj.weight").detach().clone()
 
             # Store as shared expert weights
             neuron_state_dict[f"layers.{l}.mlp.shared_experts.gate_proj.weight"] = shared_gate

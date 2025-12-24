@@ -79,7 +79,8 @@ def generate(skip_compile=False):
             cp_degree=8,  # Context parallelism
 
             # Fused operations
-            fused_qkv=True,  # Only applies to full attention layers
+            # NOTE: fused_qkv disabled because HF Qwen3 Next has different Q size (32 heads vs config's 16)
+            fused_qkv=False,
             is_continuous_batching=True,
             logical_nc_config=2,
             sequence_parallel_enabled=True,
@@ -342,7 +343,7 @@ def generate_minimal_test(skip_compile=False):
 if __name__ == "__main__":
     # Full generation with tp_degree=64 (requires trn2.48xlarge)
     # Use skip_compile=True to load existing compiled model
-    generate(skip_compile=True)  # Changed to True since model is already compiled
+    generate(skip_compile=True)  # Load from compiled checkpoint
 
     # Use the minimal test config (tp_degree=8, for smaller instances)
     # generate_minimal_test(skip_compile=False)
