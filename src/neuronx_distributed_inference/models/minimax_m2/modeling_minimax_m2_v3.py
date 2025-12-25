@@ -220,7 +220,9 @@ class MiniMaxM2QKNorm(nn.Module):
             weight_reshaped = self.weight.view(self.tp_degree, self.hidden_size)
             # rank_util.rank is [0, 1, 2, ..., tp_degree-1], each SPMD device gets its rank value
             # Use index_select which is XLA-compatible for proper tracing
-            rank_index = rank_util.rank[:1]  # Get first element as 1D tensor for index_select
+            # IMPORTANT: Convert to int64 (torch.long) for XLA compatibility
+            # XLA requires consistent types for index operations (S64)
+            rank_index = rank_util.rank[:1].to(torch.long)
             local_weight = torch.index_select(weight_reshaped, 0, rank_index).squeeze(0)
         else:
             # Single rank or no rank_util - use first slice
