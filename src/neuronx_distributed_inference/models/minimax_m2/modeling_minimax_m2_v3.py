@@ -169,19 +169,30 @@ class MiniMaxM2QKNorm(nn.Module):
     - All-reduce to get global sum across all TP ranks
     - Compute global RMS normalization
     - Stores FULL padded weights [tp_degree * per_rank_size]
-    - Dynamically slices weights in forward() based on rank
+    - Dynamically slices weights in forward() based on rank using rank_util tensor
+
+    Parameters:
+    - hidden_size: Per-rank hidden size (e.g., 128 for both Q and K per rank)
+    - full_hidden_size: Original full size for RMS divisor computation
+      - For Q: 6144 (original 48 heads * 128 dim, NOT padded 8192)
+      - For K: 8192 (accounts for replication: 8 original KV heads replicated to 64)
+    - padded_hidden_size: Total weight storage size (tp_degree * per_rank_size)
     """
-    def __init__(self, hidden_size, eps=1e-6, tp_degree=1):
+    def __init__(self, hidden_size, eps=1e-6, tp_degree=1, full_hidden_size=None, padded_hidden_size=None):
         super().__init__()
         self.hidden_size = hidden_size  # Per-rank hidden size
         self.variance_epsilon = eps
         self.tp_degree = tp_degree
-        # Full hidden size for RMS divisor (original full size across all ranks)
-        self.full_hidden_size = hidden_size * tp_degree
-        # Store FULL weights - will be sliced dynamically in forward()
-        self.weight = nn.Parameter(torch.ones(self.full_hidden_size))
+        # Full hidden size for RMS divisor
+        # - For Q: should be original 6144 (padding zeros don't contribute to sum_sq)
+        # - For K: should be 8192 (replication factor cancels out: 8x sum / 8192 = sum / 1024)
+        self.full_hidden_size = full_hidden_size if full_hidden_size is not None else (hidden_size * tp_degree)
+        # Padded hidden size for weight storage
+        self.padded_hidden_size = padded_hidden_size if padded_hidden_size is not None else (hidden_size * tp_degree)
+        # Store FULL weights - will be sliced dynamically in forward() using rank_util
+        self.weight = nn.Parameter(torch.ones(self.padded_hidden_size))
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, rank_util=None):
         from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
 
         input_dtype = hidden_states.dtype
@@ -200,13 +211,20 @@ class MiniMaxM2QKNorm(nn.Module):
         global_variance = global_sum_sq / self.full_hidden_size
         hidden_states = hidden_states * torch.rsqrt(global_variance + self.variance_epsilon)
 
-        # Dynamically slice weight based on TP rank
-        if self.tp_degree > 1:
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            start_idx = tp_rank * self.hidden_size
-            local_weight = self.weight[start_idx:start_idx + self.hidden_size]
+        # Dynamically slice weight based on TP rank using rank_util tensor
+        # IMPORTANT: Cannot use parallel_state.get_tensor_model_parallel_rank() here
+        # because it returns a Python constant at trace time, not a tensor.
+        # We need to use rank_util.rank which is a tensor for proper SPMD execution.
+        if rank_util is not None and self.tp_degree > 1:
+            # Reshape weight to [tp_degree, hidden_size] for rank-based indexing
+            weight_reshaped = self.weight.view(self.tp_degree, self.hidden_size)
+            # rank_util.rank is [0, 1, 2, ..., tp_degree-1], each SPMD device gets its rank value
+            # Use index_select which is XLA-compatible for proper tracing
+            rank_index = rank_util.rank[:1]  # Get first element as 1D tensor for index_select
+            local_weight = torch.index_select(weight_reshaped, 0, rank_index).squeeze(0)
         else:
-            local_weight = self.weight
+            # Single rank or no rank_util - use first slice
+            local_weight = self.weight[:self.hidden_size]
 
         return (local_weight * hidden_states).to(input_dtype)
 
@@ -520,10 +538,48 @@ class NeuronMiniMaxM2AttentionV3(NeuronAttentionBase):
         tp_degree = config.neuron_config.tp_degree
         if self.use_minimax_qk_norm:
             # Per-rank Q/K size (after tensor parallel sharding)
-            q_size_per_rank = self.num_heads * self.head_dim
-            k_size_per_rank = self.num_key_value_heads * self.head_dim
-            self.q_norm = MiniMaxM2QKNorm(q_size_per_rank, eps=config.rms_norm_eps, tp_degree=tp_degree)
-            self.k_norm = MiniMaxM2QKNorm(k_size_per_rank, eps=config.rms_norm_eps, tp_degree=tp_degree)
+            # self.num_heads and self.num_key_value_heads are already per-rank values from base class
+            q_size_per_rank = self.num_heads * self.head_dim  # e.g., 1 * 128 = 128
+            k_size_per_rank = self.num_key_value_heads * self.head_dim  # e.g., 1 * 128 = 128
+
+            # Calculate full_hidden_size for RMS divisor computation:
+            #
+            # For Q norm (interleaved padding):
+            # - Original Q: 48 heads * 128 dim = 6144 elements
+            # - After padding: 64 heads * 128 dim = 8192 elements, but padding is zeros
+            # - GPU computes RMS over 6144 elements
+            # - Neuron: global_sum_sq = all_reduce(local_sum_sq) = original sum (padding zeros contribute 0)
+            # - Division should be by ORIGINAL 6144 to match GPU
+            full_q_hidden_size = config.num_attention_heads * config.head_dim  # 48 * 128 = 6144
+
+            # For K norm (replication):
+            # - Original K: 8 KV heads * 128 dim = 1024 elements
+            # - After replication: 64 KV heads * 128 dim = 8192 elements (each original value appears 8 times)
+            # - GPU computes RMS over 1024 elements: sqrt(sum_sq / 1024)
+            # - Neuron: global_sum_sq = all_reduce(local_sum_sq) = 8 * original_sum_sq (due to replication)
+            # - Division by 8192: sqrt(8 * original_sum_sq / 8192) = sqrt(original_sum_sq / 1024) = GPU result
+            # - So full_hidden_size should be 8192 (padded size) for K norm
+            padded_num_kv_heads = self.num_key_value_heads * tp_degree  # 1 * 64 = 64
+            full_k_hidden_size = padded_num_kv_heads * config.head_dim  # 64 * 128 = 8192
+
+            # Padded hidden size for weight storage (both Q and K are padded to tp_degree heads)
+            padded_q_hidden_size = self.num_heads * tp_degree * config.head_dim  # 1 * 64 * 128 = 8192
+            padded_k_hidden_size = padded_num_kv_heads * config.head_dim  # 64 * 128 = 8192
+
+            self.q_norm = MiniMaxM2QKNorm(
+                q_size_per_rank,
+                eps=config.rms_norm_eps,
+                tp_degree=tp_degree,
+                full_hidden_size=full_q_hidden_size,
+                padded_hidden_size=padded_q_hidden_size
+            )
+            self.k_norm = MiniMaxM2QKNorm(
+                k_size_per_rank,
+                eps=config.rms_norm_eps,
+                tp_degree=tp_degree,
+                full_hidden_size=full_k_hidden_size,
+                padded_hidden_size=padded_k_hidden_size
+            )
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
@@ -552,9 +608,10 @@ class NeuronMiniMaxM2AttentionV3(NeuronAttentionBase):
         )
 
         # Apply qk_norm BEFORE reshape (MiniMax M2 specific)
+        # Pass rank_util for proper SPMD weight slicing
         if self.use_minimax_qk_norm:
-            Q = self.q_norm(Q)
-            K = self.k_norm(K)
+            Q = self.q_norm(Q, self.rank_util)
+            K = self.k_norm(K, self.rank_util)
 
         # Reshape to [batch, num_heads, seq_len, head_dim]
         bsz, q_len, _ = hidden_states.size()
@@ -672,9 +729,23 @@ class NeuronMiniMaxM2DecoderLayerV3(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronMiniMaxM2AttentionV3(config=config)
-        self.block_sparse_moe = initialize_minimax_m2_moe_module_v3(config=config)
+        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
+
         self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+
+        # v3: support moe_fused_nki_kernel like Qwen3 MoE
+        if self.moe_fused_nki_kernel_enabled:
+            self.block_sparse_moe = initialize_minimax_m2_moe_module_v3(
+                config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
+            )
+        else:
+            self.block_sparse_moe = initialize_minimax_m2_moe_module_v3(config=config)
+
+        # v3: store config flags for forward optimization
+        self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
+        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+        self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
 
     def forward(
         self,
@@ -682,10 +753,20 @@ class NeuronMiniMaxM2DecoderLayerV3(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, ...]:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+
+        # v3: Module marker wrappers for compiler optimization (from Qwen3 MoE)
+        qkv_fused_rmsnorm = None
+        hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+
+        if self.input_layernorm:
+            if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
+                qkv_fused_rmsnorm = self.input_layernorm
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -693,15 +774,20 @@ class NeuronMiniMaxM2DecoderLayerV3(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
+            rmsnorm=qkv_fused_rmsnorm,
             **kwargs,
         )
         hidden_states = residual + hidden_states
 
         # MoE
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.block_sparse_moe(hidden_states)[0]
+        if not self.moe_fused_nki_kernel_enabled:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, padding_mask)[0]
         hidden_states = residual + hidden_states
+
+        # End module marker
+        hidden_states = ModuleMarkerEndWrapper()(hidden_states)
 
         return (hidden_states, present_key_value, cos_cache, sin_cache, None)
 
@@ -848,6 +934,13 @@ class NeuronMiniMaxM2ForCausalLMV3(NeuronBaseForCausalLM):
                 # Handle tied word embeddings if configured
                 if getattr(config, "tie_word_embeddings", False):
                     cls.update_state_dict_for_tied_weights(model_sd)
+
+                # Add _FUSED_PREFIX to keys if needed (for fused speculation)
+                param_name_list = list(model_sd.keys())
+                if cls._FUSED_PREFIX != "":
+                    for param_name in param_name_list:
+                        model_sd[f"{cls._FUSED_PREFIX}.{param_name}"] = model_sd[param_name]
+                        del model_sd[param_name]
 
                 return model_sd
             else:
