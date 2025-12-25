@@ -71,6 +71,39 @@ def generate(skip_compile=False):
                 'act_fn': 'sigmoid',
             },
         )
+        # neuron_config = MoENeuronConfig(
+        #     tp_degree=64,  # Must be multiple of num_key_value_heads=8
+        #     moe_tp_degree=64,  # Full TP for MoE (no EP)
+        #     moe_ep_degree=1,  # moe_ep_degree not set - defaults to 1
+        #     batch_size=16,  # Reduced for memory, 16
+        #     ctx_batch_size=1,
+        #     tkg_batch_size=1,  # 16
+        #     seq_len=2048,  # Reduced for memory, 10240
+        #     max_context_length=2048,  # 1024
+        #     # scratchpad_page_size=1024,
+        #     torch_dtype=DTYPE,
+        #     # Lower temperature for more coherent output (Qwen3 MoE uses 0.6)
+        #     on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
+        #     enable_bucketing=True,
+        #     context_encoding_buckets=[256, 512, 1024, 2048],
+        #     token_generation_buckets=[256, 512, 1024, 2048],
+        #     flash_decoding_enabled=False,
+        #     # attention_dp_degree=8,
+        #     # cp_degree=16,
+        #     fused_qkv=True,
+        #     is_continuous_batching=False,  # Simpler for testing, True
+        #     logical_nc_config=2,
+        #     sequence_parallel_enabled=True,
+        #     # Disable kernel optimizations
+        #     qkv_kernel_enabled=False,  # True
+        #     attn_kernel_enabled=False,  # True
+        #     strided_context_parallel_kernel_enabled=False,  # True
+        #     # blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True, "skip_dma_token": True},  
+        #     # MiniMax M2 uses sigmoid activation for router (not softmax)
+        #     router_config={
+        #         'act_fn': 'sigmoid',
+        #     },
+        # )
         config = MiniMaxM2InferenceConfigV3(
             neuron_config,
             load_config=load_pretrained_config(model_path),
