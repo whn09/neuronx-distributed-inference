@@ -161,11 +161,11 @@ def _run_flux_helper(flux_app, args):
 
 if __name__ == "__main__":
     # The Ckpt directory root under huggingface
-    CKPT_DIR = "/shared/flux/FLUX.1-dev/"
+    CKPT_DIR = "/home/ubuntu/model_hf/FLUX.1-dev/"
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--prompt", type=str, default="A cat holding a sign that says hello world")
-    parser.add_argument("-hh", "--height", type=int, default=1024)
+    parser.add_argument("-h", "--height", type=int, default=1024)
     parser.add_argument("-w", "--width", type=int, default=1024)
     parser.add_argument("-n", "--num_inference_steps", type=int, default=25)
     parser.add_argument("-i", "--instance_type", type=str, default="trn2")
@@ -174,7 +174,7 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile_name", type=str, default="flux_torch_profile.json")
     parser.add_argument("--num_images", type=int, default=1)
-    parser.add_argument("--save_image", action="store_true")
+    parser.add_argument("--save_image", action="store_true", default=True)
     parser.add_argument("--context_parallel_enabled", action="store_true", default=True)
 
     args = parser.parse_args()
