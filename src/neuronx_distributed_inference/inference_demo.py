@@ -29,6 +29,7 @@ from neuronx_distributed_inference.models.mixtral.modeling_mixtral import Neuron
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+from neuronx_distributed_inference.models.mimo_v2.modeling_mimo_v2 import NeuronMiMoV2ForCausalLM
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.accuracy import (
     check_accuracy,
@@ -55,6 +56,7 @@ MODEL_TYPES = {
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
+    "mimo_v2_flash": {"causal-lm": NeuronMiMoV2ForCausalLM},
 }
 
 

@@ -1,0 +1,987 @@
+# coding=utf-8
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This implementation is based on the MiMo-V2-Flash model from Xiaomi.
+# Reference: https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash
+
+"""MiMo-V2-Flash model for NXD inference."""
+
+import gc
+import math
+import warnings
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
+
+import torch
+import torch.nn.functional as F
+from torch import nn, Tensor
+
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers.layers import (
+    ColumnParallelLinear,
+    ParallelEmbedding,
+    RowParallelLinear,
+)
+from neuronx_distributed.parallel_layers.mappings import (
+    gather_from_sequence_parallel_region,
+)
+from neuronx_distributed.utils import cpu_mode
+
+from neuronx_distributed_inference.models.config import (
+    InferenceConfig,
+    MoENeuronConfig,
+)
+from neuronx_distributed_inference.models.model_base import (
+    NeuronBaseForCausalLM,
+    NeuronBaseModel,
+)
+from neuronx_distributed_inference.models.model_wrapper import (
+    CONTEXT_ENCODING_MODEL_TAG,
+    TOKEN_GENERATION_MODEL_TAG,
+)
+from neuronx_distributed_inference.modules.attention.attention_base import (
+    NeuronAttentionBase,
+)
+from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+
+try:
+    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
+except ImportError:
+    from neuronxcc.nki.kernels.attention import attention_isa_kernel
+
+from torch_neuronx.xla_impl.ops import nki_jit
+
+_flash_fwd_call = nki_jit()(attention_isa_kernel)
+
+
+def get_rmsnorm_cls():
+    """Get appropriate RMSNorm class based on execution environment."""
+    return MiMoV2RMSNorm if cpu_mode() else CustomRMSNorm
+
+
+class MiMoV2RMSNorm(nn.Module):
+    """RMSNorm implementation for CPU mode."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class MiMoV2RotaryEmbedding(nn.Module):
+    """Rotary Position Embedding for MiMo-V2-Flash.
+
+    Supports partial rotary embedding where only a fraction of dimensions
+    use rotary position encoding.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 262144,
+        base: float = 5000000.0,
+        partial_rotary_factor: float = 1.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.partial_rotary_factor = partial_rotary_factor
+
+        # Calculate the actual dimension used for rotary embedding
+        self.rope_dim = int(dim * partial_rotary_factor)
+        # Ensure rope_dim is even
+        self.rope_dim = self.rope_dim - (self.rope_dim % 2)
+
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.rope_dim, 2, dtype=torch.float32) / self.rope_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute rotary embeddings.
+
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, hidden_size)
+            position_ids: Position indices of shape (batch_size, seq_len)
+
+        Returns:
+            Tuple of (cos, sin) tensors for rotary embedding
+        """
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(
+            position_ids.shape[0], -1, 1
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: Optional[torch.Tensor] = None,
+    unsqueeze_dim: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embedding to query and key tensors."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class MiMoV2InferenceConfig(InferenceConfig):
+    """Configuration class for MiMo-V2-Flash inference on Neuron."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # MoE configuration
+        self.num_local_experts = self.n_routed_experts
+        self.n_shared_experts = 0  # MiMo-V2-Flash has no shared experts
+
+        # Set intermediate_size for MoE layers
+        self.intermediate_size = self.moe_intermediate_size
+
+        # Check and pad intermediate size if needed
+        self.maybe_pad_intermediate()
+
+        # Router configuration
+        self.neuron_config.router_config.dtype = torch.float32
+        self.neuron_config.router_config.act_fn = "sigmoid"  # MiMo uses sigmoid
+
+        # Disable numeric CC token as workaround
+        self.neuron_config.disable_numeric_cc_token = True
+
+        # MiMo normalizes top-k affinities
+        self.neuron_config.normalize_top_k_affinities = True
+
+        # Parse hybrid layer pattern
+        self._parse_hybrid_pattern()
+
+    def _parse_hybrid_pattern(self):
+        """Parse hybrid layer pattern to determine attention types."""
+        if hasattr(self, 'hybrid_layer_pattern') and self.hybrid_layer_pattern:
+            self.layer_attention_types = [
+                "sliding_window" if p == 1 else "full"
+                for p in self.hybrid_layer_pattern
+            ]
+        else:
+            self.layer_attention_types = ["full"] * self.num_hidden_layers
+
+        # Parse MoE layer frequency
+        if hasattr(self, 'moe_layer_freq') and self.moe_layer_freq:
+            self.layer_uses_moe = [bool(f) for f in self.moe_layer_freq]
+        else:
+            self.layer_uses_moe = [True] * self.num_hidden_layers
+
+    def maybe_pad_intermediate(self):
+        """Pad intermediate size if required for efficient computation."""
+        from neuronx_distributed_inference.models.config import (
+            SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP,
+        )
+
+        moe_tp_degree = self.neuron_config.moe_tp_degree
+        I_TP = self.moe_intermediate_size // moe_tp_degree
+
+        if getattr(
+            self.neuron_config.blockwise_matmul_config,
+            "use_shard_on_intermediate_dynamic_while",
+            False,
+        ):
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP != 0:
+                padded_size = (
+                    math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP)
+                    * SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP
+                    * moe_tp_degree
+                )
+                self.moe_intermediate_pad_size = max(
+                    padded_size - self.moe_intermediate_size, 0
+                )
+                self.moe_intermediate_size = padded_size
+
+    def get_required_attributes(self) -> List[str]:
+        return [
+            "attention_bias",
+            "head_dim",
+            "hidden_act",
+            "hidden_size",
+            "hybrid_layer_pattern",
+            "layernorm_epsilon",
+            "max_position_embeddings",
+            "moe_intermediate_size",
+            "moe_layer_freq",
+            "n_routed_experts",
+            "norm_topk_prob",
+            "num_attention_heads",
+            "num_experts_per_tok",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "partial_rotary_factor",
+            "rope_theta",
+            "scoring_func",
+            "sliding_window",
+            "swa_head_dim",
+            "swa_num_attention_heads",
+            "swa_num_key_value_heads",
+            "swa_rope_theta",
+            "swa_v_head_dim",
+            "tie_word_embeddings",
+            "v_head_dim",
+            "vocab_size",
+        ]
+
+    @classmethod
+    def get_neuron_config_cls(cls) -> Type[MoENeuronConfig]:
+        return MoENeuronConfig
+
+
+class NeuronMiMoV2Attention(NeuronAttentionBase):
+    """MiMo-V2-Flash Attention implementation supporting hybrid attention patterns.
+
+    Supports both full attention and sliding window attention with different
+    head dimensions for Q/K vs V.
+    """
+
+    def __init__(
+        self,
+        config: MiMoV2InferenceConfig,
+        layer_idx: int,
+        is_sliding_window: bool = False,
+    ):
+        self.layer_idx = layer_idx
+        self.is_sliding_window = is_sliding_window
+
+        # Select parameters based on attention type
+        if is_sliding_window:
+            self.attn_head_dim = config.swa_head_dim
+            self.attn_v_head_dim = config.swa_v_head_dim
+            self.attn_num_heads = config.swa_num_attention_heads
+            self.attn_num_kv_heads = config.swa_num_key_value_heads
+            rope_theta = getattr(config, 'swa_rope_theta', 10000.0)
+            self.sliding_window_size = config.sliding_window
+        else:
+            self.attn_head_dim = config.head_dim
+            self.attn_v_head_dim = config.v_head_dim
+            self.attn_num_heads = config.num_attention_heads
+            self.attn_num_kv_heads = config.num_key_value_heads
+            rope_theta = config.rope_theta
+            self.sliding_window_size = None
+
+        # Calculate partial rotary dimensions
+        self.partial_rotary_factor = config.partial_rotary_factor
+        self.rope_dim = int(self.attn_head_dim * self.partial_rotary_factor)
+        self.rope_dim = self.rope_dim - (self.rope_dim % 2)  # Ensure even
+        self.nope_dim = self.attn_head_dim - self.rope_dim
+
+        # Create rotary embedding
+        rotary_emb = MiMoV2RotaryEmbedding(
+            dim=self.attn_head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
+            partial_rotary_factor=self.partial_rotary_factor,
+        )
+
+        # Initialize base attention
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=self.attn_num_heads,
+            num_key_value_heads=self.attn_num_kv_heads,
+            head_dim=self.attn_v_head_dim,  # Use v_head_dim for base class
+            rotary_emb=rotary_emb,
+            rms_norm_eps=config.layernorm_epsilon,
+            use_qk_norm=False,
+        )
+
+        # Override projections with correct dimensions
+        self._init_projections(config)
+
+        # Scaling factor
+        self.scaling = self.attn_head_dim ** -0.5
+        if hasattr(config, 'attention_value_scale'):
+            self.value_scale = config.attention_value_scale
+        else:
+            self.value_scale = 1.0
+
+        # Store cache KV heads (max of full and sliding window) for cache compatibility
+        self.cache_num_kv_heads = max(
+            config.num_key_value_heads,
+            getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
+        )
+        # Calculate local cache KV heads after TP split
+        tp_degree = config.neuron_config.tp_degree
+        self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // tp_degree)
+
+    def _init_projections(self, config: MiMoV2InferenceConfig):
+        """Initialize projection layers with correct dimensions."""
+        dtype = config.neuron_config.torch_dtype
+
+        # Q/K use head_dim, V uses v_head_dim
+        q_hidden_size = self.attn_num_heads * self.attn_head_dim
+        k_hidden_size = self.attn_num_kv_heads * self.attn_head_dim
+        v_hidden_size = self.attn_num_kv_heads * self.attn_v_head_dim
+        o_hidden_size = self.attn_num_heads * self.attn_v_head_dim
+
+        if parallel_state.model_parallel_is_initialized():
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+
+            # Q projection
+            self.q_proj = ColumnParallelLinear(
+                config.hidden_size,
+                q_hidden_size,
+                bias=config.attention_bias,
+                gather_output=False,
+                dtype=dtype,
+                tensor_model_parallel_group=tp_group,
+            )
+
+            # K projection
+            self.k_proj = ColumnParallelLinear(
+                config.hidden_size,
+                k_hidden_size,
+                bias=config.attention_bias,
+                gather_output=False,
+                dtype=dtype,
+                tensor_model_parallel_group=tp_group,
+            )
+
+            # V projection
+            self.v_proj = ColumnParallelLinear(
+                config.hidden_size,
+                v_hidden_size,
+                bias=config.attention_bias,
+                gather_output=False,
+                dtype=dtype,
+                tensor_model_parallel_group=tp_group,
+            )
+
+            # Output projection
+            self.o_proj = RowParallelLinear(
+                o_hidden_size,
+                config.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                dtype=dtype,
+                tensor_model_parallel_group=tp_group,
+            )
+
+            # Calculate local dimensions after TP split
+            tp_degree = config.neuron_config.tp_degree
+            self.local_num_heads = self.attn_num_heads // tp_degree
+            self.local_num_kv_heads = max(1, self.attn_num_kv_heads // tp_degree)
+        else:
+            self.q_proj = nn.Linear(config.hidden_size, q_hidden_size, bias=config.attention_bias)
+            self.k_proj = nn.Linear(config.hidden_size, k_hidden_size, bias=config.attention_bias)
+            self.v_proj = nn.Linear(config.hidden_size, v_hidden_size, bias=config.attention_bias)
+            self.o_proj = nn.Linear(o_hidden_size, config.hidden_size, bias=False)
+
+            self.local_num_heads = self.attn_num_heads
+            self.local_num_kv_heads = self.attn_num_kv_heads
+
+        # Remove qkv_proj from base class if exists
+        if hasattr(self, 'qkv_proj'):
+            self.qkv_proj = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[torch.Tensor] = None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Forward pass for MiMo-V2-Flash attention."""
+
+        # Handle sequence parallel
+        if self.sequence_parallel_enabled and parallel_state.model_parallel_is_initialized():
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states,
+                self.sequence_dimension,
+                process_group=parallel_state.get_tensor_model_parallel_group(),
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        # Determine if this is token generation (past_key_value is not None)
+        is_token_gen = past_key_value is not None
+
+        # Project Q, K, V
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        # Reshape for multi-head attention: [bsz, num_heads, seq_len, head_dim]
+        query_states = query_states.view(bsz, q_len, self.local_num_heads, self.attn_head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.local_num_kv_heads, self.attn_head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.local_num_kv_heads, self.attn_v_head_dim).transpose(1, 2)
+
+        # Split into rope and non-rope parts
+        query_rope = query_states[..., :self.rope_dim]
+        query_nope = query_states[..., self.rope_dim:]
+        key_rope = key_states[..., :self.rope_dim]
+        key_nope = key_states[..., self.rope_dim:]
+
+        # Compute rotary embeddings if not cached
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = self.rotary_emb(value_states, position_ids)
+
+        # Apply rotary position embedding to rope parts only
+        query_rope, key_rope = apply_rotary_pos_emb(
+            query_rope, key_rope, cos_cache, sin_cache, position_ids
+        )
+
+        # Concatenate rope and non-rope parts
+        query_states = torch.cat([query_rope, query_nope], dim=-1)
+        key_states = torch.cat([key_rope, key_nope], dim=-1)
+
+        # Store key/value states BEFORE GQA repeat for KV cache
+        # The cache stores original num_kv_heads, not expanded
+        key_states_for_cache = key_states
+        value_states_for_cache = value_states
+
+        # WORKAROUND 1: Pad V from v_head_dim (128) to head_dim (192) for KV cache compatibility
+        if self.attn_v_head_dim < self.attn_head_dim:
+            pad_size = self.attn_head_dim - self.attn_v_head_dim
+            value_states_for_cache = F.pad(value_states_for_cache, (0, pad_size), value=0.0)
+
+        # WORKAROUND 2: Pad KV heads if layer has fewer than cache expects
+        # Full attention has 4 KV heads (1 per rank), sliding window has 8 (2 per rank)
+        # Cache is sized for max (8 heads = 2 per rank)
+        if self.local_num_kv_heads < self.local_cache_kv_heads:
+            # Pad KV heads by repeating
+            repeat_factor = self.local_cache_kv_heads // self.local_num_kv_heads
+            key_states_for_cache = key_states_for_cache.repeat(1, repeat_factor, 1, 1)
+            value_states_for_cache = value_states_for_cache.repeat(1, repeat_factor, 1, 1)
+
+        # Repeat KV heads for GQA
+        num_key_value_groups = self.local_num_heads // self.local_num_kv_heads
+        if num_key_value_groups > 1:
+            key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
+            value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
+
+        if is_token_gen:
+            # Token generation: use decomposed attention with prior (cached) and active (current) KV
+            # past_key_value[0] = cached K, shape [bsz, cache_kv_heads, kv_seq_len, head_dim]
+            # past_key_value[1] = cached V, shape [bsz, cache_kv_heads, kv_seq_len, head_dim] (padded)
+            K_prior = past_key_value[0]
+            V_prior = past_key_value[1]
+
+            # WORKAROUND 1: Slice KV heads if cache has more than layer needs
+            if self.local_num_kv_heads < self.local_cache_kv_heads:
+                # Cache has repeated heads, just take the first local_num_kv_heads
+                K_prior = K_prior[:, :self.local_num_kv_heads, :, :]
+                V_prior = V_prior[:, :self.local_num_kv_heads, :, :]
+
+            # WORKAROUND 2: Slice V_prior back to v_head_dim (128) from head_dim (192)
+            if self.attn_v_head_dim < self.attn_head_dim:
+                V_prior = V_prior[..., :self.attn_v_head_dim]
+
+            # Repeat cached KV for GQA
+            if num_key_value_groups > 1:
+                K_prior = K_prior.repeat_interleave(num_key_value_groups, dim=1)
+                V_prior = V_prior.repeat_interleave(num_key_value_groups, dim=1)
+
+            # Compute attention on prior (cached) KV
+            # K_prior shape: [bsz, num_heads, kv_seq_len, head_dim]
+            prior_scores = torch.matmul(query_states, K_prior.transpose(-2, -1)) * self.scaling
+
+            # Apply attention mask to prior scores (mask indicates valid positions)
+            if attention_mask is not None:
+                # attention_mask shape: [bsz, 1, 1, kv_seq_len] or [bsz, num_heads, q_len, kv_seq_len]
+                prior_scores = torch.where(
+                    attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+                )
+            prior_scores = prior_scores.to(torch.float32)
+
+            # Compute attention on active (current) KV
+            # key_states shape: [bsz, num_heads, 1, head_dim]
+            active_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
+            active_scores = active_scores.to(torch.float32)
+
+            # Combined softmax over prior and active scores
+            # Concatenate scores along the last dimension
+            all_scores = torch.cat([prior_scores, active_scores], dim=-1)
+            attn_weights = F.softmax(all_scores, dim=-1, dtype=torch.float32)
+
+            # Split attention weights back
+            prior_weights = attn_weights[..., :-q_len].to(V_prior.dtype)
+            active_weights = attn_weights[..., -q_len:].to(value_states.dtype)
+
+            # Compute attention outputs
+            attn_prior = torch.matmul(prior_weights, V_prior)
+            attn_active = torch.matmul(active_weights, value_states)
+            attn_output = attn_prior + attn_active
+        else:
+            # Context encoding: standard attention
+            # Compute attention scores
+            attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
+
+            # Apply attention mask
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+
+            # Apply sliding window mask if needed
+            if self.is_sliding_window and self.sliding_window_size is not None:
+                # Create sliding window mask
+                seq_len = attn_weights.size(-1)
+                sliding_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=attn_weights.device)
+                sliding_mask = torch.triu(sliding_mask, diagonal=-self.sliding_window_size + 1)
+                sliding_mask = torch.tril(sliding_mask)
+                sliding_mask = ~sliding_mask
+                attn_weights = attn_weights.masked_fill(sliding_mask, float('-inf'))
+
+            # Softmax
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+
+            # Apply attention to values
+            attn_output = torch.matmul(attn_weights, value_states)
+
+        # Apply value scale if specified
+        if self.value_scale != 1.0:
+            attn_output = attn_output * self.value_scale
+
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.local_num_heads * self.attn_v_head_dim)
+        attn_output = self.o_proj(attn_output)
+
+        # Prepare KV cache output - return as tuple for KV cache manager
+        # Return ORIGINAL (non-GQA-expanded) key/value states for cache
+        new_key_value = (key_states_for_cache, value_states_for_cache)
+
+        return attn_output, new_key_value, cos_cache, sin_cache
+
+
+class MiMoV2MLP(nn.Module):
+    """Standard MLP for non-MoE layers in MiMo-V2-Flash."""
+
+    def __init__(self, config: MiMoV2InferenceConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        # Use the dense intermediate size for non-MoE layers
+        self.intermediate_size = getattr(config, 'dense_intermediate_size', config.intermediate_size * 8)
+
+        dtype = config.neuron_config.torch_dtype
+
+        if parallel_state.model_parallel_is_initialized():
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+                gather_output=False,
+                dtype=dtype,
+                tensor_model_parallel_group=tp_group,
+            )
+            self.up_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+                gather_output=False,
+                dtype=dtype,
+                tensor_model_parallel_group=tp_group,
+            )
+            self.down_proj = RowParallelLinear(
+                self.intermediate_size,
+                self.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                dtype=dtype,
+                tensor_model_parallel_group=tp_group,
+            )
+        else:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        self.act_fn = F.silu
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class NeuronMiMoV2DecoderLayer(nn.Module):
+    """MiMo-V2-Flash Decoder Layer with hybrid attention and conditional MoE."""
+
+    def __init__(self, config: MiMoV2InferenceConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
+
+        # Determine attention type for this layer
+        is_sliding_window = config.layer_attention_types[layer_idx] == "sliding_window"
+        self.attention_type = "sliding_window" if is_sliding_window else "full"
+
+        # Create attention module
+        self.self_attn = NeuronMiMoV2Attention(
+            config=config,
+            layer_idx=layer_idx,
+            is_sliding_window=is_sliding_window,
+        )
+
+        # Determine if this layer uses MoE
+        self.uses_moe = config.layer_uses_moe[layer_idx]
+
+        # Create MLP/MoE module
+        if self.uses_moe:
+            self.mlp = initialize_moe_module(config=config)
+        else:
+            self.mlp = MiMoV2MLP(config)
+
+        # Layer norms
+        self.input_layernorm = get_rmsnorm_cls()(
+            config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
+        self.post_attention_layernorm = get_rmsnorm_cls()(
+            config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
+
+        # Config flags
+        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, ...]:
+        """Forward pass for decoder layer."""
+
+        # Self attention with residual
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # MLP/MoE with residual
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if self.uses_moe:
+            hidden_states = self.mlp(hidden_states, padding_mask)[0]
+        else:
+            hidden_states = self.mlp(hidden_states)
+
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
+        return outputs
+
+
+class NeuronMiMoV2Model(NeuronBaseModel):
+    """MiMo-V2-Flash Model for NXD inference."""
+
+    def setup_attr_for_model(self, config: MiMoV2InferenceConfig):
+        self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        # Use the maximum num_kv_heads for KV cache (handles hybrid full/sliding window attention)
+        # Full attention uses num_key_value_heads, sliding window uses swa_num_key_value_heads
+        self.num_key_value_heads = max(
+            config.num_key_value_heads,
+            getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
+        )
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
+
+    def init_model(self, config: MiMoV2InferenceConfig):
+        self.padding_idx = getattr(config, 'pad_token_id', None)
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+            dtype=config.neuron_config.torch_dtype,
+            shard_across_embedding=True,
+        )
+
+        self.layers = nn.ModuleList([
+            NeuronMiMoV2DecoderLayer(config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
+        ])
+
+        self.norm = get_rmsnorm_cls()(
+            config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
+
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            gather_output=not self.on_device_sampling,
+            bias=False,
+        )
+
+
+def convert_mimo_v2_hf_to_neuron_state_dict(
+    neuron_state_dict: Dict[str, Any],
+    config: MiMoV2InferenceConfig,
+) -> Dict[str, Any]:
+    """Convert HuggingFace MiMo-V2-Flash weights to Neuron format.
+
+    This handles:
+    1. Router weight renaming
+    2. Expert weight concatenation and transposition
+    3. FP8 dequantization if needed
+    """
+
+    assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
+
+    # Dequantize layers if needed
+    _maybe_dequantize_layer(neuron_state_dict, config)
+
+    # Add rank utility tensors
+    neuron_state_dict["rank_util.rank"] = torch.arange(
+        0, config.neuron_config.tp_degree, dtype=torch.int32
+    )
+
+    for layer_idx in range(config.num_hidden_layers):
+        # Add rank utility for attention
+        neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
+            0, config.neuron_config.tp_degree, dtype=torch.int32
+        )
+
+        # Only convert MoE layers
+        if not config.layer_uses_moe[layer_idx]:
+            continue
+
+        # Check if this layer has MoE weights
+        gate_key = f"layers.{layer_idx}.mlp.gate.weight"
+        if gate_key not in neuron_state_dict:
+            continue
+
+        # Rename router weights
+        neuron_state_dict[f"layers.{layer_idx}.mlp.router.linear_router.weight"] = (
+            neuron_state_dict[gate_key].detach().clone()
+        )
+        del neuron_state_dict[gate_key]
+
+        # Get dimensions from first expert
+        expert_0_gate = f"layers.{layer_idx}.mlp.experts.0.gate_proj.weight"
+        if expert_0_gate not in neuron_state_dict:
+            continue
+
+        intermediate_size, hidden_size = neuron_state_dict[expert_0_gate].shape
+        device = neuron_state_dict[expert_0_gate].device
+        dtype = neuron_state_dict[expert_0_gate].dtype
+
+        num_experts = config.n_routed_experts
+
+        # Concatenate gate and up projections
+        gate_up_proj = torch.empty(
+            num_experts,
+            hidden_size,
+            2 * intermediate_size,
+            dtype=dtype,
+            device=device,
+        )
+
+        for e in range(num_experts):
+            gate_proj_weights = neuron_state_dict[
+                f"layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight"
+            ].T.detach().clone()
+            up_proj_weights = neuron_state_dict[
+                f"layers.{layer_idx}.mlp.experts.{e}.up_proj.weight"
+            ].T.detach().clone()
+
+            gate_up_proj[e, :, :intermediate_size] = gate_proj_weights
+            gate_up_proj[e, :, intermediate_size:] = up_proj_weights
+
+            del neuron_state_dict[f"layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight"]
+            del neuron_state_dict[f"layers.{layer_idx}.mlp.experts.{e}.up_proj.weight"]
+
+        # Pad if needed
+        pad_size = getattr(config, "moe_intermediate_pad_size", 0)
+        if pad_size > 0:
+            gate_up_proj = gate_up_proj.reshape(num_experts, hidden_size, 2, -1)
+            gate_up_proj = F.pad(gate_up_proj, (0, pad_size))
+            gate_up_proj = gate_up_proj.reshape(num_experts, hidden_size, -1)
+
+        neuron_state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
+
+        # Convert down projections
+        down_proj = torch.empty(
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+
+        for e in range(num_experts):
+            down_proj_weights = neuron_state_dict[
+                f"layers.{layer_idx}.mlp.experts.{e}.down_proj.weight"
+            ].T.detach().clone()
+            down_proj[e] = down_proj_weights
+            del neuron_state_dict[f"layers.{layer_idx}.mlp.experts.{e}.down_proj.weight"]
+
+        # Pad if needed
+        if pad_size > 0:
+            down_proj = F.pad(down_proj, (0, 0, 0, pad_size))
+
+        neuron_state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+
+        gc.collect()
+
+    return neuron_state_dict
+
+
+def _maybe_dequantize_layer(
+    neuron_state_dict: Dict[str, Any],
+    config: MiMoV2InferenceConfig,
+):
+    """Dequantize FP8 layers if present."""
+    scale_layers = []
+
+    for layer_key in list(neuron_state_dict.keys()):
+        if "_scale_inv" in layer_key:
+            scales = neuron_state_dict[layer_key]
+            scale_layers.append(layer_key)
+
+            fp8_layer_name = layer_key.replace("_scale_inv", "")
+            if fp8_layer_name not in neuron_state_dict:
+                continue
+
+            fp8_layer = neuron_state_dict[fp8_layer_name]
+
+            # Get block size from config if available
+            if hasattr(config, 'quantization_config') and config.quantization_config:
+                block_size = config.quantization_config.get("weight_block_size", [128, 128])
+            else:
+                block_size = [128, 128]
+
+            # Expand scales and dequantize
+            scales_expanded = scales.repeat_interleave(block_size[0], dim=0)
+            scales_expanded = scales_expanded.repeat_interleave(block_size[1], dim=1)
+
+            # Ensure shapes match
+            if scales_expanded.shape != fp8_layer.shape:
+                scales_expanded = scales_expanded[:fp8_layer.shape[0], :fp8_layer.shape[1]]
+
+            scaled_layer = fp8_layer.to(torch.float32) * scales_expanded.to(torch.float32)
+            neuron_state_dict[fp8_layer_name] = scaled_layer.to(config.neuron_config.torch_dtype)
+
+    # Remove scale layers
+    for scale_layer in scale_layers:
+        del neuron_state_dict[scale_layer]
+
+
+class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
+    """MiMo-V2-Flash for Causal Language Modeling on Neuron."""
+
+    _model_cls = NeuronMiMoV2Model
+
+    @staticmethod
+    def load_hf_model(model_path: str, **kwargs):
+        """Load HuggingFace model.
+
+        Note: MiMo-V2-Flash uses custom code, so we need trust_remote_code=True
+        """
+        from transformers import AutoModelForCausalLM
+        return AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            **kwargs,
+        )
+
+    @classmethod
+    def get_config_cls(cls) -> Type[MiMoV2InferenceConfig]:
+        return MiMoV2InferenceConfig
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(
+        state_dict: Dict[str, Any],
+        config: MiMoV2InferenceConfig,
+    ) -> Dict[str, Any]:
+        return convert_mimo_v2_hf_to_neuron_state_dict(state_dict, config)
+
+    def enable_context_encoding(self):
+        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
+        super().enable_context_encoding()
+
+    def enable_token_generation(self):
+        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
+        super().enable_token_generation()
+
+    def get_compiler_args(self) -> str:
+        """Get compiler arguments optimized for MiMo-V2-Flash."""
+        if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
+            optimization_level = "-O1"
+        elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
+            optimization_level = "-O3" if self.neuron_config.moe_ep_degree > 1 else "-O1"
+        else:
+            optimization_level = "-O1"
+
+        compiler_args = (
+            f"--enable-saturate-infinity "
+            f"--enable-mixed-precision-accumulation "
+            f"--model-type transformer "
+            f"{optimization_level}"
+        )
+
+        # Add CC overlap optimization
+        compiler_args += (
+            " --tensorizer-options='--enable-ccop-compute-overlap "
+            "--cc-pipeline-tiling-factor=2'"
+        )
+
+        compiler_args += " --auto-cast=none"
+
+        # Enable vector-offset DGE
+        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
+        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
+
+        if self.neuron_config.scratchpad_page_size:
+            compiler_args += f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size}"
+
+        return compiler_args

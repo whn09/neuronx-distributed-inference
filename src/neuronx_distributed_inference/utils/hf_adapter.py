@@ -50,6 +50,9 @@ def load_pretrained_config(
                 # Qwen3 Next uses custom config since it's not in standard transformers yet
                 from neuronx_distributed_inference.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
                 config: PretrainedConfig = Qwen3NextConfig.from_pretrained(model_path_or_name)
+            elif 'MiMo' in model_path_or_name or 'mimo' in model_path_or_name.lower():
+                # MiMo-V2-Flash uses custom code
+                config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=True)
             else:
                 config: PretrainedConfig = AutoConfig.from_pretrained(model_path_or_name)
         else:
