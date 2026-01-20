@@ -332,23 +332,44 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         else:
             self.value_scale = 1.0
 
-        # Store cache KV heads (max of full and sliding window) for cache compatibility
-        self.cache_num_kv_heads = max(
-            config.num_key_value_heads,
-            getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
-        )
-        # Calculate local cache KV heads after TP split
+        # Store cache KV heads for cache compatibility
+        # With CONVERT_TO_MHA, all layers have num_attention_heads KV heads
+        # Otherwise, use max of full and sliding window kv heads
         tp_degree = config.neuron_config.tp_degree
-        self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // tp_degree)
+        if self.use_gqa_convert_to_mha:
+            # CONVERT_TO_MHA: cache stores num_attention_heads (same as Q heads)
+            self.cache_num_kv_heads = self.attn_num_heads
+            self.local_cache_kv_heads = self.local_num_heads
+        else:
+            # Standard GQA: cache uses max of full and sliding window kv heads
+            self.cache_num_kv_heads = max(
+                config.num_key_value_heads,
+                getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
+            )
+            self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // tp_degree)
 
     def _init_projections(self, config: MiMoV2InferenceConfig):
         """Initialize projection layers with correct dimensions."""
         dtype = config.neuron_config.torch_dtype
+        tp_degree = config.neuron_config.tp_degree
+
+        # Check if we need GQA CONVERT_TO_MHA (when tp_degree > num_kv_heads)
+        # In this case, we replicate KV to match num_attention_heads for proper TP splitting
+        self.use_gqa_convert_to_mha = tp_degree > self.attn_num_kv_heads
+
+        if self.use_gqa_convert_to_mha:
+            # CONVERT_TO_MHA: K and V are projected to num_attention_heads (same as Q)
+            # This allows proper TP splitting when tp_degree > num_kv_heads
+            k_num_heads = self.attn_num_heads
+            v_num_heads = self.attn_num_heads
+        else:
+            k_num_heads = self.attn_num_kv_heads
+            v_num_heads = self.attn_num_kv_heads
 
         # Q/K use head_dim, V uses v_head_dim
         q_hidden_size = self.attn_num_heads * self.attn_head_dim
-        k_hidden_size = self.attn_num_kv_heads * self.attn_head_dim
-        v_hidden_size = self.attn_num_kv_heads * self.attn_v_head_dim
+        k_hidden_size = k_num_heads * self.attn_head_dim
+        v_hidden_size = v_num_heads * self.attn_v_head_dim
         o_hidden_size = self.attn_num_heads * self.attn_v_head_dim
 
         if parallel_state.model_parallel_is_initialized():
@@ -395,9 +416,12 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             )
 
             # Calculate local dimensions after TP split
-            tp_degree = config.neuron_config.tp_degree
             self.local_num_heads = self.attn_num_heads // tp_degree
-            self.local_num_kv_heads = max(1, self.attn_num_kv_heads // tp_degree)
+            if self.use_gqa_convert_to_mha:
+                # With CONVERT_TO_MHA, local KV heads = local Q heads
+                self.local_num_kv_heads = self.local_num_heads
+            else:
+                self.local_num_kv_heads = max(1, self.attn_num_kv_heads // tp_degree)
         else:
             self.q_proj = nn.Linear(config.hidden_size, q_hidden_size, bias=config.attention_bias)
             self.k_proj = nn.Linear(config.hidden_size, k_hidden_size, bias=config.attention_bias)
@@ -405,7 +429,7 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             self.o_proj = nn.Linear(o_hidden_size, config.hidden_size, bias=False)
 
             self.local_num_heads = self.attn_num_heads
-            self.local_num_kv_heads = self.attn_num_kv_heads
+            self.local_num_kv_heads = k_num_heads  # May be expanded if CONVERT_TO_MHA
 
         # Remove qkv_proj from base class if exists
         if hasattr(self, 'qkv_proj'):
@@ -466,7 +490,8 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         key_states = torch.cat([key_rope, key_nope], dim=-1)
 
         # Store key/value states BEFORE GQA repeat for KV cache
-        # The cache stores original num_kv_heads, not expanded
+        # With CONVERT_TO_MHA, the cache stores expanded heads (same as Q heads)
+        # Without CONVERT_TO_MHA, the cache stores original num_kv_heads
         key_states_for_cache = key_states
         value_states_for_cache = value_states
 
@@ -476,15 +501,18 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             value_states_for_cache = F.pad(value_states_for_cache, (0, pad_size), value=0.0)
 
         # WORKAROUND 2: Pad KV heads if layer has fewer than cache expects
+        # Only needed when NOT using CONVERT_TO_MHA (standard GQA mode)
         # Full attention has 4 KV heads (1 per rank), sliding window has 8 (2 per rank)
         # Cache is sized for max (8 heads = 2 per rank)
-        if self.local_num_kv_heads < self.local_cache_kv_heads:
+        # With CONVERT_TO_MHA, all layers have same num_kv_heads (=num_attention_heads)
+        if not self.use_gqa_convert_to_mha and self.local_num_kv_heads < self.local_cache_kv_heads:
             # Pad KV heads by repeating
             repeat_factor = self.local_cache_kv_heads // self.local_num_kv_heads
             key_states_for_cache = key_states_for_cache.repeat(1, repeat_factor, 1, 1)
             value_states_for_cache = value_states_for_cache.repeat(1, repeat_factor, 1, 1)
 
-        # Repeat KV heads for GQA
+        # Repeat KV heads for GQA (only needed without CONVERT_TO_MHA)
+        # With CONVERT_TO_MHA, K/V already have num_attention_heads
         num_key_value_groups = self.local_num_heads // self.local_num_kv_heads
         if num_key_value_groups > 1:
             key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
@@ -498,7 +526,9 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             V_prior = past_key_value[1]
 
             # WORKAROUND 1: Slice KV heads if cache has more than layer needs
-            if self.local_num_kv_heads < self.local_cache_kv_heads:
+            # Only needed when NOT using CONVERT_TO_MHA (standard GQA mode)
+            # With CONVERT_TO_MHA, cache and layer have same num_kv_heads
+            if not self.use_gqa_convert_to_mha and self.local_num_kv_heads < self.local_cache_kv_heads:
                 # Cache has repeated heads, just take the first local_num_kv_heads
                 K_prior = K_prior[:, :self.local_num_kv_heads, :, :]
                 V_prior = V_prior[:, :self.local_num_kv_heads, :, :]
@@ -507,7 +537,8 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             if self.attn_v_head_dim < self.attn_head_dim:
                 V_prior = V_prior[..., :self.attn_v_head_dim]
 
-            # Repeat cached KV for GQA
+            # Repeat cached KV for GQA (only needed without CONVERT_TO_MHA)
+            # With CONVERT_TO_MHA, cached K/V already have num_attention_heads
             if num_key_value_groups > 1:
                 K_prior = K_prior.repeat_interleave(num_key_value_groups, dim=1)
                 V_prior = V_prior.repeat_interleave(num_key_value_groups, dim=1)
@@ -724,12 +755,26 @@ class NeuronMiMoV2Model(NeuronBaseModel):
         self.tp_degree = config.neuron_config.tp_degree
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
-        # Use the maximum num_kv_heads for KV cache (handles hybrid full/sliding window attention)
-        # Full attention uses num_key_value_heads, sliding window uses swa_num_key_value_heads
-        self.num_key_value_heads = max(
+
+        # Check if we need GQA CONVERT_TO_MHA mode
+        # When tp_degree > num_kv_heads, we replicate K/V to match num_attention_heads
+        min_kv_heads = min(
             config.num_key_value_heads,
             getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
         )
+        self.use_gqa_convert_to_mha = self.tp_degree > min_kv_heads
+
+        if self.use_gqa_convert_to_mha:
+            # With CONVERT_TO_MHA, KV cache stores num_attention_heads (same as Q)
+            self.num_key_value_heads = config.num_attention_heads
+        else:
+            # Standard GQA: use the maximum num_kv_heads for KV cache
+            # (handles hybrid full/sliding window attention)
+            self.num_key_value_heads = max(
+                config.num_key_value_heads,
+                getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
+            )
+
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
 

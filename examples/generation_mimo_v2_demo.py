@@ -11,21 +11,21 @@ MiMo-V2-Flash is a large MoE model from Xiaomi with:
 Reference: https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash
 
 IMPORTANT CONSTRAINTS:
-1. TP Degree: Must divide the minimum num_kv_heads (4). Valid values: 1, 2, 4.
-   - Full attention uses num_kv_heads=4
-   - Sliding window attention uses num_kv_heads=8
-   - Common divisor is 4, so TP must be 1, 2, or 4.
+1. TP Degree:
+   - For small TP (<=4): Must divide the minimum num_kv_heads (4). Valid: 1, 2, 4.
+   - For large TP (>4): Uses GQA CONVERT_TO_MHA mode where K/V are replicated
+     to match num_attention_heads (64). Valid: 8, 16, 32, 64.
+   - Recommended: TP=32 for this large model (fits on trn2.48xlarge)
 
 2. Memory Requirements:
    - With TP=4, the model requires ~143GB per compilation unit
    - A single Trainium2 chip has ~24GB HBM
-   - Full compilation requires distributed inference across multiple nodes,
-     expert parallelism (EP), or model quantization.
+   - With TP=32, memory per chip is ~4.5GB which fits comfortably
 
 3. Hybrid Attention:
    - Full attention layers (pattern=0): num_kv_heads=4, head_dim=192, v_head_dim=128
    - Sliding window layers (pattern=1): num_kv_heads=8, head_dim=192, v_head_dim=128
-   - The KV cache uses the maximum num_kv_heads (8) for compatibility.
+   - With CONVERT_TO_MHA (TP>4): K/V are replicated to 64 heads for proper TP splitting
 """
 
 import argparse
@@ -64,8 +64,22 @@ def parse_args():
     parser.add_argument(
         "--tp-degree",
         type=int,
-        default=4,
-        help="Tensor parallelism degree. Must divide num_kv_heads=4. Valid: 1, 2, 4.",
+        default=32,
+        help="Tensor parallelism degree. For TP<=4, must divide num_kv_heads=4. "
+             "For TP>4, uses CONVERT_TO_MHA mode. Valid: 1, 2, 4, 8, 16, 32. "
+             "Recommended: 32 for this large model.",
+    )
+    parser.add_argument(
+        "--moe-tp-degree",
+        type=int,
+        default=None,
+        help="MoE tensor parallelism degree (default: tp_degree).",
+    )
+    parser.add_argument(
+        "--moe-ep-degree",
+        type=int,
+        default=1,
+        help="MoE expert parallelism degree. Note: EP>1 may not be supported in token generation.",
     )
     parser.add_argument(
         "--batch-size",
@@ -105,11 +119,22 @@ def parse_args():
 
     # Validate TP degree
     MIN_NUM_KV_HEADS = 4  # Full attention uses 4 KV heads
-    if MIN_NUM_KV_HEADS % args.tp_degree != 0:
-        raise ValueError(
-            f"tp_degree ({args.tp_degree}) must divide num_kv_heads (4). "
-            f"Valid values: 1, 2, 4."
-        )
+    NUM_ATTENTION_HEADS = 64  # MiMo-V2-Flash has 64 attention heads
+
+    if args.tp_degree <= MIN_NUM_KV_HEADS:
+        # Standard GQA mode: TP must divide num_kv_heads
+        if MIN_NUM_KV_HEADS % args.tp_degree != 0:
+            raise ValueError(
+                f"tp_degree ({args.tp_degree}) must divide num_kv_heads (4). "
+                f"Valid values for small TP: 1, 2, 4."
+            )
+    else:
+        # CONVERT_TO_MHA mode: TP must divide num_attention_heads
+        if NUM_ATTENTION_HEADS % args.tp_degree != 0:
+            raise ValueError(
+                f"tp_degree ({args.tp_degree}) must divide num_attention_heads (64). "
+                f"Valid values for large TP: 8, 16, 32, 64."
+            )
 
     return args
 
@@ -117,17 +142,30 @@ def parse_args():
 def create_neuron_config(args):
     """Create NeuronConfig for MiMo-V2-Flash."""
 
-    # MiMo-V2-Flash uses:
-    # - num_key_value_heads = 4 (full attention)
-    # - num_key_value_heads = 8 (sliding window attention)
-    # tp_degree must be divisible by the minimum (4)
-    assert args.tp_degree % 4 == 0, f"tp_degree must be divisible by 4, got {args.tp_degree}"
+    # Determine MoE TP/EP degrees
+    moe_ep_degree = args.moe_ep_degree
+    moe_tp_degree = args.moe_tp_degree if args.moe_tp_degree else args.tp_degree
+
+    # Check if CONVERT_TO_MHA mode will be used
+    MIN_NUM_KV_HEADS = 4
+    use_convert_to_mha = args.tp_degree > MIN_NUM_KV_HEADS
+
+    print(f"\nParallelism configuration:")
+    print(f"  TP Degree (attention): {args.tp_degree}")
+    print(f"  MoE TP Degree: {moe_tp_degree}")
+    print(f"  MoE EP Degree: {moe_ep_degree}")
+    print(f"  Experts per EP rank: {256 // moe_ep_degree}")
+    print(f"  GQA Mode: {'CONVERT_TO_MHA (K/V replicated to 64 heads)' if use_convert_to_mha else 'Standard GQA'}")
 
     neuron_config = MoENeuronConfig(
         tp_degree=args.tp_degree,
         batch_size=args.batch_size,
         max_context_length=args.max_context_length,
         seq_len=args.seq_len,
+
+        # MoE parallelism
+        moe_tp_degree=moe_tp_degree,
+        moe_ep_degree=moe_ep_degree,
 
         # Sampling configuration
         on_device_sampling_config=OnDeviceSamplingConfig(

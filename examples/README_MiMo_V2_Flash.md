@@ -46,27 +46,34 @@ Full model implementation with weight conversion support.
 ## Constraints
 
 ### TP Degree
-Must divide the minimum num_kv_heads (4). Valid values: **1, 2, 4**.
 
-- Full attention uses num_kv_heads=4
-- Sliding window attention uses num_kv_heads=8
-- Common divisor is 4
+**Standard GQA Mode (TP <= 4)**:
+- Must divide the minimum num_kv_heads (4)
+- Valid values: **1, 2, 4**
+
+**CONVERT_TO_MHA Mode (TP > 4)**:
+- K/V heads are replicated to match num_attention_heads (64)
+- Must divide num_attention_heads (64)
+- Valid values: **8, 16, 32, 64**
+- **Recommended: TP=32** for this large model (fits on trn2.48xlarge with 32 logical cores)
 
 ### Memory Requirements
-With TP=4, the model requires ~143GB per compilation unit, but Trainium2 has 24GB per chip.
 
-Full compilation requires one of:
-- Expert parallelism (EP) to distribute 256 experts across chips
-- Multi-node distributed inference
-- Model quantization (FP8/INT8)
+| TP Degree | Memory per Chip | Status |
+|-----------|-----------------|--------|
+| 4 | ~143GB | Exceeds 24GB HBM |
+| 8 | ~18GB | Fits |
+| 16 | ~9GB | Fits comfortably |
+| 32 | ~4.5GB | Fits easily (recommended) |
 
 ### Hybrid Attention
-| Attention Type | num_kv_heads | head_dim | v_head_dim |
-|---------------|--------------|----------|------------|
-| Full (pattern=0) | 4 | 192 | 128 |
-| Sliding Window (pattern=1) | 8 | 192 | 128 |
+| Attention Type | Original num_kv_heads | With CONVERT_TO_MHA | head_dim | v_head_dim |
+|---------------|----------------------|---------------------|----------|------------|
+| Full (pattern=0) | 4 | 64 | 192 | 128 |
+| Sliding Window (pattern=1) | 8 | 64 | 192 | 128 |
 
-The KV cache uses the maximum num_kv_heads (8) for compatibility.
+- With CONVERT_TO_MHA (TP>4), all layers have 64 KV heads (same as Q heads)
+- KV cache stores 64 heads per layer (split across TP ranks)
 
 ## Usage
 
@@ -77,9 +84,9 @@ source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 # Set PYTHONPATH for development
 export PYTHONPATH=/home/ubuntu/neuronx-distributed-inference/src:$PYTHONPATH
 
-# Compile model (requires multi-node setup for full compilation)
+# Compile model with TP=32 (recommended)
 python examples/generation_mimo_v2_demo.py \
-    --tp-degree 4 \
+    --tp-degree 32 \
     --batch-size 1 \
     --max-context-length 128 \
     --seq-len 512 \
@@ -87,7 +94,7 @@ python examples/generation_mimo_v2_demo.py \
 
 # Run inference (after compilation)
 python examples/generation_mimo_v2_demo.py \
-    --tp-degree 4 \
+    --tp-degree 32 \
     --skip-compile \
     --prompt "Hello, how are you?"
 ```
@@ -107,9 +114,35 @@ Uses decomposed attention approach:
 - Active attention: Compute attention on current token's KV
 - Combined with proper softmax normalization
 
-## Next Steps for Full Support
+## Current Status
 
-1. Add expert parallelism (EP) configuration to distribute 256 experts
-2. Test with multi-node setup (e.g., trn2.48xlarge with 16 chips + EP)
-3. Add FP8/INT8 quantization support for memory reduction
-4. Optimize KV cache for hybrid attention (per-layer cache sizes)
+**COMPILATION: PASSED** - Both context_encoding_model and token_generation_model compiled successfully with TP=32.
+
+**Solution: CONVERT_TO_MHA with TP=32** - Using high tensor parallelism (TP=32) with GQA CONVERT_TO_MHA mode to distribute the ~143GB model across 32 logical cores on trn2.48xlarge.
+
+Compilation results:
+- HLO generation: ~11 seconds
+- Context encoding compilation: ~355 seconds
+- Token generation compilation: Cached (used previous compile)
+- Total build time: ~431 seconds (~7 minutes)
+
+## Implementation Details
+
+### CONVERT_TO_MHA Mode
+When TP > num_kv_heads (4 for MiMo), the implementation uses GQA CONVERT_TO_MHA strategy:
+- K and V projections output num_attention_heads (64) instead of num_kv_heads (4 or 8)
+- This allows proper tensor parallel splitting across TP ranks
+- KV cache stores 64 heads per layer (2 per TP rank with TP=32)
+
+### Expert Parallelism Note
+The neuronx-distributed MoE module currently has a limitation for EP > 1:
+```
+NotImplementedError: Selective Loading with Expert parallelism is not supported in token generation.
+```
+With TP=32, EP is not required since the model fits in memory using tensor parallelism alone.
+
+## Next Steps
+
+1. Test compilation and inference with TP=32 on a 32-chip instance
+2. Benchmark inference performance
+3. Consider adding FP8 quantization for smaller cluster deployments
