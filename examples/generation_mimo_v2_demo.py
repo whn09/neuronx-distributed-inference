@@ -9,6 +9,23 @@ MiMo-V2-Flash is a large MoE model from Xiaomi with:
 - Partial RoPE (34% of dimensions)
 
 Reference: https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash
+
+IMPORTANT CONSTRAINTS:
+1. TP Degree: Must divide the minimum num_kv_heads (4). Valid values: 1, 2, 4.
+   - Full attention uses num_kv_heads=4
+   - Sliding window attention uses num_kv_heads=8
+   - Common divisor is 4, so TP must be 1, 2, or 4.
+
+2. Memory Requirements:
+   - With TP=4, the model requires ~143GB per compilation unit
+   - A single Trainium2 chip has ~24GB HBM
+   - Full compilation requires distributed inference across multiple nodes,
+     expert parallelism (EP), or model quantization.
+
+3. Hybrid Attention:
+   - Full attention layers (pattern=0): num_kv_heads=4, head_dim=192, v_head_dim=128
+   - Sliding window layers (pattern=1): num_kv_heads=8, head_dim=192, v_head_dim=128
+   - The KV cache uses the maximum num_kv_heads (8) for compatibility.
 """
 
 import argparse
@@ -47,8 +64,8 @@ def parse_args():
     parser.add_argument(
         "--tp-degree",
         type=int,
-        default=32,
-        help="Tensor parallelism degree (must be divisible by num_kv_heads=4)",
+        default=4,
+        help="Tensor parallelism degree. Must divide num_kv_heads=4. Valid: 1, 2, 4.",
     )
     parser.add_argument(
         "--batch-size",
@@ -84,7 +101,17 @@ def parse_args():
         default="Hello, how are you today?",
         help="Prompt for text generation",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Validate TP degree
+    MIN_NUM_KV_HEADS = 4  # Full attention uses 4 KV heads
+    if MIN_NUM_KV_HEADS % args.tp_degree != 0:
+        raise ValueError(
+            f"tp_degree ({args.tp_degree}) must divide num_kv_heads (4). "
+            f"Valid values: 1, 2, 4."
+        )
+
+    return args
 
 
 def create_neuron_config(args):
