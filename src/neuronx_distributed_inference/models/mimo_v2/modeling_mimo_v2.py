@@ -845,8 +845,9 @@ def _replicate_kv_projections_for_convert_to_mha(
         k_proj = neuron_state_dict[k_proj_key]
         # Reshape to [num_kv_heads, head_dim, hidden_size]
         k_proj = k_proj.view(num_kv_heads, head_dim, -1)
-        # Repeat along num_kv_heads dimension
-        k_proj = k_proj.repeat(repeat_factor, 1, 1)
+        # Use repeat_interleave to repeat each head consecutively
+        # This matches the GQA CONVERT_TO_MHA pattern where each KV head serves multiple Q heads
+        k_proj = k_proj.repeat_interleave(repeat_factor, dim=0)
         # Reshape back to [num_attention_heads * head_dim, hidden_size]
         neuron_state_dict[k_proj_key] = k_proj.view(-1, k_proj.shape[-1])
 
@@ -856,8 +857,8 @@ def _replicate_kv_projections_for_convert_to_mha(
         v_proj = neuron_state_dict[v_proj_key]
         # Reshape to [num_kv_heads, v_head_dim, hidden_size]
         v_proj = v_proj.view(num_kv_heads, v_head_dim, -1)
-        # Repeat along num_kv_heads dimension
-        v_proj = v_proj.repeat(repeat_factor, 1, 1)
+        # Use repeat_interleave to repeat each head consecutively
+        v_proj = v_proj.repeat_interleave(repeat_factor, dim=0)
         # Reshape back to [num_attention_heads * v_head_dim, hidden_size]
         neuron_state_dict[v_proj_key] = v_proj.view(-1, v_proj.shape[-1])
 
@@ -871,13 +872,19 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
     This handles:
     1. Router weight renaming
     2. Expert weight concatenation and transposition
-    3. FP8 dequantization if needed
+    3. FP8 dequantization or native FP8 scale conversion
     4. K/V projection replication for CONVERT_TO_MHA mode
     """
 
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
 
-    # Dequantize layers if needed
+    # Check if using native FP8
+    use_native_fp8 = (
+        config.neuron_config.quantized or
+        config.neuron_config.quantized_mlp_kernel_enabled
+    )
+
+    # Handle FP8 weights (dequantize or convert scale format)
     _maybe_dequantize_layer(neuron_state_dict, config)
 
     # Check if we need CONVERT_TO_MHA mode
@@ -899,6 +906,11 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
             _replicate_kv_projections_for_convert_to_mha(
                 neuron_state_dict, config, layer_idx
             )
+            # Also replicate scales if using native FP8
+            if use_native_fp8:
+                _replicate_kv_scales_for_convert_to_mha(
+                    neuron_state_dict, config, layer_idx
+                )
         # Add rank utility for attention
         neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
@@ -993,7 +1005,17 @@ def _maybe_dequantize_layer(
     neuron_state_dict: Dict[str, Any],
     config: MiMoV2InferenceConfig,
 ):
-    """Dequantize FP8 layers if present."""
+    """Handle FP8 weights - either dequantize to BF16 or convert for native FP8.
+
+    If config.neuron_config.quantized or config.neuron_config.quantized_mlp_kernel_enabled
+    is True, this function converts weight_scale_inv to .scale format for native FP8.
+    Otherwise, it dequantizes FP8 weights to BF16.
+    """
+    use_native_fp8 = (
+        config.neuron_config.quantized or
+        config.neuron_config.quantized_mlp_kernel_enabled
+    )
+
     scale_layers = []
 
     for layer_key in list(neuron_state_dict.keys()):
@@ -1007,26 +1029,93 @@ def _maybe_dequantize_layer(
 
             fp8_layer = neuron_state_dict[fp8_layer_name]
 
-            # Get block size from config if available
-            if hasattr(config, 'quantization_config') and config.quantization_config:
-                block_size = config.quantization_config.get("weight_block_size", [128, 128])
+            if use_native_fp8:
+                # Convert scale format for native FP8 inference
+                # HuggingFace: weight_scale_inv = 1/scale (used as: original = weight * weight_scale_inv)
+                # Neuron: scale (used as: original = weight * scale)
+                # So: neuron_scale = weight_scale_inv (same semantics, just rename)
+                # Note: The FP8 rescaling (OCP to Neuron format) should be done in preprocessing
+                new_scale_key = fp8_layer_name.replace(".weight", ".scale")
+                neuron_state_dict[new_scale_key] = scales.to(torch.float32)
             else:
-                block_size = [128, 128]
+                # Dequantize FP8 to BF16
+                # Get block size from config if available
+                if hasattr(config, 'quantization_config') and config.quantization_config:
+                    block_size = config.quantization_config.get("weight_block_size", [128, 128])
+                else:
+                    block_size = [128, 128]
 
-            # Expand scales and dequantize
-            scales_expanded = scales.repeat_interleave(block_size[0], dim=0)
-            scales_expanded = scales_expanded.repeat_interleave(block_size[1], dim=1)
+                # Expand scales and dequantize
+                scales_expanded = scales.repeat_interleave(block_size[0], dim=0)
+                scales_expanded = scales_expanded.repeat_interleave(block_size[1], dim=1)
 
-            # Ensure shapes match
-            if scales_expanded.shape != fp8_layer.shape:
-                scales_expanded = scales_expanded[:fp8_layer.shape[0], :fp8_layer.shape[1]]
+                # Ensure shapes match
+                if scales_expanded.shape != fp8_layer.shape:
+                    scales_expanded = scales_expanded[:fp8_layer.shape[0], :fp8_layer.shape[1]]
 
-            scaled_layer = fp8_layer.to(torch.float32) * scales_expanded.to(torch.float32)
-            neuron_state_dict[fp8_layer_name] = scaled_layer.to(config.neuron_config.torch_dtype)
+                scaled_layer = fp8_layer.to(torch.float32) * scales_expanded.to(torch.float32)
+                neuron_state_dict[fp8_layer_name] = scaled_layer.to(config.neuron_config.torch_dtype)
 
-    # Remove scale layers
+    # Remove original scale layers (renamed or no longer needed after dequantization)
     for scale_layer in scale_layers:
         del neuron_state_dict[scale_layer]
+
+
+def _replicate_kv_scales_for_convert_to_mha(
+    neuron_state_dict: Dict[str, Any],
+    config: MiMoV2InferenceConfig,
+    layer_idx: int,
+    block_size: List[int] = [128, 128],
+) -> None:
+    """Replicate K/V projection scales for CONVERT_TO_MHA mode (native FP8 only).
+
+    When using native FP8 with CONVERT_TO_MHA, scales must also be replicated
+    alongside weights.
+
+    Args:
+        neuron_state_dict: State dict to modify in-place
+        config: Model configuration
+        layer_idx: Layer index to process
+        block_size: Block size for quantization
+    """
+    is_sliding_window = config.layer_attention_types[layer_idx] == "sliding_window"
+
+    if is_sliding_window:
+        num_kv_heads = config.swa_num_key_value_heads
+        head_dim = config.swa_head_dim
+        v_head_dim = config.swa_v_head_dim
+    else:
+        num_kv_heads = config.num_key_value_heads
+        head_dim = config.head_dim
+        v_head_dim = config.v_head_dim
+
+    num_attention_heads = config.num_attention_heads
+    repeat_factor = num_attention_heads // num_kv_heads
+
+    for proj, proj_head_dim in [("k_proj", head_dim), ("v_proj", v_head_dim)]:
+        scale_key = f"layers.{layer_idx}.self_attn.{proj}.scale"
+
+        if scale_key not in neuron_state_dict:
+            continue
+
+        scale = neuron_state_dict[scale_key]
+
+        # Scale shape: [scale_h, scale_w] where scale_h = ceil(weight_h / block_size[0])
+        # weight_h = num_kv_heads * head_dim
+        # After replication: weight_h = num_attention_heads * head_dim
+        # So scale_h should increase proportionally
+
+        # Number of scale rows per KV head
+        scales_per_head = scale.shape[0] // num_kv_heads
+
+        # Reshape to [num_kv_heads, scales_per_head, scale_w]
+        scale_reshaped = scale.view(num_kv_heads, scales_per_head, -1)
+
+        # Replicate using repeat_interleave
+        scale_replicated = scale_reshaped.repeat_interleave(repeat_factor, dim=0)
+
+        # Reshape back to [new_scale_h, scale_w]
+        neuron_state_dict[scale_key] = scale_replicated.view(-1, scale.shape[-1])
 
 
 class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
