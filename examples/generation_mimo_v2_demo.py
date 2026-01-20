@@ -190,6 +190,10 @@ def create_neuron_config(args):
 
         # Normalize top-k affinities
         normalize_top_k_affinities=True,
+
+        # Enable pre-sharded checkpoints for faster loading
+        # This saves sharded weights during compilation so loading is much faster
+        save_sharded_checkpoint=True,
     )
 
     return neuron_config

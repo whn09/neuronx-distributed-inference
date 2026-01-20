@@ -808,6 +808,60 @@ class NeuronMiMoV2Model(NeuronBaseModel):
         )
 
 
+def _replicate_kv_projections_for_convert_to_mha(
+    neuron_state_dict: Dict[str, Any],
+    config: MiMoV2InferenceConfig,
+    layer_idx: int,
+) -> None:
+    """Replicate K/V projection weights for CONVERT_TO_MHA mode.
+
+    When TP > num_kv_heads, we use CONVERT_TO_MHA strategy where K/V projections
+    are expanded to match num_attention_heads. This function replicates the
+    original K/V weights to create the expanded projections.
+
+    Args:
+        neuron_state_dict: State dict to modify in-place
+        config: Model configuration
+        layer_idx: Layer index to process
+    """
+    # Determine if this is a sliding window layer
+    is_sliding_window = config.layer_attention_types[layer_idx] == "sliding_window"
+
+    if is_sliding_window:
+        num_kv_heads = config.swa_num_key_value_heads
+        head_dim = config.swa_head_dim
+        v_head_dim = config.swa_v_head_dim
+    else:
+        num_kv_heads = config.num_key_value_heads
+        head_dim = config.head_dim
+        v_head_dim = config.v_head_dim
+
+    num_attention_heads = config.num_attention_heads
+    repeat_factor = num_attention_heads // num_kv_heads
+
+    # K projection: [num_kv_heads * head_dim, hidden_size] -> [num_attention_heads * head_dim, hidden_size]
+    k_proj_key = f"layers.{layer_idx}.self_attn.k_proj.weight"
+    if k_proj_key in neuron_state_dict:
+        k_proj = neuron_state_dict[k_proj_key]
+        # Reshape to [num_kv_heads, head_dim, hidden_size]
+        k_proj = k_proj.view(num_kv_heads, head_dim, -1)
+        # Repeat along num_kv_heads dimension
+        k_proj = k_proj.repeat(repeat_factor, 1, 1)
+        # Reshape back to [num_attention_heads * head_dim, hidden_size]
+        neuron_state_dict[k_proj_key] = k_proj.view(-1, k_proj.shape[-1])
+
+    # V projection: [num_kv_heads * v_head_dim, hidden_size] -> [num_attention_heads * v_head_dim, hidden_size]
+    v_proj_key = f"layers.{layer_idx}.self_attn.v_proj.weight"
+    if v_proj_key in neuron_state_dict:
+        v_proj = neuron_state_dict[v_proj_key]
+        # Reshape to [num_kv_heads, v_head_dim, hidden_size]
+        v_proj = v_proj.view(num_kv_heads, v_head_dim, -1)
+        # Repeat along num_kv_heads dimension
+        v_proj = v_proj.repeat(repeat_factor, 1, 1)
+        # Reshape back to [num_attention_heads * v_head_dim, hidden_size]
+        neuron_state_dict[v_proj_key] = v_proj.view(-1, v_proj.shape[-1])
+
+
 def convert_mimo_v2_hf_to_neuron_state_dict(
     neuron_state_dict: Dict[str, Any],
     config: MiMoV2InferenceConfig,
@@ -818,6 +872,7 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
     1. Router weight renaming
     2. Expert weight concatenation and transposition
     3. FP8 dequantization if needed
+    4. K/V projection replication for CONVERT_TO_MHA mode
     """
 
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
@@ -825,12 +880,25 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
     # Dequantize layers if needed
     _maybe_dequantize_layer(neuron_state_dict, config)
 
+    # Check if we need CONVERT_TO_MHA mode
+    tp_degree = config.neuron_config.tp_degree
+    min_num_kv_heads = min(
+        config.num_key_value_heads,
+        getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
+    )
+    use_convert_to_mha = tp_degree > min_num_kv_heads
+
     # Add rank utility tensors
     neuron_state_dict["rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
     for layer_idx in range(config.num_hidden_layers):
+        # Replicate K/V projections if CONVERT_TO_MHA mode
+        if use_convert_to_mha:
+            _replicate_kv_projections_for_convert_to_mha(
+                neuron_state_dict, config, layer_idx
+            )
         # Add rank utility for attention
         neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
