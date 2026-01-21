@@ -7,7 +7,6 @@ MiMo-V2-Flash is a large MoE model from Xiaomi with:
 - Hybrid attention (full + sliding window)
 - Different Q/K dim (192) and V dim (128)
 - Partial RoPE (34% of dimensions)
-- FP8 quantized weights (float8_e4m3fn with block-wise 128x128 scales)
 
 Reference: https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash
 
@@ -28,28 +27,13 @@ IMPORTANT CONSTRAINTS:
    - Sliding window layers (pattern=1): num_kv_heads=8, head_dim=192, v_head_dim=128
    - With CONVERT_TO_MHA (TP>4): K/V are replicated to 64 heads for proper TP splitting
 
-4. FP8 Quantized Inference:
-   MiMo-V2-Flash weights are stored in FP8 format (float8_e4m3fn). There are two modes:
+4. Model Weights:
+   This script expects BF16 weights. The original HuggingFace checkpoint is FP8 quantized,
+   which should be converted to BF16 format first. See README_MiMo_V2_Flash.md for details.
 
-   a) BF16 Mode (default):
-      - FP8 weights are dequantized to BF16 during loading
-      - Larger memory footprint (~585GB for sharded model)
-      - Better numerical accuracy
-      - Command: python generation_mimo_v2_demo.py --compile-only
-
-   b) Native FP8 Mode (--quantized):
-      - Weights remain in FP8, scales are preserved
-      - Smaller memory footprint (~143GB)
-      - Requires preprocessing step to convert OCP FP8 format to Neuron FP8 format
-      - Steps:
-        1. Run preprocessing script:
-           python -m neuronx_distributed_inference.models.mimo_v2.conversion_script.preprocess_mimo_v2_fp8 \\
-               --hf_model_path /path/to/MiMo-V2-Flash \\
-               --save_path /path/to/preprocessed_mimo_v2_fp8 \\
-               --tp_degree 32 --convert_to_mha
-        2. Compile with --quantized flag:
-           python generation_mimo_v2_demo.py --compile-only --quantized \\
-               --quantized-checkpoints-path /path/to/preprocessed_mimo_v2_fp8
+   Usage:
+   - Compile: python generation_mimo_v2_demo.py --compile-only
+   - Generate: python generation_mimo_v2_demo.py --skip-compile --prompt "Hello!"
 """
 
 import argparse
@@ -76,13 +60,13 @@ def parse_args():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/home/ubuntu/models/MiMo-V2-Flash/",
-        help="Path to HuggingFace model checkpoint",
+        default="/home/ubuntu/models/MiMo-V2-Flash-BF16/",
+        help="Path to BF16 model checkpoint (converted from FP8)",
     )
     parser.add_argument(
         "--compiled-model-path",
         type=str,
-        default="/home/ubuntu/traced_model/MiMo-V2-Flash/",
+        default="/home/ubuntu/traced_model/MiMo-V2-Flash-BF16/",
         help="Path to save/load compiled model",
     )
     parser.add_argument(
@@ -140,26 +124,6 @@ def parse_args():
         help="Prompt for text generation",
     )
 
-    # FP8 quantization options
-    parser.add_argument(
-        "--quantized",
-        action="store_true",
-        help="Enable native FP8 quantized inference. Requires preprocessed checkpoint.",
-    )
-    parser.add_argument(
-        "--quantized-checkpoints-path",
-        type=str,
-        default=None,
-        help="Path to preprocessed FP8 checkpoint (created by preprocess_mimo_v2_fp8.py). "
-             "Required when --quantized is set.",
-    )
-    parser.add_argument(
-        "--quantization-block-size",
-        type=int,
-        nargs=2,
-        default=[128, 128],
-        help="Block size for FP8 quantization [height, width]. Default: [128, 128]",
-    )
     args = parser.parse_args()
 
     # Validate TP degree
@@ -181,13 +145,6 @@ def parse_args():
                 f"Valid values for large TP: 8, 16, 32, 64."
             )
 
-    # Validate FP8 arguments
-    if args.quantized and args.quantized_checkpoints_path is None:
-        raise ValueError(
-            "--quantized-checkpoints-path is required when --quantized is set. "
-            "Use preprocess_mimo_v2_fp8.py to create preprocessed FP8 checkpoint."
-        )
-
     return args
 
 
@@ -208,10 +165,6 @@ def create_neuron_config(args):
     print(f"  MoE EP Degree: {moe_ep_degree}")
     print(f"  Experts per EP rank: {256 // moe_ep_degree}")
     print(f"  GQA Mode: {'CONVERT_TO_MHA (K/V replicated to 64 heads)' if use_convert_to_mha else 'Standard GQA'}")
-    print(f"  FP8 Quantized: {args.quantized}")
-    if args.quantized:
-        print(f"  Quantized checkpoint path: {args.quantized_checkpoints_path}")
-        print(f"  Quantization block size: {args.quantization_block_size}")
 
     # Build config kwargs
     config_kwargs = dict(
@@ -253,16 +206,6 @@ def create_neuron_config(args):
         save_sharded_checkpoint=True,
     )
 
-    # Add FP8 quantization options if enabled
-    if args.quantized:
-        config_kwargs.update(
-            quantized=True,
-            quantized_checkpoints_path=args.quantized_checkpoints_path,
-            quantization_dtype="f8e4m3",
-            quantization_type="per_channel_symmetric",
-            quantization_block_size=args.quantization_block_size,
-        )
-
     neuron_config = MoENeuronConfig(**config_kwargs)
 
     return neuron_config
@@ -281,21 +224,9 @@ def compile_model(args):
     print(f"Batch size: {args.batch_size}")
     print(f"Max context length: {args.max_context_length}")
     print(f"Sequence length: {args.seq_len}")
-    if args.quantized:
-        print(f"FP8 mode: Native FP8 quantized inference")
-        print(f"Quantized checkpoint: {args.quantized_checkpoints_path}")
 
     # Create neuron config
     neuron_config = create_neuron_config(args)
-
-    # Determine checkpoint path for weights
-    # For native FP8: use preprocessed checkpoint if available
-    # For BF16: use original HuggingFace checkpoint
-    if args.quantized and args.quantized_checkpoints_path:
-        weights_path = args.quantized_checkpoints_path
-        print(f"\nUsing preprocessed FP8 checkpoint for weights: {weights_path}")
-    else:
-        weights_path = args.model_path
 
     # Load HuggingFace config for display
     print("\nLoading HuggingFace config...")
@@ -325,7 +256,7 @@ def compile_model(args):
 
     # Create and compile model
     print("\nCreating NeuronMiMoV2ForCausalLM...")
-    model = NeuronMiMoV2ForCausalLM(weights_path, config)
+    model = NeuronMiMoV2ForCausalLM(args.model_path, config)
 
     print("\nCompiling model (this may take a while)...")
     model.compile(args.compiled_model_path)

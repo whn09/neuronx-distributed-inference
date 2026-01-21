@@ -8,7 +8,6 @@ MiMo-V2-Flash is a large MoE model from Xiaomi with unique architecture features
 - **Hybrid attention**: Full attention + Sliding window attention (alternating pattern)
 - **Different Q/K dim (192) and V dim (128)** - asymmetric head dimensions
 - **Partial RoPE**: Only 34% of dimensions use rotary position encoding
-- **FP8 quantized weights**: float8_e4m3fn with block-wise 128x128 scales
 
 Reference: https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash
 
@@ -39,7 +38,6 @@ Total Parameters: ~143B (FP8) / ~286B (BF16 equivalent)
 |------|-------------|
 | `src/neuronx_distributed_inference/models/mimo_v2/__init__.py` | Module exports |
 | `src/neuronx_distributed_inference/models/mimo_v2/modeling_mimo_v2.py` | Main model implementation |
-| `src/neuronx_distributed_inference/models/mimo_v2/conversion_script/preprocess_mimo_v2_fp8.py` | FP8 preprocessing script |
 
 ### Demo Script
 | File | Description |
@@ -47,6 +45,26 @@ Total Parameters: ~143B (FP8) / ~286B (BF16 equivalent)
 | `examples/generation_mimo_v2_demo.py` | Compilation and inference demo |
 
 ## Quick Start
+
+### Prerequisites
+
+The original HuggingFace checkpoint uses FP8 quantized weights. You need to convert them to BF16 first on a GPU machine:
+
+```python
+# Run this on a GPU machine with sufficient memory (~200GB)
+from transformers import AutoModelForCausalLM
+import torch
+
+model = AutoModelForCausalLM.from_pretrained(
+    "XiaomiMiMo/MiMo-V2-Flash",
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+model.save_pretrained("/path/to/MiMo-V2-Flash-BF16")
+# Also copy the tokenizer files from the original checkpoint
+```
 
 ### Environment Setup
 ```bash
@@ -57,14 +75,12 @@ source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 export PYTHONPATH=/home/ubuntu/neuronx-distributed-inference/src:$PYTHONPATH
 ```
 
-### Option A: BF16 Mode (Simpler, Larger Memory)
-
-FP8 weights are dequantized to BF16 during loading.
+### Compile and Run
 
 ```bash
 # Compile model with TP=32 (recommended)
 python examples/generation_mimo_v2_demo.py \
-    --model-path /home/ubuntu/models/MiMo-V2-Flash \
+    --model-path /home/ubuntu/models/MiMo-V2-Flash-BF16 \
     --compiled-model-path /home/ubuntu/traced_model/MiMo-V2-Flash-BF16 \
     --tp-degree 32 \
     --batch-size 1 \
@@ -77,45 +93,6 @@ python examples/generation_mimo_v2_demo.py \
     --compiled-model-path /home/ubuntu/traced_model/MiMo-V2-Flash-BF16 \
     --tp-degree 32 \
     --skip-compile \
-    --prompt "Hello, how are you?"
-```
-
-### Option B: Native FP8 Mode (Recommended, Smaller Memory)
-
-Weights remain in FP8 format with preserved scales. Requires preprocessing.
-
-**Step 1: Preprocess FP8 checkpoint (one-time, ~5 hours)**
-
-```bash
-python -m neuronx_distributed_inference.models.mimo_v2.conversion_script.preprocess_mimo_v2_fp8 \
-    --hf_model_path /home/ubuntu/models/MiMo-V2-Flash \
-    --save_path /home/ubuntu/models/preprocessed_mimo_v2_fp8 \
-    --tp_degree 32 \
-    --convert_to_mha
-```
-
-**Step 2: Compile with native FP8**
-```bash
-python examples/generation_mimo_v2_demo.py \
-    --model-path /home/ubuntu/models/MiMo-V2-Flash \
-    --compiled-model-path /home/ubuntu/traced_model/MiMo-V2-Flash-FP8 \
-    --tp-degree 32 \
-    --batch-size 1 \
-    --max-context-length 128 \
-    --seq-len 512 \
-    --compile-only \
-    --quantized \
-    --quantized-checkpoints-path /home/ubuntu/models/preprocessed_mimo_v2_fp8
-```
-
-**Step 3: Run inference**
-```bash
-python examples/generation_mimo_v2_demo.py \
-    --compiled-model-path /home/ubuntu/traced_model/MiMo-V2-Flash-FP8 \
-    --tp-degree 32 \
-    --skip-compile \
-    --quantized \
-    --quantized-checkpoints-path /home/ubuntu/models/preprocessed_mimo_v2_fp8 \
     --prompt "Hello, how are you?"
 ```
 
@@ -132,12 +109,10 @@ python examples/generation_mimo_v2_demo.py \
 
 ### Memory Requirements
 
-| Mode | TP Degree | Memory per Chip | Sharded Model Size | Status |
-|------|-----------|-----------------|-------------------|--------|
-| BF16 | 4 | ~143GB | ~585GB | Exceeds 24GB HBM |
-| BF16 | 32 | ~4.5GB | ~585GB | Fits (recommended) |
-| FP8 | 4 | ~36GB | ~143GB | Exceeds 24GB HBM |
-| FP8 | 32 | ~4.5GB | ~143GB | Fits (recommended) |
+| TP Degree | Memory per Chip | Sharded Model Size | Status |
+|-----------|-----------------|-------------------|--------|
+| 4 | ~143GB | ~585GB | Exceeds 24GB HBM |
+| 32 | ~4.5GB | ~585GB | Fits (recommended) |
 
 ### Hybrid Attention Configuration
 
@@ -145,50 +120,6 @@ python examples/generation_mimo_v2_demo.py \
 |---------------|---------|--------------|---------------------|----------|------------|--------|
 | Full | 0 | 4 | 64 | 192 | 128 | ∞ |
 | Sliding Window | 1 | 8 | 64 | 192 | 128 | 32768 |
-
-## FP8 Quantization Details
-
-### FP8 Format Differences
-
-| Format | Range | Exponent | Mantissa | Used By |
-|--------|-------|----------|----------|---------|
-| OCP FP8 E4M3 (e4m3fn) | ±448 | 4 bits | 3 bits | HuggingFace, GPUs |
-| IEEE-754 FP8 E4M3 | ±240 | 4 bits | 3 bits | Neuron/Trainium |
-
-**Rescaling Factor**: `FP8_SCALING_FACTOR = 448.0 / 240.0 ≈ 1.867`
-
-### Scale Format Conversion
-
-| Source (HuggingFace) | Target (Neuron) | Conversion Formula |
-|---------------------|-----------------|-------------------|
-| `weight_scale_inv` | `.scale` | `neuron_scale = weight_scale_inv * FP8_SCALING_FACTOR` |
-
-### Block-wise Quantization
-
-MiMo-V2-Flash uses block-wise FP8 quantization:
-- **Block size**: 128 × 128
-- **Each block has its own scale factor**
-- **Scale tensor shape**: `[ceil(weight_h / 128), ceil(weight_w / 128)]`
-
-Example:
-```
-Weight: layers.0.self_attn.q_proj.weight
-  Shape: [12288, 4096]  (num_attention_heads * head_dim, hidden_size)
-  Scale shape: [96, 32]  (12288/128 = 96, 4096/128 = 32)
-  Total blocks: 3,072 (each with independent scale)
-```
-
-### What the Preprocessing Script Does
-
-1. **Load HuggingFace checkpoint** (~143GB, takes ~30 minutes)
-2. **Rescale FP8 weights**: Divide by `FP8_SCALING_FACTOR` to fit Neuron's ±240 range
-3. **Convert scales**: `weight_scale_inv` → `.scale` with rescaling
-4. **Fuse MoE experts**: Concatenate gate_proj + up_proj for efficient inference
-5. **Handle CONVERT_TO_MHA**: Replicate K/V weights and scales for TP > num_kv_heads
-6. **Save in safetensors format**: Compatible with neuronx-distributed-inference
-
-**Preprocessing Time**: ~5 hours for full model (48 layers × 256 experts)
-**Memory Required**: ~400GB RAM during preprocessing
 
 ## Implementation Details
 
@@ -240,18 +171,6 @@ Uses decomposed attention approach for efficiency:
 3. Combine: Weighted sum based on softmax normalization factors
 ```
 
-## Compilation Results
-
-**Configuration**: TP=32, batch_size=1, max_context_length=128, seq_len=512
-
-| Stage | Time |
-|-------|------|
-| HLO generation | ~11 seconds |
-| Context encoding compilation | ~355 seconds |
-| Token generation compilation | ~170 seconds |
-| Pre-sharding checkpoints (BF16) | ~96 minutes |
-| **Total** | ~105 minutes |
-
 ## Troubleshooting
 
 ### Common Issues
@@ -260,22 +179,8 @@ Uses decomposed attention approach for efficiency:
 |-------|-------|----------|
 | `TP degree must divide num_kv_heads` | TP ≤ 4 but doesn't divide 4 | Use TP = 1, 2, or 4 |
 | `TP degree must divide num_attention_heads` | TP > 4 but doesn't divide 64 | Use TP = 8, 16, 32, or 64 |
-| Out of memory during preprocessing | Model is large | Need ~400GB RAM |
 | Garbage output | K/V replication using `repeat` instead of `repeat_interleave` | Fixed in current version |
 | Slow checkpoint loading | Large model | Use `save_sharded_checkpoint=True` |
-
-### Monitoring Preprocessing
-
-```bash
-# Check if preprocessing is running
-ps aux | grep preprocess_mimo | grep -v grep
-
-# Check memory usage
-ps aux | grep preprocess_mimo | grep -v grep | awk '{print "RSS:", $6/1024/1024 "GB"}'
-
-# Check output directory (created when complete)
-ls -la /home/ubuntu/models/preprocessed_mimo_v2_fp8/
-```
 
 ## Expert Parallelism Note
 
@@ -285,6 +190,15 @@ NotImplementedError: Selective Loading with Expert parallelism is not supported 
 ```
 
 With TP=32, EP is not required since the model fits in memory using tensor parallelism alone.
+
+## Native FP8 Support (Not Currently Working)
+
+The original HuggingFace checkpoint uses FP8 quantized weights with block-wise 128x128 scales. Native FP8 inference is **not currently supported** due to scale format incompatibilities:
+
+- **HuggingFace format**: Block-wise quantization with per-block scales (e.g., `[256, 16, 2]` for MoE)
+- **Neuron framework expectation**: Per-row or per-tensor scales (e.g., `[1, 1, 128]`)
+
+Converting between these formats is not straightforward as it would require complete re-quantization, which loses the original quantization accuracy. For now, use BF16 mode by converting the checkpoint on a GPU machine first.
 
 ## References
 
@@ -296,6 +210,6 @@ With TP=32, EP is not required since the model fits in memory using tensor paral
 
 | Date | Changes |
 |------|---------|
-| 2025-01-20 | Added native FP8 support with preprocessing script |
+| 2025-01-21 | Simplified to BF16-only mode (native FP8 not supported due to scale format incompatibilities) |
 | 2025-01-20 | Implemented CONVERT_TO_MHA for TP=32 support |
 | 2025-01-19 | Initial implementation with hybrid attention and MoE |

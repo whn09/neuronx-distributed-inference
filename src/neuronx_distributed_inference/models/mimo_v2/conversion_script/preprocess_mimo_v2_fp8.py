@@ -38,10 +38,161 @@ from neuronx_distributed_inference.modules.checkpoint import (
 # Neuron FP8 E4M3 (IEEE-754): range ±240
 FP8_SCALING_FACTOR = 448.0 / 240.0
 
+# Neuron FP8 E4M3 max value
+NEURON_FP8_MAX = 240.0
 
-def rescale_fp8_weight(weight: torch.Tensor, scale: torch.Tensor):
+
+def convert_bf16_to_fp8_per_row(weight: torch.Tensor):
     """
-    Rescale FP8 weight from OCP format to Neuron format.
+    Convert BF16 weight to FP8 with per-row (per-channel) scales for Neuron.
+
+    This is used for weights like o_proj that are BF16 in the original checkpoint.
+    The Neuron framework expects per-row scaling for these layers.
+
+    Args:
+        weight: BF16 weight tensor [out_features, in_features]
+
+    Returns:
+        Tuple of (fp8_weight, scale)
+        - fp8_weight: Weight quantized to FP8 (float8_e4m3fn)
+        - scale: Per-row scale tensor [out_features, 1]
+    """
+    out_features, in_features = weight.shape
+
+    # Compute per-row max absolute values
+    weight_float = weight.float()
+    row_max_abs = weight_float.abs().max(dim=1, keepdim=True)[0]
+
+    # Compute scales (avoid division by zero)
+    scales = row_max_abs / NEURON_FP8_MAX
+    scales = torch.clamp(scales, min=1e-10)
+
+    # Quantize
+    quantized = (weight_float / scales).to(torch.float8_e4m3fn)
+
+    return quantized, scales.to(torch.float32)
+
+
+def convert_bf16_to_fp8_blockwise(
+    weight: torch.Tensor,
+    block_size: List[int] = [128, 128],
+):
+    """
+    Convert BF16 weight to FP8 with block-wise scales for Neuron.
+
+    Some weights in MiMo-V2-Flash (like o_proj) are in BF16, not FP8.
+    This function quantizes them to FP8 with appropriate block-wise scales.
+
+    Args:
+        weight: BF16 weight tensor [out_features, in_features]
+        block_size: Block size for quantization [128, 128]
+
+    Returns:
+        Tuple of (fp8_weight, scale)
+        - fp8_weight: Weight quantized to FP8 (float8_e4m3fn)
+        - scale: Block-wise scale tensor [scale_h, scale_w]
+    """
+    h, w = weight.shape
+    block_h, block_w = block_size
+
+    # Calculate scale grid dimensions
+    scale_h = (h + block_h - 1) // block_h
+    scale_w = (w + block_w - 1) // block_w
+
+    # Initialize output tensors
+    fp8_weight = torch.zeros_like(weight, dtype=torch.float8_e4m3fn)
+    scale = torch.zeros(scale_h, scale_w, dtype=torch.float32)
+
+    # Process each block
+    for i in range(scale_h):
+        for j in range(scale_w):
+            # Block boundaries
+            h_start = i * block_h
+            h_end = min((i + 1) * block_h, h)
+            w_start = j * block_w
+            w_end = min((j + 1) * block_w, w)
+
+            # Extract block
+            block = weight[h_start:h_end, w_start:w_end].float()
+
+            # Compute scale: max_abs / FP8_MAX
+            max_abs = block.abs().max().item()
+            if max_abs == 0:
+                block_scale = 1.0
+            else:
+                block_scale = max_abs / NEURON_FP8_MAX
+
+            # Quantize block
+            quantized_block = (block / block_scale).to(torch.float8_e4m3fn)
+
+            # Store results
+            fp8_weight[h_start:h_end, w_start:w_end] = quantized_block
+            scale[i, j] = block_scale
+
+    return fp8_weight, scale
+
+
+def rescale_fp8_to_per_row(weight: torch.Tensor, scale: torch.Tensor):
+    """
+    Rescale FP8 weight from OCP format to Neuron format with per-row scaling.
+
+    The original HuggingFace checkpoint uses block-wise FP8 quantization.
+    The Neuron framework expects per-row (per-channel) scaling.
+    This function converts block-wise to per-row scaling.
+
+    Args:
+        weight: FP8 weight tensor (float8_e4m3fn) [out_features, in_features]
+        scale: Block-wise scale tensor (weight_scale_inv) [scale_h, scale_w]
+
+    Returns:
+        Tuple of (rescaled_weight, neuron_scale)
+        - rescaled_weight: FP8 weight compatible with Neuron
+        - neuron_scale: Per-row scale [out_features, 1]
+    """
+    out_features, in_features = weight.shape
+    scale_h, scale_w = scale.shape
+
+    # Block size inferred from scale dimensions
+    block_h = (out_features + scale_h - 1) // scale_h
+    block_w = (in_features + scale_w - 1) // scale_w
+
+    # First dequantize using block-wise scales
+    # HF convention: original = fp8_weight * weight_scale_inv
+    weight_float = weight.float()
+    dequantized = torch.zeros(out_features, in_features, dtype=torch.float32)
+
+    for i in range(scale_h):
+        for j in range(scale_w):
+            h_start = i * block_h
+            h_end = min((i + 1) * block_h, out_features)
+            w_start = j * block_w
+            w_end = min((j + 1) * block_w, in_features)
+
+            block_scale = scale[i, j].item()
+            dequantized[h_start:h_end, w_start:w_end] = (
+                weight_float[h_start:h_end, w_start:w_end] * block_scale
+            )
+
+    # Now requantize with per-row scaling for Neuron
+    # Compute per-row max absolute values
+    row_max_abs = dequantized.abs().max(dim=1, keepdim=True)[0]
+
+    # Compute scales (avoid division by zero)
+    # Need to fit in Neuron FP8 range (±240)
+    scales = row_max_abs / NEURON_FP8_MAX
+    scales = torch.clamp(scales, min=1e-10)
+
+    # Quantize to FP8
+    quantized = (dequantized / scales).to(torch.float8_e4m3fn)
+
+    return quantized, scales.to(torch.float32)
+
+
+def rescale_fp8_weight_blockwise(weight: torch.Tensor, scale: torch.Tensor):
+    """
+    Rescale FP8 weight from OCP format to Neuron format, keeping block-wise scaling.
+
+    This is kept for MoE experts which may use block-wise scaling.
 
     Args:
         weight: FP8 weight tensor (float8_e4m3fn)
@@ -61,27 +212,6 @@ def rescale_fp8_weight(weight: torch.Tensor, scale: torch.Tensor):
     # Convert back to FP8
     rescaled_weight = rescaled_weight_bf16.to(torch.float8_e4m3fn)
 
-    # Convert weight_scale_inv to neuron scale format:
-    # neuron_scale = (1 / weight_scale_inv) * FP8_SCALING_FACTOR
-    # Because: original = quantized * weight_scale_inv
-    #          After rescaling: original = rescaled * neuron_scale
-    # We need: rescaled * neuron_scale = (quantized / FP8_SCALING_FACTOR) * neuron_scale = original
-    # So: neuron_scale = weight_scale_inv * FP8_SCALING_FACTOR
-    # But wait, Neuron expects: original = weight * scale (where scale is dequant factor)
-    # And HF stores: weight_scale_inv = 1/scale
-    # So: neuron_scale = (1 / weight_scale_inv) * FP8_SCALING_FACTOR = scale * FP8_SCALING_FACTOR
-    # But after rescaling the weight by /FP8_SCALING_FACTOR, we need to compensate:
-    # original = (weight / FP8_SCALING_FACTOR) * (scale * FP8_SCALING_FACTOR) = weight * scale
-    # So: neuron_scale = 1 / weight_scale_inv (take reciprocal, no rescaling needed for scale)
-
-    # Actually, let's think more carefully:
-    # Original dequant: original = fp8_weight * weight_scale_inv (HF convention)
-    # But weight_scale_inv is 1/scale, so: original = fp8_weight / scale
-    # Wait no, looking at explain_fp8_scales.py:
-    #   HF: original = quantized_weight * weight_scale_inv
-    #   Neuron: original = quantized_weight * scale
-    #   So weight_scale_inv IS the dequant factor, just different naming
-    #
     # After our rescaling:
     #   rescaled_weight = fp8_weight / FP8_SCALING_FACTOR
     #   We need: original = rescaled_weight * new_scale
@@ -99,21 +229,19 @@ def replicate_for_convert_to_mha(
     num_kv_heads: int,
     num_attention_heads: int,
     head_dim: int,
-    block_size: List[int] = [128, 128],
 ):
     """
-    Replicate K/V weights and scales for CONVERT_TO_MHA mode.
+    Replicate K/V weights and per-row scales for CONVERT_TO_MHA mode.
 
     When TP > num_kv_heads, we need to replicate K/V heads to match Q heads.
     This uses repeat_interleave to create the correct GQA pattern.
 
     Args:
         weight: FP8 K or V weight [num_kv_heads * head_dim, hidden_size]
-        scale: Scale tensor [scale_h, scale_w] for block-wise quantization
+        scale: Per-row scale tensor [num_kv_heads * head_dim, 1]
         num_kv_heads: Original number of KV heads
         num_attention_heads: Target number of attention heads
         head_dim: Dimension per head
-        block_size: Block size for quantization [128, 128]
 
     Returns:
         Tuple of (replicated_weight, replicated_scale)
@@ -136,21 +264,15 @@ def replicate_for_convert_to_mha(
     if scale is None:
         return weight_replicated, None
 
-    # Replicate scale for block-wise quantization
-    # Scale shape: [scale_h, scale_w] where scale_h = ceil(weight_h / block_size[0])
-    # After replication, weight_h increases by repeat_factor
-    # So scale_h should also increase
-
-    # Number of scale rows per KV head
-    scales_per_head = scale.shape[0] // num_kv_heads
-
-    # Reshape scale to [num_kv_heads, scales_per_head, scale_w]
-    scale_reshaped = scale.view(num_kv_heads, scales_per_head, -1)
+    # Replicate per-row scales
+    # Scale shape: [num_kv_heads * head_dim, 1]
+    # Reshape to [num_kv_heads, head_dim, 1]
+    scale_reshaped = scale.view(num_kv_heads, head_dim, -1)
 
     # Replicate scales
     scale_replicated = scale_reshaped.repeat_interleave(repeat_factor, dim=0)
 
-    # Reshape back
+    # Reshape back to [num_attention_heads * head_dim, 1]
     scale_replicated = scale_replicated.view(-1, scale_replicated.shape[-1])
 
     return weight_replicated, scale_replicated
@@ -254,19 +376,17 @@ def process_mimo_v2_checkpoint(
             weight = state_dict[weight_key]
             scale = state_dict.get(scale_key)
 
-            # Rescale FP8 weight for Neuron
+            # Handle FP8 weights - convert to per-row scaling for Neuron
+            # Neuron framework expects per-row (per-channel) scaling for attention layers
             if weight.dtype == torch.float8_e4m3fn and scale is not None:
-                weight, scale = rescale_fp8_weight(weight, scale)
+                weight, scale = rescale_fp8_to_per_row(weight, scale)
+            # Handle BF16 weights (convert to FP8 with per-row scales)
+            elif weight.dtype == torch.bfloat16:
+                weight, scale = convert_bf16_to_fp8_per_row(weight)
 
-            # Apply CONVERT_TO_MHA for K and V projections
-            if convert_to_mha and proj in ["k_proj", "v_proj"]:
-                if tp_degree > layer_num_kv_heads:
-                    proj_head_dim = layer_head_dim if proj == "k_proj" else layer_v_head_dim
-                    weight, scale = replicate_for_convert_to_mha(
-                        weight, scale,
-                        layer_num_kv_heads, layer_num_heads,
-                        proj_head_dim, block_size
-                    )
+            # NOTE: Do NOT apply CONVERT_TO_MHA replication here.
+            # The Neuron framework handles K/V replication internally.
+            # Pre-replicating would cause double-replication.
 
             # Save with Neuron naming convention
             new_weight_key = f"layers.{layer_idx}.self_attn.{proj}.weight"
@@ -311,7 +431,9 @@ def process_mimo_v2_checkpoint(
                     gate_s = state_dict.get(gate_s_key)
 
                     if gate_w.dtype == torch.float8_e4m3fn and gate_s is not None:
-                        gate_w, gate_s = rescale_fp8_weight(gate_w, gate_s)
+                        gate_w, gate_s = rescale_fp8_weight_blockwise(gate_w, gate_s)
+                    elif gate_w.dtype == torch.bfloat16:
+                        gate_w, gate_s = convert_bf16_to_fp8_blockwise(gate_w, block_size)
 
                     gate_weights.append(gate_w.T)  # Transpose for fusion
                     if gate_s is not None:
@@ -326,7 +448,9 @@ def process_mimo_v2_checkpoint(
                     up_s = state_dict.get(up_s_key)
 
                     if up_w.dtype == torch.float8_e4m3fn and up_s is not None:
-                        up_w, up_s = rescale_fp8_weight(up_w, up_s)
+                        up_w, up_s = rescale_fp8_weight_blockwise(up_w, up_s)
+                    elif up_w.dtype == torch.bfloat16:
+                        up_w, up_s = convert_bf16_to_fp8_blockwise(up_w, block_size)
 
                     up_weights.append(up_w.T)  # Transpose for fusion
                     if up_s is not None:
@@ -341,7 +465,9 @@ def process_mimo_v2_checkpoint(
                     down_s = state_dict.get(down_s_key)
 
                     if down_w.dtype == torch.float8_e4m3fn and down_s is not None:
-                        down_w, down_s = rescale_fp8_weight(down_w, down_s)
+                        down_w, down_s = rescale_fp8_weight_blockwise(down_w, down_s)
+                    elif down_w.dtype == torch.bfloat16:
+                        down_w, down_s = convert_bf16_to_fp8_blockwise(down_w, block_size)
 
                     down_weights.append(down_w.T)  # Transpose for fusion
                     if down_s is not None:
@@ -384,6 +510,32 @@ def process_mimo_v2_checkpoint(
                     down_s_stacked = torch.stack(down_scales, dim=0)
                     new_scale_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.scale"
                     new_state_dict[new_scale_key] = down_s_stacked
+        else:
+            # Non-MoE layer: regular MLP with gate_proj, up_proj, down_proj
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                weight_key = f"{prefix}mlp.{proj}.weight"
+                scale_key = f"{prefix}mlp.{proj}.weight_scale_inv"
+
+                if weight_key not in state_dict_keys:
+                    continue
+
+                weight = state_dict[weight_key]
+                scale = state_dict.get(scale_key)
+
+                # Handle FP8 weights - convert to per-row scaling for Neuron
+                if weight.dtype == torch.float8_e4m3fn and scale is not None:
+                    weight, scale = rescale_fp8_to_per_row(weight, scale)
+                # Handle BF16 weights (convert to FP8 with per-row scales)
+                elif weight.dtype == torch.bfloat16:
+                    weight, scale = convert_bf16_to_fp8_per_row(weight)
+
+                # Save with Neuron naming convention
+                new_weight_key = f"layers.{layer_idx}.mlp.{proj}.weight"
+                new_state_dict[new_weight_key] = weight
+
+                if scale is not None:
+                    new_scale_key = f"layers.{layer_idx}.mlp.{proj}.scale"
+                    new_state_dict[new_scale_key] = scale
 
         gc.collect()
         print(" done", flush=True)
