@@ -177,10 +177,10 @@ def create_neuron_config(args):
         moe_tp_degree=moe_tp_degree,
         moe_ep_degree=moe_ep_degree,
 
-        # Sampling configuration
-        on_device_sampling_config=OnDeviceSamplingConfig(
-            do_sample=False,  # Greedy for deterministic results
-        ),
+        # Sampling configuration - disabled for now to debug generation issues
+        # on_device_sampling_config=OnDeviceSamplingConfig(
+        #     do_sample=False,  # Greedy for deterministic results
+        # ),
 
         # Disable bucketing for simpler testing
         enable_bucketing=False,

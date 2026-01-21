@@ -551,7 +551,7 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             if attention_mask is not None:
                 # attention_mask shape: [bsz, 1, 1, kv_seq_len] or [bsz, num_heads, q_len, kv_seq_len]
                 prior_scores = torch.where(
-                    attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+                    attention_mask.to(torch.bool), prior_scores, torch.finfo(prior_scores.dtype).min
                 )
             prior_scores = prior_scores.to(torch.float32)
 
