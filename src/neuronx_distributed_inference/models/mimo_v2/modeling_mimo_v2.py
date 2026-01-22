@@ -273,6 +273,10 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
     NOTE: MiMo-V2 has different K head_dim (192) and V head_dim (128), which is not
     supported by the base class. Therefore, this class implements a custom forward()
     method to handle this case properly.
+
+    The MiMo-V2 model uses an "attention sink" mechanism for SWA layers. This adds
+    a learnable bias that acts as a virtual token to absorb excess attention probability,
+    preventing attention from being too concentrated on specific tokens.
     """
 
     def __init__(
@@ -283,6 +287,13 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
     ):
         self.layer_idx = layer_idx
         self.is_sliding_window = is_sliding_window
+
+        # Determine if this layer uses attention sink
+        # SWA layers use attention sink if add_swa_attention_sink_bias=True
+        # Full attention layers use attention sink if add_full_attention_sink_bias=True
+        add_swa_sink = getattr(config, 'add_swa_attention_sink_bias', False)
+        add_full_sink = getattr(config, 'add_full_attention_sink_bias', False)
+        self.use_attention_sink = (is_sliding_window and add_swa_sink) or (not is_sliding_window and add_full_sink)
 
         # Select parameters based on attention type
         if is_sliding_window:
@@ -346,6 +357,20 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
             )
             self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // tp_degree)
+
+        # Attention sink bias for SWA layers
+        # This is a learnable bias per attention head that acts as a virtual token
+        # to absorb excess attention probability
+        if self.use_attention_sink:
+            # The attention_sink_bias is stored as [tp_degree, local_num_heads]
+            # At runtime, we use rank_util.rank to select the correct shard
+            # This allows dynamic per-rank selection that works with NXD's weight loading
+            self.attention_sink_bias = nn.Parameter(
+                torch.zeros(tp_degree, self.local_num_heads, dtype=config.neuron_config.torch_dtype),
+                requires_grad=False
+            )
+        else:
+            self.attention_sink_bias = None
 
     def _init_projections(self, config: MiMoV2InferenceConfig):
         """Initialize projection layers with correct dimensions for different K/V head dims."""
@@ -520,9 +545,28 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             active_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
             active_scores = active_scores.to(torch.float32)
 
-            # Combined softmax
+            # Combined softmax with optional attention sink
             all_scores = torch.cat([prior_scores, active_scores], dim=-1)
-            attn_weights = F.softmax(all_scores, dim=-1, dtype=torch.float32)
+
+            # Apply attention sink bias if enabled
+            if self.use_attention_sink and self.attention_sink_bias is not None:
+                # attention_sink_bias has shape [tp_degree, local_num_heads]
+                # Use rank_util.rank to dynamically select the correct shard at runtime
+                # rank_util.rank is loaded per-rank and contains that rank's index
+                rank_idx = self.rank_util.rank[0]  # scalar tensor with current rank
+                local_sink_bias = self.attention_sink_bias[rank_idx]  # [local_num_heads]
+                # Reshape: [local_num_heads] -> [1, local_num_heads, 1, 1]
+                sink_bias = local_sink_bias.view(1, -1, 1, 1).expand(bsz, -1, q_len, 1).to(torch.float32)
+                # Concatenate sink as extra column
+                all_scores = torch.cat([all_scores, sink_bias], dim=-1)
+                # Subtract max for numerical stability
+                all_scores = all_scores - all_scores.max(dim=-1, keepdim=True).values
+                # Softmax
+                attn_weights = F.softmax(all_scores, dim=-1, dtype=torch.float32)
+                # Drop the sink column
+                attn_weights = attn_weights[..., :-1]
+            else:
+                attn_weights = F.softmax(all_scores, dim=-1, dtype=torch.float32)
 
             prior_weights = attn_weights[..., :-q_len].to(V_prior.dtype)
             active_weights = attn_weights[..., -q_len:].to(value_states.dtype)
@@ -547,7 +591,27 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 sliding_mask = torch.tril(sliding_mask)
                 attn_weights = attn_weights.masked_fill(~sliding_mask, float('-inf'))
 
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+            # Apply attention sink bias if enabled
+            # The sink acts as a virtual token that absorbs excess attention probability
+            if self.use_attention_sink and self.attention_sink_bias is not None:
+                # attention_sink_bias has shape [tp_degree, local_num_heads]
+                # Use rank_util.rank to dynamically select the correct shard at runtime
+                rank_idx = self.rank_util.rank[0]  # scalar tensor with current rank
+                local_sink_bias = self.attention_sink_bias[rank_idx]  # [local_num_heads]
+                # Reshape: [local_num_heads] -> [1, local_num_heads, 1, 1]
+                # Then expand to [bsz, local_num_heads, q_len, 1]
+                sink_bias = local_sink_bias.view(1, -1, 1, 1).expand(bsz, -1, q_len, 1)
+                # Concatenate sink as extra column
+                attn_weights = torch.cat([attn_weights, sink_bias], dim=-1)
+                # Subtract max for numerical stability (as in HF implementation)
+                attn_weights = attn_weights - attn_weights.max(dim=-1, keepdim=True).values
+                # Softmax
+                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+                # Drop the sink column
+                attn_weights = attn_weights[..., :-1].to(value_states.dtype)
+            else:
+                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+
             attn_output = torch.matmul(attn_weights, value_states)
 
         # Reshape and output projection
@@ -869,6 +933,19 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
                 _replicate_kv_scales_for_convert_to_mha(
                     neuron_state_dict, config, layer_idx
                 )
+
+        # Shard attention_sink_bias for TP
+        # The HF checkpoint has shape [num_attention_heads], we reshape to [tp_degree, local_num_heads]
+        # so that NXD's checkpoint sharding picks the correct shard for each TP rank
+        sink_bias_key = f"layers.{layer_idx}.self_attn.attention_sink_bias"
+        if sink_bias_key in neuron_state_dict:
+            sink_bias = neuron_state_dict[sink_bias_key]
+            num_heads = sink_bias.shape[0]
+            local_num_heads = num_heads // tp_degree
+            # Reshape to [tp_degree, local_num_heads] for automatic TP sharding
+            # NXD will pick dimension 0 for each rank
+            neuron_state_dict[sink_bias_key] = sink_bias.view(tp_degree, local_num_heads)
+
         # Add rank utility for attention
         neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
