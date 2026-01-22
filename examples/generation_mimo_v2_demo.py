@@ -166,18 +166,26 @@ def create_neuron_config(args):
     print(f"  Experts per EP rank: {256 // moe_ep_degree}")
     print(f"  GQA Mode: {'CONVERT_TO_MHA (K/V replicated to 64 heads)' if use_convert_to_mha else 'Standard GQA'}")
 
-    # Build config kwargs
+    # Build config kwargs (following MiniMax M2 pattern)
     config_kwargs = dict(
         tp_degree=args.tp_degree,
         batch_size=args.batch_size,
+        ctx_batch_size=args.batch_size,
+        tkg_batch_size=args.batch_size,
         max_context_length=args.max_context_length,
         seq_len=args.seq_len,
+
+        # Data type - important for numerical stability
+        torch_dtype=torch.bfloat16,
 
         # MoE parallelism
         moe_tp_degree=moe_tp_degree,
         moe_ep_degree=moe_ep_degree,
 
-        # Sampling configuration - disabled for now to debug generation issues
+        # Sampling configuration
+        # NOTE: on_device_sampling causes gather_output=False for lm_head,
+        # which may cause issues with HuggingFace generation adapter.
+        # Disable for now to ensure proper logits gathering.
         # on_device_sampling_config=OnDeviceSamplingConfig(
         #     do_sample=False,  # Greedy for deterministic results
         # ),
@@ -187,6 +195,21 @@ def create_neuron_config(args):
 
         # Flash decoding
         flash_decoding_enabled=False,
+
+        # Sequence parallel - disabled for now to simplify debugging
+        # Note: MiniMax M2 uses this, but MiMo-V2 may have issues with it
+        sequence_parallel_enabled=False,
+
+        # Logical NC config - disabled for now to simplify debugging
+        # logical_nc_config=2,
+
+        # Disable continuous batching for simpler testing
+        is_continuous_batching=False,
+
+        # Disable kernel optimizations for debugging
+        qkv_kernel_enabled=False,
+        attn_kernel_enabled=False,
+        strided_context_parallel_kernel_enabled=False,
 
         # MoE configuration
         # MiMo uses sigmoid activation for router
@@ -202,7 +225,6 @@ def create_neuron_config(args):
         normalize_top_k_affinities=True,
 
         # Enable pre-sharded checkpoints for faster loading
-        # This saves sharded weights during compilation so loading is much faster
         save_sharded_checkpoint=True,
     )
 

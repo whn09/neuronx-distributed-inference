@@ -269,6 +269,10 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
     Supports both full attention and sliding window attention with different
     head dimensions for Q/K vs V.
+
+    NOTE: MiMo-V2 has different K head_dim (192) and V head_dim (128), which is not
+    supported by the base class. Therefore, this class implements a custom forward()
+    method to handle this case properly.
     """
 
     def __init__(
@@ -311,37 +315,32 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         )
 
         # Initialize base attention
+        # Note: We pass head_dim for scaling calculation
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
             num_attention_heads=self.attn_num_heads,
             num_key_value_heads=self.attn_num_kv_heads,
-            head_dim=self.attn_v_head_dim,  # Use v_head_dim for base class
+            head_dim=self.attn_head_dim,  # Use Q/K head_dim for base class
             rotary_emb=rotary_emb,
             rms_norm_eps=config.layernorm_epsilon,
             use_qk_norm=False,
         )
 
-        # Override projections with correct dimensions
+        # Override projections with correct dimensions for different K/V head dims
         self._init_projections(config)
 
-        # Scaling factor
+        # Scaling factor for attention
         self.scaling = self.attn_head_dim ** -0.5
-        if hasattr(config, 'attention_value_scale'):
-            self.value_scale = config.attention_value_scale
-        else:
-            self.value_scale = 1.0
 
         # Store cache KV heads for cache compatibility
         # With CONVERT_TO_MHA, all layers have num_attention_heads KV heads
         # Otherwise, use max of full and sliding window kv heads
         tp_degree = config.neuron_config.tp_degree
         if self.use_gqa_convert_to_mha:
-            # CONVERT_TO_MHA: cache stores num_attention_heads (same as Q heads)
             self.cache_num_kv_heads = self.attn_num_heads
             self.local_cache_kv_heads = self.local_num_heads
         else:
-            # Standard GQA: cache uses max of full and sliding window kv heads
             self.cache_num_kv_heads = max(
                 config.num_key_value_heads,
                 getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
@@ -349,17 +348,14 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // tp_degree)
 
     def _init_projections(self, config: MiMoV2InferenceConfig):
-        """Initialize projection layers with correct dimensions."""
+        """Initialize projection layers with correct dimensions for different K/V head dims."""
         dtype = config.neuron_config.torch_dtype
         tp_degree = config.neuron_config.tp_degree
 
         # Check if we need GQA CONVERT_TO_MHA (when tp_degree > num_kv_heads)
-        # In this case, we replicate KV to match num_attention_heads for proper TP splitting
         self.use_gqa_convert_to_mha = tp_degree > self.attn_num_kv_heads
 
         if self.use_gqa_convert_to_mha:
-            # CONVERT_TO_MHA: K and V are projected to num_attention_heads (same as Q)
-            # This allows proper TP splitting when tp_degree > num_kv_heads
             k_num_heads = self.attn_num_heads
             v_num_heads = self.attn_num_heads
         else:
@@ -375,50 +371,29 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         if parallel_state.model_parallel_is_initialized():
             tp_group = parallel_state.get_tensor_model_parallel_group()
 
-            # Q projection
             self.q_proj = ColumnParallelLinear(
-                config.hidden_size,
-                q_hidden_size,
-                bias=config.attention_bias,
-                gather_output=False,
-                dtype=dtype,
-                tensor_model_parallel_group=tp_group,
+                config.hidden_size, q_hidden_size,
+                bias=config.attention_bias, gather_output=False,
+                dtype=dtype, tensor_model_parallel_group=tp_group,
             )
-
-            # K projection
             self.k_proj = ColumnParallelLinear(
-                config.hidden_size,
-                k_hidden_size,
-                bias=config.attention_bias,
-                gather_output=False,
-                dtype=dtype,
-                tensor_model_parallel_group=tp_group,
+                config.hidden_size, k_hidden_size,
+                bias=config.attention_bias, gather_output=False,
+                dtype=dtype, tensor_model_parallel_group=tp_group,
             )
-
-            # V projection
             self.v_proj = ColumnParallelLinear(
-                config.hidden_size,
-                v_hidden_size,
-                bias=config.attention_bias,
-                gather_output=False,
-                dtype=dtype,
-                tensor_model_parallel_group=tp_group,
+                config.hidden_size, v_hidden_size,
+                bias=config.attention_bias, gather_output=False,
+                dtype=dtype, tensor_model_parallel_group=tp_group,
             )
-
-            # Output projection
             self.o_proj = RowParallelLinear(
-                o_hidden_size,
-                config.hidden_size,
-                bias=False,
-                input_is_parallel=True,
-                dtype=dtype,
-                tensor_model_parallel_group=tp_group,
+                o_hidden_size, config.hidden_size,
+                bias=False, input_is_parallel=True,
+                dtype=dtype, tensor_model_parallel_group=tp_group,
             )
 
-            # Calculate local dimensions after TP split
             self.local_num_heads = self.attn_num_heads // tp_degree
             if self.use_gqa_convert_to_mha:
-                # With CONVERT_TO_MHA, local KV heads = local Q heads
                 self.local_num_kv_heads = self.local_num_heads
             else:
                 self.local_num_kv_heads = max(1, self.attn_num_kv_heads // tp_degree)
@@ -429,9 +404,9 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             self.o_proj = nn.Linear(o_hidden_size, config.hidden_size, bias=False)
 
             self.local_num_heads = self.attn_num_heads
-            self.local_num_kv_heads = k_num_heads  # May be expanded if CONVERT_TO_MHA
+            self.local_num_kv_heads = k_num_heads
 
-        # Remove qkv_proj from base class if exists
+        # Remove qkv_proj from base class
         if hasattr(self, 'qkv_proj'):
             self.qkv_proj = None
 
@@ -445,7 +420,7 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         sin_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Forward pass for MiMo-V2-Flash attention."""
+        """Forward pass for MiMo-V2-Flash attention with different K/V head dims."""
 
         # Handle sequence parallel
         if self.sequence_parallel_enabled and parallel_state.model_parallel_is_initialized():
@@ -456,8 +431,6 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             )
 
         bsz, q_len, _ = hidden_states.size()
-
-        # Determine if this is token generation (past_key_value is not None)
         is_token_gen = past_key_value is not None
 
         # Project Q, K, V
@@ -465,120 +438,100 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Reshape for multi-head attention: [bsz, num_heads, seq_len, head_dim]
+        # Reshape: [bsz, seq, hidden] -> [bsz, heads, seq, head_dim]
         query_states = query_states.view(bsz, q_len, self.local_num_heads, self.attn_head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.local_num_kv_heads, self.attn_head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.local_num_kv_heads, self.attn_v_head_dim).transpose(1, 2)
 
-        # Split into rope and non-rope parts
+        # Apply partial RoPE
         query_rope = query_states[..., :self.rope_dim]
         query_nope = query_states[..., self.rope_dim:]
         key_rope = key_states[..., :self.rope_dim]
         key_nope = key_states[..., self.rope_dim:]
 
-        # Compute rotary embeddings if not cached
         if cos_cache is None or sin_cache is None:
             cos_cache, sin_cache = self.rotary_emb(value_states, position_ids)
 
-        # Apply rotary position embedding to rope parts only
         query_rope, key_rope = apply_rotary_pos_emb(
             query_rope, key_rope, cos_cache, sin_cache, position_ids
         )
 
-        # Concatenate rope and non-rope parts
         query_states = torch.cat([query_rope, query_nope], dim=-1)
         key_states = torch.cat([key_rope, key_nope], dim=-1)
 
-        # Store key/value states BEFORE GQA repeat for KV cache
-        # With CONVERT_TO_MHA, the cache stores expanded heads (same as Q heads)
-        # Without CONVERT_TO_MHA, the cache stores original num_kv_heads
+        # Prepare KV for cache (BEFORE GQA repeat)
         key_states_for_cache = key_states
         value_states_for_cache = value_states
 
-        # WORKAROUND 1: Pad V from v_head_dim (128) to head_dim (192) for KV cache compatibility
+        # Pad V from v_head_dim to head_dim for cache compatibility
         if self.attn_v_head_dim < self.attn_head_dim:
             pad_size = self.attn_head_dim - self.attn_v_head_dim
             value_states_for_cache = F.pad(value_states_for_cache, (0, pad_size), value=0.0)
 
-        # WORKAROUND 2: Pad KV heads if layer has fewer than cache expects
-        # Only needed when NOT using CONVERT_TO_MHA (standard GQA mode)
-        # Full attention has 4 KV heads (1 per rank), sliding window has 8 (2 per rank)
-        # Cache is sized for max (8 heads = 2 per rank)
-        # With CONVERT_TO_MHA, all layers have same num_kv_heads (=num_attention_heads)
+        # Pad KV heads if needed (when layer has fewer KV heads than cache expects)
         if not self.use_gqa_convert_to_mha and self.local_num_kv_heads < self.local_cache_kv_heads:
-            # Pad KV heads by repeating
             repeat_factor = self.local_cache_kv_heads // self.local_num_kv_heads
             key_states_for_cache = key_states_for_cache.repeat(1, repeat_factor, 1, 1)
             value_states_for_cache = value_states_for_cache.repeat(1, repeat_factor, 1, 1)
 
-        # Repeat KV heads for GQA (only needed without CONVERT_TO_MHA)
-        # With CONVERT_TO_MHA, K/V already have num_attention_heads
+        # GQA: repeat KV heads to match Q heads
         num_key_value_groups = self.local_num_heads // self.local_num_kv_heads
         if num_key_value_groups > 1:
             key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
             value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
 
         if is_token_gen:
-            # Token generation: use decomposed attention with prior (cached) and active (current) KV
-            # past_key_value[0] = cached K, shape [bsz, cache_kv_heads, kv_seq_len, head_dim]
-            # past_key_value[1] = cached V, shape [bsz, cache_kv_heads, kv_seq_len, head_dim] (padded)
+            # Token generation with decomposed attention
             K_prior = past_key_value[0]
             V_prior = past_key_value[1]
 
-            # WORKAROUND 1: Slice KV heads if cache has more than layer needs
-            # Only needed when NOT using CONVERT_TO_MHA (standard GQA mode)
-            # With CONVERT_TO_MHA, cache and layer have same num_kv_heads
+            # Slice KV heads if cache has more than layer needs
             if not self.use_gqa_convert_to_mha and self.local_num_kv_heads < self.local_cache_kv_heads:
-                # Cache has repeated heads, just take the first local_num_kv_heads
                 K_prior = K_prior[:, :self.local_num_kv_heads, :, :]
                 V_prior = V_prior[:, :self.local_num_kv_heads, :, :]
 
-            # WORKAROUND 2: Slice V_prior back to v_head_dim (128) from head_dim (192)
+            # Slice V back to v_head_dim
             if self.attn_v_head_dim < self.attn_head_dim:
                 V_prior = V_prior[..., :self.attn_v_head_dim]
 
-            # Repeat cached KV for GQA (only needed without CONVERT_TO_MHA)
-            # With CONVERT_TO_MHA, cached K/V already have num_attention_heads
+            # GQA repeat for cached KV
             if num_key_value_groups > 1:
                 K_prior = K_prior.repeat_interleave(num_key_value_groups, dim=1)
                 V_prior = V_prior.repeat_interleave(num_key_value_groups, dim=1)
 
-            # Compute attention on prior (cached) KV
-            # K_prior shape: [bsz, num_heads, kv_seq_len, head_dim]
+            # Compute prior scores: Q @ K_prior^T
             prior_scores = torch.matmul(query_states, K_prior.transpose(-2, -1)) * self.scaling
 
-            # Apply attention mask to prior scores (mask indicates valid positions)
+            # Pad attention mask if needed
+            if attention_mask is not None and prior_scores.shape[-1] > attention_mask.shape[-1]:
+                pad_size = prior_scores.shape[-1] - attention_mask.shape[-1]
+                attention_mask = F.pad(attention_mask, (0, pad_size), "constant", False)
+
+            # Apply mask (True = attend, False = mask)
             if attention_mask is not None:
-                # attention_mask shape: [bsz, 1, 1, kv_seq_len] or [bsz, num_heads, q_len, kv_seq_len]
                 prior_scores = torch.where(
-                    attention_mask.to(torch.bool), prior_scores, torch.finfo(prior_scores.dtype).min
+                    attention_mask.to(torch.bool),
+                    prior_scores,
+                    torch.finfo(prior_scores.dtype).min
                 )
             prior_scores = prior_scores.to(torch.float32)
 
-            # Compute attention on active (current) KV
-            # key_states shape: [bsz, num_heads, 1, head_dim]
+            # Compute active scores: Q @ K_active^T
             active_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
             active_scores = active_scores.to(torch.float32)
 
-            # Combined softmax over prior and active scores
-            # Concatenate scores along the last dimension
+            # Combined softmax
             all_scores = torch.cat([prior_scores, active_scores], dim=-1)
             attn_weights = F.softmax(all_scores, dim=-1, dtype=torch.float32)
 
-            # Split attention weights back
             prior_weights = attn_weights[..., :-q_len].to(V_prior.dtype)
             active_weights = attn_weights[..., -q_len:].to(value_states.dtype)
 
-            # Compute attention outputs
-            attn_prior = torch.matmul(prior_weights, V_prior)
-            attn_active = torch.matmul(active_weights, value_states)
-            attn_output = attn_prior + attn_active
+            attn_output = torch.matmul(prior_weights, V_prior) + torch.matmul(active_weights, value_states)
         else:
             # Context encoding: standard attention
-            # Compute attention scores
             attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
 
-            # Apply attention mask (boolean mask: True = attend, False = mask out)
             if attention_mask is not None:
                 attn_weights = torch.where(
                     attention_mask.to(torch.bool),
@@ -586,35 +539,23 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                     torch.finfo(attn_weights.dtype).min
                 )
 
-            # Apply sliding window mask if needed
+            # Sliding window mask
             if self.is_sliding_window and self.sliding_window_size is not None:
-                # Create sliding window mask
                 seq_len = attn_weights.size(-1)
                 sliding_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=attn_weights.device)
                 sliding_mask = torch.triu(sliding_mask, diagonal=-self.sliding_window_size + 1)
                 sliding_mask = torch.tril(sliding_mask)
-                sliding_mask = ~sliding_mask
-                attn_weights = attn_weights.masked_fill(sliding_mask, float('-inf'))
+                attn_weights = attn_weights.masked_fill(~sliding_mask, float('-inf'))
 
-            # Softmax
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
-
-            # Apply attention to values
             attn_output = torch.matmul(attn_weights, value_states)
 
-        # Apply value scale if specified
-        if self.value_scale != 1.0:
-            attn_output = attn_output * self.value_scale
-
-        # Reshape and project output
+        # Reshape and output projection
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.local_num_heads * self.attn_v_head_dim)
         attn_output = self.o_proj(attn_output)
 
-        # Prepare KV cache output - return as tuple for KV cache manager
-        # Return ORIGINAL (non-GQA-expanded) key/value states for cache
         new_key_value = (key_states_for_cache, value_states_for_cache)
-
         return attn_output, new_key_value, cos_cache, sin_cache
 
 
