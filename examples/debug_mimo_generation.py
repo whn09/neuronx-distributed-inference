@@ -187,8 +187,15 @@ def main():
             # Need to prepare inputs properly
             input_ids = inputs.input_ids
             attention_mask = inputs.attention_mask
-            position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
-            seq_ids = torch.arange(input_ids.shape[0])
+            # Use int32 for position_ids and seq_ids as expected by Neuron
+            position_ids = torch.arange(input_ids.shape[1], dtype=torch.int32).unsqueeze(0)
+            seq_ids = torch.zeros(input_ids.shape[0], dtype=torch.int32)
+
+            print(f"   Input shapes and dtypes:")
+            print(f"     input_ids: {input_ids.shape}, dtype={input_ids.dtype}")
+            print(f"     attention_mask: {attention_mask.shape}, dtype={attention_mask.dtype}")
+            print(f"     position_ids: {position_ids.shape}, dtype={position_ids.dtype}")
+            print(f"     seq_ids: {seq_ids.shape}, dtype={seq_ids.dtype}")
 
             outputs = model(
                 input_ids=input_ids,
@@ -203,8 +210,21 @@ def main():
                 logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
 
             print(f"   Logits shape: {logits.shape}")
+            print(f"   Logits dtype: {logits.dtype}")
             print(f"   Logits stats - mean: {logits.mean().item():.4f}, std: {logits.std().item():.4f}")
             print(f"   Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
+
+            # Check for NaN/Inf
+            if torch.isnan(logits).any():
+                nan_count = torch.isnan(logits).sum().item()
+                print(f"   WARNING: Logits contain {nan_count} NaN values!")
+            if torch.isinf(logits).any():
+                inf_count = torch.isinf(logits).sum().item()
+                print(f"   WARNING: Logits contain {inf_count} Inf values!")
+
+            # Check variance to detect degenerate outputs
+            if logits.var().item() < 1e-6:
+                print("   WARNING: Logits have very low variance - may be degenerate!")
 
             # Get top-10 tokens from logits
             if logits.dim() == 3:
@@ -281,8 +301,99 @@ def main():
     print(f"   Output IDs: {outputs[0].tolist()}")
     print(f"   Output text: '{tokenizer.decode(outputs[0], skip_special_tokens=True)}'")
 
+    # Step-by-step generation to see exactly what happens
+    print("\n12. Step-by-step generation (manual forward passes)...")
+    try:
+        # Reset the model
+        model.reset()
+
+        # Context encoding first
+        print("   Step 0: Context encoding...")
+        with torch.no_grad():
+            input_ids = inputs.input_ids.clone()
+            attention_mask = inputs.attention_mask.clone()
+            position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+            seq_ids = torch.arange(input_ids.shape[0])
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                seq_ids=seq_ids,
+            )
+
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+
+            # Get last position logits
+            if logits.dim() == 3:
+                last_logits = logits[0, -1, :]
+            else:
+                last_logits = logits[0, :]
+
+            next_token = last_logits.argmax().item()
+            next_token_text = tokenizer.decode([next_token])
+            print(f"     Context encoding output token: {next_token} '{next_token_text}'")
+            print(f"     Logits stats: mean={last_logits.mean():.4f}, std={last_logits.std():.4f}")
+
+            # Append to input
+            current_ids = torch.cat([input_ids, torch.tensor([[next_token]])], dim=1)
+            current_mask = torch.cat([attention_mask, torch.tensor([[1]])], dim=1)
+            current_pos = input_ids.shape[1]
+
+        # Token generation steps
+        for step in range(3):
+            print(f"   Step {step+1}: Token generation...")
+            with torch.no_grad():
+                # For token gen, we only pass the new token
+                new_input_ids = torch.tensor([[next_token]])
+                position_ids = torch.tensor([[current_pos]])
+                # Attention mask needs to be for full sequence
+                attention_mask = torch.ones(1, current_pos + 1)
+
+                outputs = model(
+                    input_ids=new_input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    seq_ids=seq_ids,
+                )
+
+                if hasattr(outputs, 'logits'):
+                    logits = outputs.logits
+                else:
+                    logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+
+                if logits.dim() == 3:
+                    last_logits = logits[0, -1, :]
+                else:
+                    last_logits = logits[0, :]
+
+                next_token = last_logits.argmax().item()
+                next_token_text = tokenizer.decode([next_token])
+                print(f"     Token gen output token: {next_token} '{next_token_text}'")
+                print(f"     Logits stats: mean={last_logits.mean():.4f}, std={last_logits.std():.4f}")
+
+                # Check if it's the problematic token
+                if next_token == 118076:
+                    print(f"     WARNING: Generated problematic token 118076!")
+                    # Show top 5 tokens
+                    top_vals, top_idxs = torch.topk(last_logits, 5)
+                    print(f"     Top 5 tokens:")
+                    for v, i in zip(top_vals.tolist(), top_idxs.tolist()):
+                        print(f"       {i} '{tokenizer.decode([i])}': {v:.4f}")
+
+                current_pos += 1
+
+    except Exception as e:
+        import traceback
+        print(f"   Error during step-by-step generation: {e}")
+        traceback.print_exc()
+
     # Try with sampling enabled
-    print("\n11. Testing with do_sample=True, temperature=0.7...")
+    print("\n13. Testing with do_sample=True, temperature=0.7...")
+    generation_model.neuron_model.reset()  # Reset before new generation
     outputs_sample = generation_model.generate(
         inputs.input_ids,
         attention_mask=inputs.attention_mask,

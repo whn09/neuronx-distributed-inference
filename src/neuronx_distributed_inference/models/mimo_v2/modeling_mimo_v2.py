@@ -660,7 +660,12 @@ class NeuronMiMoV2DecoderLayer(nn.Module):
         sin_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, ...]:
-        """Forward pass for decoder layer."""
+        """Forward pass for decoder layer.
+
+        Each layer uses the same attention_mask from the base class. Sliding window
+        attention is handled internally by the NeuronMiMoV2Attention layer, which
+        applies the sliding window mask on top of the causal mask.
+        """
 
         # Self attention with residual
         residual = hidden_states
@@ -722,6 +727,14 @@ class NeuronMiMoV2Model(NeuronBaseModel):
 
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
+
+        # MiMo-V2 has hybrid attention: some layers use full attention, others use sliding window
+        # Each attention layer applies its own sliding window mask internally, so we don't need
+        # has_mixed_attn or sliding_window at the model level. The attention layers handle
+        # the masking themselves.
+        self.has_mixed_attn = False
+        self.sliding_window = None
+        self.attention_chunk_size = None
 
     def init_model(self, config: MiMoV2InferenceConfig):
         self.padding_idx = getattr(config, 'pad_token_id', None)
@@ -1091,6 +1104,16 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
         config: MiMoV2InferenceConfig,
     ) -> Dict[str, Any]:
         return convert_mimo_v2_hf_to_neuron_state_dict(state_dict, config)
+
+    @staticmethod
+    def update_state_dict_for_tied_weights(state_dict: Dict[str, Any]):
+        """Copy embed_tokens weights to lm_head when tie_word_embeddings=True.
+
+        MiMo-V2-Flash uses tie_word_embeddings=True, meaning the embedding
+        and lm_head share weights. This method ensures the lm_head gets
+        the correct weights from embed_tokens.
+        """
+        state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
 
     def enable_context_encoding(self):
         self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
