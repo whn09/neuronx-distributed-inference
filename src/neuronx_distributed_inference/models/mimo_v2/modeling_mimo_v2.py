@@ -582,6 +582,21 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 prior_scores = torch.where(
                     attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
                 )
+
+            # Apply sliding window mask for SWA layers
+            # For token generation, only attend to positions within the sliding window
+            if self.is_sliding_window and self.sliding_window_size is not None and position_ids is not None:
+                kv_seq_len = prior_scores.size(-1)
+                # Current position from position_ids
+                current_pos = position_ids[0, 0]  # Assuming batch size 1 and single token
+                # Create mask: only attend to positions >= current_pos - sliding_window_size + 1
+                pos_indices = torch.arange(kv_seq_len, device=prior_scores.device)
+                sliding_mask = pos_indices >= (current_pos - self.sliding_window_size + 1)
+                sliding_mask = sliding_mask[None, None, None, :]  # [1, 1, 1, kv_seq_len]
+                prior_scores = torch.where(
+                    sliding_mask, prior_scores, torch.finfo(prior_scores.dtype).min
+                )
+
             prior_scores = prior_scores.to(torch.float32)
 
             # Compute attention on active (current) KV
@@ -609,20 +624,23 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
             # Apply attention mask (boolean mask: True = attend, False = mask out)
             if attention_mask is not None:
-                # Convert boolean mask to additive mask
                 attn_weights = torch.where(
                     attention_mask, attn_weights, torch.finfo(attn_weights.dtype).min
                 )
 
-            # Apply sliding window mask if needed
+            # Apply sliding window mask for SWA layers
+            # This creates a band mask that restricts attention to nearby positions
             if self.is_sliding_window and self.sliding_window_size is not None:
-                # Create sliding window mask
                 seq_len = attn_weights.size(-1)
-                sliding_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=attn_weights.device)
-                sliding_mask = torch.triu(sliding_mask, diagonal=-self.sliding_window_size + 1)
-                sliding_mask = torch.tril(sliding_mask)
-                sliding_mask = ~sliding_mask
-                attn_weights = attn_weights.masked_fill(sliding_mask, float('-inf'))
+                # Create sliding window mask: True = attend, False = mask out
+                row_idx = torch.arange(seq_len, device=attn_weights.device).unsqueeze(1)
+                col_idx = torch.arange(seq_len, device=attn_weights.device).unsqueeze(0)
+                # Causal: col <= row, and within window: col >= row - window_size + 1
+                sliding_mask = (col_idx <= row_idx) & (col_idx >= row_idx - self.sliding_window_size + 1)
+                sliding_mask = sliding_mask[None, None, :, :]  # [1, 1, seq_len, seq_len]
+                attn_weights = torch.where(
+                    sliding_mask, attn_weights, torch.finfo(attn_weights.dtype).min
+                )
 
             # Softmax
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
@@ -809,6 +827,12 @@ class NeuronMiMoV2Model(NeuronBaseModel):
 
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
+
+        # MiMo has hybrid attention (full + sliding window)
+        # NOTE: Do NOT set self.sliding_window here because it affects KV cache size globally.
+        # MiMo handles sliding window per-layer in the attention module itself.
+        # Setting has_mixed_attn = True enables proper mask creation without affecting cache size.
+        self.has_mixed_attn = True
 
     def init_model(self, config: MiMoV2InferenceConfig):
         self.padding_idx = getattr(config, 'pad_token_id', None)
