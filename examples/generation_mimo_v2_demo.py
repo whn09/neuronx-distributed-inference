@@ -60,22 +60,22 @@ def parse_args():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/home/ubuntu/models/MiMo-V2-Flash-BF16/",
+        default="/opt/dlami/nvme/models/MiMo-V2-Flash-BF16/",
         help="Path to BF16 model checkpoint (converted from FP8)",
     )
     parser.add_argument(
         "--compiled-model-path",
         type=str,
-        default="/home/ubuntu/traced_model/MiMo-V2-Flash-BF16/",
+        default="/opt/dlami/nvme/traced_model/MiMo-V2-Flash-BF16/",
         help="Path to save/load compiled model",
     )
     parser.add_argument(
         "--tp-degree",
         type=int,
-        default=32,
+        default=64,
         help="Tensor parallelism degree. For TP<=4, must divide num_kv_heads=4. "
-             "For TP>4, uses CONVERT_TO_MHA mode. Valid: 1, 2, 4, 8, 16, 32. "
-             "Recommended: 32 for this large model.",
+             "For TP>4, uses CONVERT_TO_MHA mode. Valid: 1, 2, 4, 8, 16, 32, 64. "
+             "Recommended: 64 for this large model (with logical_nc_config=2).",
     )
     parser.add_argument(
         "--moe-tp-degree",
@@ -196,12 +196,16 @@ def create_neuron_config(args):
         # Flash decoding
         flash_decoding_enabled=False,
 
-        # Sequence parallel - disabled for now to simplify debugging
-        # Note: MiniMax M2 uses this, but MiMo-V2 may have issues with it
-        sequence_parallel_enabled=False,
+        # Sequence parallel - enabled following MiniMax M2
+        sequence_parallel_enabled=True,
 
-        # Logical NC config - disabled for now to simplify debugging
-        # logical_nc_config=2,
+        # Logical NC config - splits 32 physical cores into 64 logical cores
+        # Required for tp_degree=64 on trn2.48xlarge
+        logical_nc_config=2,
+
+        # Fused QKV projection - disabled because MiMo-V2 has different head_dim
+        # for Q/K (192) vs V (128), which is incompatible with standard fused_qkv
+        fused_qkv=False,
 
         # Disable continuous batching for simpler testing
         is_continuous_batching=False,
