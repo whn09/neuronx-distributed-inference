@@ -440,71 +440,29 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             self.local_num_heads = self.attn_num_heads
             self.local_num_kv_heads = k_num_heads
 
-        # Remove qkv_proj from base class if exists
+        # Override base class attributes that were computed with wrong head_dim
+        # The base class init_gqa_properties() uses head_dim=v_head_dim which is wrong for Q/K
+        # We need to override these to ensure correct computation
+        self.num_heads = self.local_num_heads
+        self.num_key_value_heads = self.local_num_kv_heads
+        self.num_key_value_groups = self.local_num_heads // self.local_num_kv_heads
+        self.head_dim = self.attn_head_dim  # Override to use actual Q/K head_dim (192)
+
+        # Remove qkv_proj from base class if exists (we use separate q_proj, k_proj, v_proj)
         if hasattr(self, 'qkv_proj'):
             self.qkv_proj = None
-
-    def _replicate_kv_weights(self, tensor: torch.Tensor, source_heads: int, repeats: int, head_dim: int) -> torch.Tensor:
-        """Replicate K/V weights from source_heads to source_heads * repeats.
-
-        Args:
-            tensor: Weight tensor of shape [source_heads * head_dim, hidden_size]
-            source_heads: Number of source KV heads
-            repeats: Replication factor
-            head_dim: Head dimension (192 for K, 128 for V)
-
-        Returns:
-            Replicated tensor of shape [source_heads * repeats * head_dim, hidden_size]
-        """
-        if tensor is None or repeats <= 1:
-            return tensor
-
-        # Reshape to [source_heads, head_dim, hidden_size]
-        original_shape = tensor.shape
-        tensor = tensor.view(source_heads, head_dim, -1)
-
-        # Repeat along head dimension
-        tensor = tensor.repeat_interleave(repeats, dim=0)
-
-        # Reshape back to [num_heads * head_dim, hidden_size]
-        tensor = tensor.view(-1, original_shape[-1])
-        return tensor
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
         """Pre-shard hook to replicate K/V weights for CONVERT_TO_MHA.
 
-        This is called before checkpoint sharding. When tp_degree > num_kv_heads,
-        we replicate K/V weights from num_kv_heads to num_attention_heads so they
-        can be evenly sharded across TP ranks.
+        NOTE: This method is NOT currently called because NeuronMiMoV2Attention
+        is not a BaseGroupQueryAttention subclass. K/V weight replication is
+        instead done in convert_mimo_v2_hf_to_neuron_state_dict().
+
+        This method is kept for reference and potential future use.
         """
-        if not self.use_gqa_convert_to_mha or self._kv_replication_factor <= 1:
-            return False
-
-        # Extract the attention module prefix (e.g., "model.layers.0.self_attn")
-        prefix_parts = prefix.split(".")
-        attn_prefix = ".".join(prefix_parts[:-1])
-
-        # Replicate K projection weights
-        k_proj_key = f"{attn_prefix}.k_proj.weight"
-        if k_proj_key in model_state_dict:
-            model_state_dict[k_proj_key] = self._replicate_kv_weights(
-                model_state_dict[k_proj_key],
-                self._src_num_kv_heads,
-                self._kv_replication_factor,
-                self.attn_head_dim,
-            )
-
-        # Replicate V projection weights
-        v_proj_key = f"{attn_prefix}.v_proj.weight"
-        if v_proj_key in model_state_dict:
-            model_state_dict[v_proj_key] = self._replicate_kv_weights(
-                model_state_dict[v_proj_key],
-                self._src_num_kv_heads,
-                self._kv_replication_factor,
-                self.attn_v_head_dim,
-            )
-
-        return True
+        # This hook is not called - see note above
+        return False
 
     def forward(
         self,
@@ -879,6 +837,41 @@ class NeuronMiMoV2Model(NeuronBaseModel):
         )
 
 
+def _replicate_kv_weights_for_convert_to_mha(
+    tensor: torch.Tensor,
+    source_heads: int,
+    target_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Replicate K/V weights from source_heads to target_heads for CONVERT_TO_MHA.
+
+    Args:
+        tensor: Weight tensor of shape [source_heads * head_dim, hidden_size]
+        source_heads: Number of source KV heads
+        target_heads: Number of target heads (num_attention_heads)
+        head_dim: Head dimension
+
+    Returns:
+        Replicated tensor of shape [target_heads * head_dim, hidden_size]
+    """
+    if tensor is None or source_heads >= target_heads:
+        return tensor
+
+    repeats = target_heads // source_heads
+
+    # Reshape to [source_heads, head_dim, hidden_size]
+    original_shape = tensor.shape
+    tensor = tensor.view(source_heads, head_dim, -1)
+
+    # Repeat along head dimension
+    tensor = tensor.repeat_interleave(repeats, dim=0)
+
+    # Reshape back to [num_heads * head_dim, hidden_size]
+    tensor = tensor.view(-1, original_shape[-1])
+
+    return tensor
+
+
 def convert_mimo_v2_hf_to_neuron_state_dict(
     neuron_state_dict: Dict[str, Any],
     config: MiMoV2InferenceConfig,
@@ -889,6 +882,7 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
     1. Router weight renaming
     2. Expert weight concatenation and transposition
     3. FP8 dequantization if needed
+    4. K/V weight replication for CONVERT_TO_MHA mode
     """
 
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
@@ -901,11 +895,68 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
+    # Determine if CONVERT_TO_MHA is needed
+    tp_degree = config.neuron_config.tp_degree
+    num_attention_heads = config.num_attention_heads
+
+    # MiMo-V2-Flash has different KV heads for full and sliding window attention
+    full_num_kv_heads = config.num_key_value_heads  # 4
+    swa_num_kv_heads = config.swa_num_key_value_heads  # 8
+
+    # Check if we need to replicate K/V weights
+    full_use_convert_to_mha = tp_degree > full_num_kv_heads
+    swa_use_convert_to_mha = tp_degree > swa_num_kv_heads
+
+    print(f"\n[DEBUG] CONVERT_TO_MHA status:")
+    print(f"  tp_degree: {tp_degree}")
+    print(f"  num_attention_heads: {num_attention_heads}")
+    print(f"  full_num_kv_heads: {full_num_kv_heads}, use_convert_to_mha: {full_use_convert_to_mha}")
+    print(f"  swa_num_kv_heads: {swa_num_kv_heads}, use_convert_to_mha: {swa_use_convert_to_mha}")
+
     for layer_idx in range(config.num_hidden_layers):
         # Add rank utility for attention
         neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
         )
+
+        # Determine attention type for this layer
+        is_sliding_window = config.layer_attention_types[layer_idx] == "sliding_window"
+
+        if is_sliding_window:
+            src_num_kv_heads = swa_num_kv_heads
+            use_convert_to_mha = swa_use_convert_to_mha
+            head_dim = config.swa_head_dim  # 192
+            v_head_dim = config.swa_v_head_dim  # 128
+        else:
+            src_num_kv_heads = full_num_kv_heads
+            use_convert_to_mha = full_use_convert_to_mha
+            head_dim = config.head_dim  # 192
+            v_head_dim = config.v_head_dim  # 128
+
+        # Replicate K/V weights if CONVERT_TO_MHA is needed
+        if use_convert_to_mha:
+            k_proj_key = f"layers.{layer_idx}.self_attn.k_proj.weight"
+            v_proj_key = f"layers.{layer_idx}.self_attn.v_proj.weight"
+
+            if k_proj_key in neuron_state_dict:
+                old_shape = neuron_state_dict[k_proj_key].shape
+                neuron_state_dict[k_proj_key] = _replicate_kv_weights_for_convert_to_mha(
+                    neuron_state_dict[k_proj_key],
+                    src_num_kv_heads,
+                    num_attention_heads,
+                    head_dim,
+                )
+                print(f"[DEBUG] Layer {layer_idx} ({'SWA' if is_sliding_window else 'Full'}): Replicated K: {old_shape} -> {neuron_state_dict[k_proj_key].shape}")
+
+            if v_proj_key in neuron_state_dict:
+                old_shape = neuron_state_dict[v_proj_key].shape
+                neuron_state_dict[v_proj_key] = _replicate_kv_weights_for_convert_to_mha(
+                    neuron_state_dict[v_proj_key],
+                    src_num_kv_heads,
+                    num_attention_heads,
+                    v_head_dim,
+                )
+                print(f"[DEBUG] Layer {layer_idx} ({'SWA' if is_sliding_window else 'Full'}): Replicated V: {old_shape} -> {neuron_state_dict[v_proj_key].shape}")
 
         # Only convert MoE layers
         if not config.layer_uses_moe[layer_idx]:
