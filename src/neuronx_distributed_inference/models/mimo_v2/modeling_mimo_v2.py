@@ -607,9 +607,12 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # Compute attention scores
             attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
 
-            # Apply attention mask
+            # Apply attention mask (boolean mask: True = attend, False = mask out)
             if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask
+                # Convert boolean mask to additive mask
+                attn_weights = torch.where(
+                    attention_mask, attn_weights, torch.finfo(attn_weights.dtype).min
+                )
 
             # Apply sliding window mask if needed
             if self.is_sliding_window and self.sliding_window_size is not None:
