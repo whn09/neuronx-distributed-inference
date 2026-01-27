@@ -505,9 +505,13 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         key_rope = key_states[..., :self.rope_dim]
         key_nope = key_states[..., self.rope_dim:]
 
-        # Compute rotary embeddings if not cached
-        if cos_cache is None or sin_cache is None:
-            cos_cache, sin_cache = self.rotary_emb(value_states, position_ids)
+        # Compute rotary embeddings
+        # IMPORTANT: Always compute for this layer because different layer types
+        # (full vs sliding window) use different rope_theta values.
+        # Full attention: rope_theta = 5000000
+        # Sliding window: rope_theta = 10000
+        # We cannot reuse cached cos/sin from other layers!
+        cos_cache, sin_cache = self.rotary_emb(value_states, position_ids)
 
         # Apply rotary position embedding to rope parts only
         query_rope, key_rope = apply_rotary_pos_emb(
