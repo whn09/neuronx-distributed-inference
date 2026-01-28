@@ -36,7 +36,7 @@ from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
     MoENeuronConfig,
-    SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP,
+    SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP,
     MOE_TKG_MK_INTERMEDIATE_PER_TP,
 )
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
@@ -203,10 +203,10 @@ class Qwen3NextInferenceConfig(InferenceConfig):
         moe_tp_degree = self.neuron_config.moe_tp_degree
         I_TP = self.moe_intermediate_size // moe_tp_degree
         if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
-            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP != 0:
                 padded_moe_intermediate_size = (
-                    math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP)
-                    * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
+                    math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP)
+                    * SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP
                     * moe_tp_degree
                 )
                 self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)

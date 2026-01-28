@@ -2,6 +2,7 @@ from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxFo
 from neuronx_distributed_inference.models.gpt_oss.modeling_gpt_oss import NeuronGptOssForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
 from neuronx_distributed_inference.models.llama4.modeling_llama4 import NeuronLlama4ForCausalLM
+from neuronx_distributed_inference.models.mimo_v2.modeling_mimo_v2 import NeuronMiMoV2ForCausalLM
 from neuronx_distributed_inference.models.minimax_m2.modeling_minimax_m2_v3 import NeuronMiniMaxM2ForCausalLMV3
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
@@ -45,6 +46,7 @@ MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
     "llama4": {"causal-lm": NeuronLlama4ForCausalLM},
     "mllama": {"causal-lm": NeuronMllamaForCausalLM},
+    "mimo_v2_flash": {"causal-lm": NeuronMiMoV2ForCausalLM},
     "minimaxm2": {"causal-lm": NeuronMiniMaxM2ForCausalLMV3},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},

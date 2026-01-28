@@ -59,7 +59,7 @@ from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecode
 
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module, initialize_moe_process_group
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.gqa import GQA
@@ -466,8 +466,8 @@ class MiniMaxM2InferenceConfigV3(InferenceConfig):
         moe_tp_degree = self.neuron_config.moe_tp_degree
         I_TP = self.intermediate_size // moe_tp_degree
         if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
-            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
-                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP != 0:
+                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP * moe_tp_degree
                 self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.intermediate_size, 0)
                 self.intermediate_size = padded_moe_intermediate_size
 
