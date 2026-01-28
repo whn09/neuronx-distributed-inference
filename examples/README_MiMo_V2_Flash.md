@@ -180,7 +180,44 @@ Uses decomposed attention approach for efficiency:
 | `TP degree must divide num_kv_heads` | TP ≤ 4 but doesn't divide 4 | Use TP = 1, 2, or 4 |
 | `TP degree must divide num_attention_heads` | TP > 4 but doesn't divide 64 | Use TP = 8, 16, 32, or 64 |
 | Garbage output | K/V replication using `repeat` instead of `repeat_interleave` | Fixed in current version |
+| Garbage output | Missing `attention_sink_bias` in token generation | Fixed in current version |
 | Slow checkpoint loading | Large model | Use `save_sharded_checkpoint=True` |
+| Repetitive output | Missing EOS token handling | Set `eos_token_id` and use `max_new_tokens` |
+
+### Key Bug Fixes (2025-01-28)
+
+#### Issue: Garbage/Random Output During Inference
+
+**Root Cause**: The token generation path was missing the `attention_sink_bias` handling that was present in the context encoding path.
+
+**Technical Details**:
+- MiMo-V2-Flash uses "attention sink bias" for Sliding Window Attention (SWA) layers
+- This is a learnable parameter (`attention_sink_bias` with shape `[num_attention_heads]`) that adds an extra "sink" column to attention weights
+- The HF implementation applies this in `eager_attention_forward`:
+  ```python
+  # Add sink column
+  sinks = module.attention_sink_bias.reshape(1, -1, 1, 1).expand(...)
+  attn_weights = torch.cat([attn_weights, sinks], dim=-1)
+  # Subtract max for numerical stability
+  attn_weights = attn_weights - attn_weights.max(dim=-1, keepdim=True).values
+  # Softmax
+  probs = F.softmax(attn_weights, dim=-1)
+  # Drop sink column after softmax
+  probs = probs[..., :-1]
+  ```
+
+**Fix Applied**:
+1. Added `attention_sink_bias` handling to the token generation path (was completely missing)
+2. Both context encoding and token generation now follow the HF implementation:
+   - Add sink bias column before softmax
+   - Subtract max for numerical stability
+   - Apply softmax
+   - Drop sink column after softmax
+
+**Verification**:
+- Config: `add_swa_attention_sink_bias=True` (default), `add_full_attention_sink_bias=False`
+- Only SWA layers (39 out of 48) have `attention_sink_bias` in the checkpoint
+- Full attention layers (layer 0, 5, 11, 17, 23, 29, 35, 41, 47) do NOT have `attention_sink_bias`
 
 ## Expert Parallelism Note
 
@@ -210,6 +247,7 @@ Converting between these formats is not straightforward as it would require comp
 
 | Date | Changes |
 |------|---------|
+| 2025-01-28 | Fixed attention_sink_bias missing in token generation path (was causing garbage output) |
 | 2025-01-21 | Simplified to BF16-only mode (native FP8 not supported due to scale format incompatibilities) |
 | 2025-01-20 | Implemented CONVERT_TO_MHA for TP=32 support |
 | 2025-01-19 | Initial implementation with hybrid attention and MoE |

@@ -123,6 +123,18 @@ def parse_args():
         default="Hello, how are you today?",
         help="Prompt for text generation",
     )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=128,
+        help="Maximum number of new tokens to generate (default: 128)",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.1,
+        help="Repetition penalty (default: 1.1, use 1.0 to disable)",
+    )
 
     args = parser.parse_args()
 
@@ -320,7 +332,7 @@ def load_model(args):
     return model, tokenizer
 
 
-def generate(model, tokenizer, prompt, max_length):
+def generate(model, tokenizer, prompt, max_new_tokens=128, repetition_penalty=1.1):
     """Generate text using the model."""
     print(f"\n{'='*60}")
     print("Generating text")
@@ -329,23 +341,43 @@ def generate(model, tokenizer, prompt, max_length):
 
     # Tokenize input
     inputs = tokenizer([prompt], padding=True, return_tensors="pt")
+    input_length = inputs.input_ids.shape[1]
     print(f"Input token IDs: {inputs.input_ids[0].tolist()}")
-    print(f"Input length: {inputs.input_ids.shape[1]}")
+    print(f"Input length: {input_length}")
 
     # Create generation adapter
     generation_model = HuggingFaceGenerationAdapter(model)
 
+    # Get EOS token ID
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_token_id
+
+    # Calculate max_length from max_new_tokens
+    max_length = min(input_length + max_new_tokens, model.config.neuron_config.max_length)
+
+    print(f"\nGeneration parameters:")
+    print(f"  max_new_tokens: {max_new_tokens}")
+    print(f"  max_length: {max_length}")
+    print(f"  repetition_penalty: {repetition_penalty}")
+    print(f"  eos_token_id: {eos_token_id}")
+
     # Generate
-    print(f"\nGenerating with max_length={max_length}...")
+    print(f"\nGenerating...")
     outputs = generation_model.generate(
         inputs.input_ids,
         attention_mask=inputs.attention_mask,
         max_length=max_length,
+        max_new_tokens=max_new_tokens,
         do_sample=False,  # Greedy decoding
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        repetition_penalty=repetition_penalty,
     )
 
+    # Get only newly generated tokens for display
+    new_tokens = outputs.shape[1] - input_length
     print(f"Output token IDs shape: {outputs.shape}")
-    print(f"Output token IDs (first 30): {outputs[0, :30].tolist()}")
+    print(f"New tokens generated: {new_tokens}")
 
     # Decode output
     output_text = tokenizer.batch_decode(
@@ -354,13 +386,21 @@ def generate(model, tokenizer, prompt, max_length):
         clean_up_tokenization_spaces=False,
     )
 
+    # Also decode just the generated part (excluding prompt)
+    generated_only = tokenizer.batch_decode(
+        outputs[:, input_length:],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
     print(f"\n{'='*60}")
     print("Generated output")
     print(f"{'='*60}")
-    for i, text in enumerate(output_text):
+    for i, (full_text, gen_text) in enumerate(zip(output_text, generated_only)):
         print(f"\nOutput {i}:")
-        print(text)
-        print(f"\n(total length: {len(text)} chars, {outputs.shape[1]} tokens)")
+        print(f"[Full]: {full_text}")
+        print(f"\n[Generated only]: {gen_text}")
+        print(f"\n(generated {new_tokens} tokens, {len(gen_text)} chars)")
 
     return output_text
 
@@ -387,8 +427,13 @@ def main():
         model, tokenizer = load_model(args)
 
     # Generate text
-    max_length = model.config.neuron_config.max_length
-    generate(model, tokenizer, args.prompt, max_length)
+    generate(
+        model,
+        tokenizer,
+        args.prompt,
+        max_new_tokens=args.max_new_tokens,
+        repetition_penalty=args.repetition_penalty,
+    )
 
 
 if __name__ == "__main__":

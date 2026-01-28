@@ -327,10 +327,11 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
         # Scaling factor
         self.scaling = self.attn_head_dim ** -0.5
-        if hasattr(config, 'attention_value_scale'):
-            self.value_scale = config.attention_value_scale
-        else:
-            self.value_scale = 1.0
+        # NOTE: The config may have 'attention_value_scale' (e.g., 0.707), but the HF model
+        # (modeling_mimo_v2_flash.py) does NOT use this value. The HF model only uses
+        # head_dim ** -0.5 for attention scaling, which is already applied via self.scaling.
+        # We must NOT apply attention_value_scale here, as it would cause divergence from HF.
+        self.value_scale = 1.0
 
         # Store cache KV heads for cache compatibility
         # With CONVERT_TO_MHA, all layers have num_attention_heads KV heads
@@ -451,6 +452,25 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         # Remove qkv_proj from base class if exists (we use separate q_proj, k_proj, v_proj)
         if hasattr(self, 'qkv_proj'):
             self.qkv_proj = None
+
+        # Attention sink bias for attention layers (following HF implementation)
+        # This is a learnable parameter that allows attention to "sink" to an extra position
+        add_full_attention_sink_bias = getattr(config, 'add_full_attention_sink_bias', False)
+        add_swa_attention_sink_bias = getattr(config, 'add_swa_attention_sink_bias', True)
+
+        # Determine if this layer uses sink bias based on config
+        self._use_sink_bias = (add_full_attention_sink_bias and not self.is_sliding_window) or \
+                              (add_swa_attention_sink_bias and self.is_sliding_window)
+
+        if self._use_sink_bias:
+            # Shape: [num_attention_heads] - will be split across TP ranks
+            # The weight is loaded from checkpoint with shape [num_attention_heads]
+            # and will be sliced to [local_num_heads] during forward
+            self.attention_sink_bias = nn.Parameter(
+                torch.zeros(self.attn_num_heads, dtype=dtype), requires_grad=False
+            )
+        else:
+            self.attention_sink_bias = None
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
         """Pre-shard hook to replicate K/V weights for CONVERT_TO_MHA.
@@ -580,38 +600,48 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # K_prior shape: [bsz, num_heads, kv_seq_len, head_dim]
             prior_scores = torch.matmul(query_states, K_prior.transpose(-2, -1)) * self.scaling
 
-            # Apply attention mask to prior scores (mask indicates valid positions)
+            # Apply attention mask to prior scores
             if attention_mask is not None:
-                # attention_mask shape: [bsz, 1, 1, kv_seq_len] or [bsz, num_heads, q_len, kv_seq_len]
-                prior_scores = torch.where(
-                    attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
-                )
+                # Convert boolean mask to additive mask if needed
+                if attention_mask.dtype == torch.bool:
+                    prior_scores = prior_scores.masked_fill(~attention_mask, float('-inf'))
+                else:
+                    prior_scores = prior_scores + attention_mask
 
             # Apply sliding window mask for SWA layers
-            # For token generation, only attend to positions within the sliding window
             if self.is_sliding_window and self.sliding_window_size is not None and position_ids is not None:
                 kv_seq_len = prior_scores.size(-1)
-                # Current position from position_ids
-                current_pos = position_ids[0, 0]  # Assuming batch size 1 and single token
-                # Create mask: only attend to positions >= current_pos - sliding_window_size + 1
+                current_pos = position_ids[0, 0]
                 pos_indices = torch.arange(kv_seq_len, device=prior_scores.device)
                 sliding_mask = pos_indices >= (current_pos - self.sliding_window_size + 1)
-                sliding_mask = sliding_mask[None, None, None, :]  # [1, 1, 1, kv_seq_len]
-                prior_scores = torch.where(
-                    sliding_mask, prior_scores, torch.finfo(prior_scores.dtype).min
-                )
+                sliding_mask = sliding_mask[None, None, None, :]
+                prior_scores = prior_scores.masked_fill(~sliding_mask, float('-inf'))
 
             prior_scores = prior_scores.to(torch.float32)
 
             # Compute attention on active (current) KV
-            # key_states shape: [bsz, num_heads, 1, head_dim]
             active_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
             active_scores = active_scores.to(torch.float32)
 
             # Combined softmax over prior and active scores
-            # Concatenate scores along the last dimension
             all_scores = torch.cat([prior_scores, active_scores], dim=-1)
+
+            # Add attention sink bias (following HF implementation)
+            # This must be applied to token generation as well!
+            use_sink = self._use_sink_bias and self.attention_sink_bias is not None
+            if use_sink:
+                tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.model_parallel_is_initialized() else 0
+                local_sink = self.attention_sink_bias[tp_rank * self.local_num_heads:(tp_rank + 1) * self.local_num_heads]
+                sink_bias = local_sink.reshape(1, -1, 1, 1).expand(bsz, -1, q_len, 1)
+                all_scores = torch.cat([all_scores, sink_bias], dim=-1)
+
+            # Numerical stability: subtract max before softmax
+            all_scores = all_scores - all_scores.max(dim=-1, keepdim=True).values
             attn_weights = F.softmax(all_scores, dim=-1, dtype=torch.float32)
+
+            # Drop the sink column after softmax
+            if use_sink:
+                attn_weights = attn_weights[..., :-1]
 
             # Split attention weights back
             prior_weights = attn_weights[..., :-q_len].to(V_prior.dtype)
@@ -626,28 +656,52 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             # Compute attention scores
             attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
 
-            # Apply attention mask (boolean mask: True = attend, False = mask out)
+            # Apply attention mask (additive mask: 0 = attend, -inf = mask out)
+            # The framework creates boolean masks, so we need to convert them
             if attention_mask is not None:
-                attn_weights = torch.where(
-                    attention_mask, attn_weights, torch.finfo(attn_weights.dtype).min
-                )
+                # Convert boolean mask to additive mask if needed
+                if attention_mask.dtype == torch.bool:
+                    # True = attend (0), False = mask (-inf)
+                    additive_mask = torch.zeros_like(attn_weights)
+                    additive_mask = additive_mask.masked_fill(~attention_mask, float('-inf'))
+                    attn_weights = attn_weights + additive_mask
+                else:
+                    # Already additive mask
+                    attn_weights = attn_weights + attention_mask
 
             # Apply sliding window mask for SWA layers
-            # This creates a band mask that restricts attention to nearby positions
             if self.is_sliding_window and self.sliding_window_size is not None:
                 seq_len = attn_weights.size(-1)
-                # Create sliding window mask: True = attend, False = mask out
                 row_idx = torch.arange(seq_len, device=attn_weights.device).unsqueeze(1)
                 col_idx = torch.arange(seq_len, device=attn_weights.device).unsqueeze(0)
                 # Causal: col <= row, and within window: col >= row - window_size + 1
                 sliding_mask = (col_idx <= row_idx) & (col_idx >= row_idx - self.sliding_window_size + 1)
-                sliding_mask = sliding_mask[None, None, :, :]  # [1, 1, seq_len, seq_len]
-                attn_weights = torch.where(
-                    sliding_mask, attn_weights, torch.finfo(attn_weights.dtype).min
-                )
+                sliding_mask = sliding_mask[None, None, :, :]
+                # Convert to additive mask
+                attn_weights = attn_weights.masked_fill(~sliding_mask, float('-inf'))
+
+            # Add attention sink bias (following HF implementation)
+            # This adds an extra "sink" column to attention weights
+            use_sink = self._use_sink_bias and self.attention_sink_bias is not None
+            if use_sink:
+                # Get local portion of sink bias for this TP rank
+                tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.model_parallel_is_initialized() else 0
+                local_sink = self.attention_sink_bias[tp_rank * self.local_num_heads:(tp_rank + 1) * self.local_num_heads]
+                # Reshape and expand: [local_num_heads] -> [bsz, local_num_heads, q_len, 1]
+                sink_bias = local_sink.reshape(1, -1, 1, 1).expand(bsz, -1, q_len, 1)
+                attn_weights = torch.cat([attn_weights, sink_bias], dim=-1)
+
+            # Numerical stability: subtract max before softmax (like HF implementation)
+            attn_weights = attn_weights - attn_weights.max(dim=-1, keepdim=True).values
 
             # Softmax
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+            # Drop the sink column after softmax
+            if use_sink:
+                attn_weights = attn_weights[..., :-1]
+
+            attn_weights = attn_weights.to(value_states.dtype)
 
             # Apply attention to values
             attn_output = torch.matmul(attn_weights, value_states)
