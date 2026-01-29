@@ -31,8 +31,21 @@ IMPORTANT CONSTRAINTS:
    This script expects BF16 weights. The original HuggingFace checkpoint is FP8 quantized,
    which should be converted to BF16 format first. See README_MiMo_V2_Flash.md for details.
 
+5. Expert Parallelism (EP):
+   EP distributes experts across ranks to reduce memory per rank. With 256 experts and
+   world_size=64, valid configurations are:
+   - EP=64, MoE_TP=1: 4 experts per rank (maximum EP)
+   - EP=32, MoE_TP=2: 8 experts per rank
+   - EP=16, MoE_TP=4: 16 experts per rank
+   - EP=8, MoE_TP=8: 32 experts per rank
+   - EP=1, MoE_TP=64: 256 experts per rank (default, no EP)
+
+   NOTE: EP is only supported during prefill (context encoding). When EP>1, hybrid
+   sharding is automatically enabled to use EP=1 for token generation.
+
    Usage:
    - Compile: python generation_mimo_v2_demo.py --compile-only
+   - Compile with EP: python generation_mimo_v2_demo.py --compile-only --moe-ep-degree 64 --moe-tp-degree 1
    - Generate: python generation_mimo_v2_demo.py --skip-compile --prompt "Hello!"
 """
 
@@ -87,7 +100,8 @@ def parse_args():
         "--moe-ep-degree",
         type=int,
         default=1,
-        help="MoE expert parallelism degree. Note: EP>1 may not be supported in token generation.",
+        help="MoE expert parallelism degree for prefill (context encoding). "
+             "When EP>1, hybrid sharding is automatically enabled with EP=1 for token generation.",
     )
     parser.add_argument(
         "--batch-size",
@@ -163,9 +177,43 @@ def parse_args():
 def create_neuron_config(args):
     """Create NeuronConfig for MiMo-V2-Flash."""
 
+    # MiMo-V2 model constants
+    NUM_EXPERTS = 256
+    TOP_K = 8
+
     # Determine MoE TP/EP degrees
     moe_ep_degree = args.moe_ep_degree
     moe_tp_degree = args.moe_tp_degree if args.moe_tp_degree else args.tp_degree
+
+    # EP support in token generation depends on batch size
+    # The threshold is: batch_size * top_k / num_experts >= 1.0
+    # For MiMo-V2: batch_size >= 256 / 8 = 32
+    min_batch_for_ep = NUM_EXPERTS // TOP_K  # = 32
+
+    # Determine if we can use EP directly or need hybrid sharding
+    if moe_ep_degree > 1:
+        # Validate that moe_tp_degree * moe_ep_degree = tp_degree (world_size)
+        if moe_tp_degree * moe_ep_degree != args.tp_degree:
+            raise ValueError(
+                f"With EP>1, moe_tp_degree ({moe_tp_degree}) × moe_ep_degree ({moe_ep_degree}) "
+                f"must equal tp_degree ({args.tp_degree}). "
+                f"Try: --moe-tp-degree {args.tp_degree // moe_ep_degree}"
+            )
+
+        if args.batch_size >= min_batch_for_ep:
+            # Batch size is large enough to use EP directly without hybrid sharding
+            # This uses forward_all_experts_EP path which supports EP
+            use_hybrid_sharding = False
+            print(f"\n  NOTE: batch_size ({args.batch_size}) >= {min_batch_for_ep}, "
+                  f"EP will work in token generation without hybrid sharding")
+        else:
+            # Batch size too small, need hybrid sharding (EP only in prefill)
+            use_hybrid_sharding = True
+            print(f"\n  NOTE: batch_size ({args.batch_size}) < {min_batch_for_ep}, "
+                  f"using hybrid sharding (EP only in prefill, EP=1 in token generation)")
+            print(f"  TIP: Use --batch-size {min_batch_for_ep} or higher for full EP support")
+    else:
+        use_hybrid_sharding = False
 
     # Check if CONVERT_TO_MHA mode will be used
     MIN_NUM_KV_HEADS = 4
@@ -177,6 +225,8 @@ def create_neuron_config(args):
     print(f"  MoE EP Degree: {moe_ep_degree}")
     print(f"  Experts per EP rank: {256 // moe_ep_degree}")
     print(f"  GQA Mode: {'CONVERT_TO_MHA (K/V replicated to 64 heads)' if use_convert_to_mha else 'Standard GQA'}")
+    if use_hybrid_sharding:
+        print(f"  Hybrid Sharding: ENABLED (CTE: EP={moe_ep_degree}/TP={moe_tp_degree}, TKG: EP=1/TP={args.tp_degree})")
 
     # Build config kwargs (following MiniMax M2 pattern)
     config_kwargs = dict(
@@ -189,10 +239,6 @@ def create_neuron_config(args):
 
         # Data type - important for numerical stability
         torch_dtype=torch.bfloat16,
-
-        # MoE parallelism
-        moe_tp_degree=moe_tp_degree,
-        moe_ep_degree=moe_ep_degree,
 
         # Sampling configuration
         # NOTE: on_device_sampling causes gather_output=False for lm_head,
@@ -242,7 +288,36 @@ def create_neuron_config(args):
 
         # Enable pre-sharded checkpoints for faster loading
         save_sharded_checkpoint=True,
+
+        # Blockwise matmul configuration for better EP performance
+        # (from Qwen3 MoE optimization)
+        blockwise_matmul_config={
+            "use_shard_on_intermediate_dynamic_while": True,
+            "skip_dma_token": True,
+        },
+
+        # Workaround for extra add/multiply in all-gather/reduce-scatter CC ops
+        disable_numeric_cc_token=True,
     )
+
+    # Configure MoE parallelism
+    if use_hybrid_sharding:
+        # Hybrid sharding: different EP/TP for prefill vs decode
+        # CTE (Context Encoding/Prefill): Use EP for expert parallelism
+        # TKG (Token Generation/Decode): EP=1 because EP is not supported in token generation
+        config_kwargs['hybrid_sharding_config'] = {
+            'moe_cte_tp_degree': moe_tp_degree,
+            'moe_cte_ep_degree': moe_ep_degree,
+            'moe_tkg_tp_degree': args.tp_degree,  # Full TP for token generation
+            'moe_tkg_ep_degree': 1,  # No EP for token generation (not supported)
+        }
+        # When using hybrid sharding, these are not used directly
+        config_kwargs['moe_tp_degree'] = 1
+        config_kwargs['moe_ep_degree'] = 1
+    else:
+        # Standard configuration: same parallelism for both phases
+        config_kwargs['moe_tp_degree'] = moe_tp_degree
+        config_kwargs['moe_ep_degree'] = moe_ep_degree
 
     neuron_config = MoENeuronConfig(**config_kwargs)
 
