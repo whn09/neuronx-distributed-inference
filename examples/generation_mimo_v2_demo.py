@@ -248,8 +248,10 @@ def create_neuron_config(args):
         #     do_sample=False,  # Greedy for deterministic results
         # ),
 
-        # Disable bucketing for simpler testing
-        enable_bucketing=False,
+        # Bucketing - enable for production, disable for testing
+        enable_bucketing=True,
+        context_encoding_buckets=[args.max_context_length],
+        token_generation_buckets=[args.seq_len],
 
         # Flash decoding
         flash_decoding_enabled=False,
@@ -265,12 +267,29 @@ def create_neuron_config(args):
         # for Q/K (192) vs V (128), which is incompatible with standard fused_qkv
         fused_qkv=False,
 
-        # Disable continuous batching for simpler testing
+        # Continuous batching - disabled for now (causes issues with async)
         is_continuous_batching=False,
 
-        # Disable kernel optimizations for debugging
+        # Async mode - disabled due to reshape error with MiMo-V2 vocab size
+        # Error: shape '[1, 1]' is invalid for input of size 152576
+        async_mode=False,
+
+        # === MoE Optimizations (from Qwen3 MoE official docs) ===
+        # Index calculation kernel - accelerates token-to-expert mapping
+        use_index_calc_kernel=True,
+
+        # Mask padded tokens in MoE computation - avoid wasted computation
+        moe_mask_padded_tokens=True,
+
+        # === Kernel optimizations ===
+        # QKV kernels - disabled because MiMo-V2 has different Q/K dim (192) vs V dim (128)
         qkv_kernel_enabled=False,
+        qkv_nki_kernel_enabled=False,
+
+        # Attention kernel - disabled due to MiMo-V2's non-standard Q/K/V dimensions
         attn_kernel_enabled=False,
+
+        # Strided context parallel kernel
         strided_context_parallel_kernel_enabled=False,
 
         # MoE configuration
@@ -298,6 +317,9 @@ def create_neuron_config(args):
 
         # Workaround for extra add/multiply in all-gather/reduce-scatter CC ops
         disable_numeric_cc_token=True,
+
+        # Scratchpad page size for large tensors (compiler and runtime)
+        scratchpad_page_size=1024,
     )
 
     # Configure MoE parallelism
