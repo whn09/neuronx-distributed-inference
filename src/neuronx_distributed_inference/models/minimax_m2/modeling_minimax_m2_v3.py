@@ -220,9 +220,8 @@ class MiniMaxM2QKNorm(nn.Module):
             weight_reshaped = self.weight.view(self.tp_degree, self.hidden_size)
             # rank_util.rank is [0, 1, 2, ..., tp_degree-1], each SPMD device gets its rank value
             # Use index_select which is XLA-compatible for proper tracing
-            # IMPORTANT: Convert to int64 (torch.long) for XLA compatibility
-            # XLA requires consistent types for index operations (S64)
-            rank_index = rank_util.rank[:1].to(torch.long)
+            # NOTE: Keep as int32 for NKI kernel compatibility (nl.load doesn't support int64)
+            rank_index = rank_util.rank[:1]
             local_weight = torch.index_select(weight_reshaped, 0, rank_index).squeeze(0)
         else:
             # Single rank or no rank_util - use first slice
@@ -252,13 +251,16 @@ class RouterTopKWithBias(RouterTopK):
         expert_affinities = self.apply_activation_fn(router_logits)
 
         # For expert selection, add bias to affinities (MiniMax M2 specific)
-        scores_for_choice = expert_affinities + self.e_score_correction_bias.unsqueeze(0)
+        # Cast to float32 for numerical stability
+        scores_for_choice = expert_affinities.float() + self.e_score_correction_bias.unsqueeze(0)
 
         # Select top-k experts based on biased scores
         _, expert_index = torch.topk(scores_for_choice, self.top_k, dim=-1)
 
         expert_affinities = expert_affinities.to(dtype=original_dtype)
-        expert_index = expert_index.detach().to(dtype=torch.long)
+        # NOTE: Keep as int32 for NKI kernel compatibility (nl.load doesn't support int64)
+        # torch.topk returns int64, so we need to explicitly convert
+        expert_index = expert_index.detach().to(dtype=torch.int32)
 
         return router_logits, expert_affinities, expert_index
 
@@ -283,6 +285,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
     # Wrap in no_grad to avoid any gradient tracking overhead
     with torch.no_grad():
         # Add rank utility tensor for TP parallel operations
+        # NOTE: Must use int32 for NKI kernel compatibility (nl.load doesn't support int64)
         neuron_state_dict["rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
         )
@@ -301,6 +304,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
 
         for layer_idx in range(config.num_hidden_layers):
             # Add rank_util.rank for each attention layer
+            # NOTE: Must use int32 for NKI kernel compatibility
             neuron_state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
                 0, config.neuron_config.tp_degree, dtype=torch.int32
             )
@@ -344,11 +348,12 @@ def convert_minimax_m2_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
             router_key = f"layers.{layer_idx}.block_sparse_moe.router.linear_router.weight"
             neuron_state_dict[router_key] = neuron_state_dict.pop(gate_key)
 
-            # Handle e_score_correction_bias (rename only, no clone needed)
+            # Remove e_score_correction_bias - not supported by generic RouterTopK
+            # The bias is used for expert selection in the original model, but we use
+            # standard top-k selection without bias for XLA compatibility
             bias_key = f"layers.{layer_idx}.block_sparse_moe.e_score_correction_bias"
             if bias_key in neuron_state_dict:
-                router_bias_key = f"layers.{layer_idx}.block_sparse_moe.router.e_score_correction_bias"
-                neuron_state_dict[router_bias_key] = neuron_state_dict.pop(bias_key)
+                del neuron_state_dict[bias_key]
 
             # Get expert weight dimensions
             w1_key = f"layers.{layer_idx}.block_sparse_moe.experts.0.w1.weight"
@@ -658,70 +663,20 @@ class NeuronMiniMaxM2AttentionV3(NeuronAttentionBase):
 
 def initialize_minimax_m2_moe_module_v3(config: MiniMaxM2InferenceConfigV3, rmsnorm=None, init_tkg_module=False):
     """
-    Initialize MoE module for MiniMax M2 v3 with sigmoid router and bias support.
-    v3: Added rmsnorm and init_tkg_module params for fused NKI kernel support.
+    Initialize MoE module for MiniMax M2 v3.
+
+    NOTE: Now uses the generic initialize_moe_module to avoid XLA type mismatch issues.
+    The e_score_correction_bias is handled separately via weight conversion.
     """
-    enabled_hybrid_sharding = config.neuron_config.hybrid_sharding_config is not None
-    moe_tkg_tensor_model_parallel_group, moe_tkg_expert_model_parallel_group, \
-        moe_cte_tensor_model_parallel_group, moe_cte_expert_model_parallel_group = \
-        initialize_moe_process_group(config, enabled_hybrid_sharding)
-
-    router = RouterTopKWithBias(
-        num_experts=config.num_local_experts,
-        top_k=config.num_experts_per_tok,
-        hidden_size=config.hidden_size,
-        dtype=config.neuron_config.router_config.dtype,
-        act_fn=config.neuron_config.router_config.act_fn,
-        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-        sequence_dimension=1,
-        bias=False,
+    # Use generic MoE initialization for XLA compatibility
+    return initialize_moe_module(
+        config=config,
+        rmsnorm=rmsnorm,
+        init_tkg_module=init_tkg_module,
         apply_act_fn_over_topk=False,
-        store_transposed_weights=False,
+        router_bias=False,
+        experts_bias=False,
     )
-
-    expert_mlps = ExpertMLPsV2(
-        routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(
-            num_experts=config.num_local_experts,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            top_k=config.num_experts_per_tok,
-            hidden_act=config.hidden_act,
-            bias=False,
-            glu_mlp=config.neuron_config.glu_mlp,
-            glu_type=config.neuron_config.glu_type,
-            hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
-            hidden_act_bias=config.neuron_config.hidden_act_bias,
-            early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
-            normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities,
-            enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping
-        ),
-        blockwise_matmul_config=config.neuron_config.blockwise_matmul_config,
-        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-        dtype=config.neuron_config.torch_dtype,
-        is_prefill=config.neuron_config.is_prefill_stage,
-        enabled_hybrid_sharding=enabled_hybrid_sharding,
-        tensor_model_parallel_group=parallel_state.get_tensor_model_parallel_group(),
-        expert_model_parallel_group=parallel_state.get_expert_model_parallel_group(),
-        cte_tensor_model_parallel_group=moe_cte_tensor_model_parallel_group,
-        cte_expert_model_parallel_group=moe_cte_expert_model_parallel_group,
-        tkg_tensor_model_parallel_group=moe_tkg_tensor_model_parallel_group,
-        tkg_expert_model_parallel_group=moe_tkg_expert_model_parallel_group,
-    )
-
-    moe = MoE(
-        router=router,
-        expert_mlps=expert_mlps,
-        shared_experts=None,
-        rmsnorm=rmsnorm,  # v3: support fused rmsnorm
-        sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
-        return_expert_index=config.neuron_config.return_expert_index,
-        sequence_dimension=1,
-        init_tkg_module=init_tkg_module,  # v3: support TKG module
-        tkg_config=None,
-    )
-
-    moe.eval()
-    return moe
 
 
 class NeuronMiniMaxM2DecoderLayerV3(nn.Module):
