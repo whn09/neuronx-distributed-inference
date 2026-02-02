@@ -899,9 +899,6 @@ class NeuronMiniMaxM2ForCausalLMV3(NeuronBaseForCausalLM):
         from safetensors import safe_open
         import json
 
-        # Override to use the actual HF model path
-        model_name_or_path = '/home/ubuntu/model_hf/MiniMax-M2-BF16/'
-
         if os.path.isdir(model_name_or_path):
             index_path = os.path.join(model_name_or_path, 'model.safetensors.index.json')
             if os.path.exists(index_path):
