@@ -145,6 +145,7 @@ vllm bench serve \
     --num-prompts 16 \
     --random-input-len 1024 \
     --random-output-len 256 \
+    --random-range-ratio 0.1 \
     --max-concurrency 1
 ```
 
@@ -161,6 +162,7 @@ vllm bench serve \
     --num-prompts 256 \
     --random-input-len 1024 \
     --random-output-len 256 \
+    --random-range-ratio 0.1 \
     --max-concurrency 16
 ```
 
