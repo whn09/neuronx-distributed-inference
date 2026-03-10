@@ -185,27 +185,39 @@ vllm bench serve \
 
 ### 结果对比
 
+测试参数：input=900, output=90, random-range-ratio=0.03
+
 | 指标 | 并发 1 | 并发 16 |
 |------|--------|---------|
 | Successful requests | 16 | 256 |
 | Failed requests | 0 | 0 |
-| Benchmark duration (s) | 129.60 | 187.29 |
-| Request throughput (req/s) | 0.12 | **1.37** |
-| Output token throughput (tok/s) | 31.61 | **349.92** |
-| Peak output token throughput (tok/s) | 33.00 | **528.00** |
-| Total token throughput (tok/s) | 158.03 | **1749.62** |
-| Mean TTFT (ms) | **248.84** | 2035.54 |
-| Median TTFT (ms) | **248.84** | 2036.18 |
-| P99 TTFT (ms) | **251.27** | 3815.14 |
-| Mean TPOT (ms) | **30.79** | 37.92 |
-| Median TPOT (ms) | **30.77** | 37.96 |
-| P99 TPOT (ms) | **30.91** | 44.92 |
-| Median ITL (ms) | 30.78 | 30.93 |
+| Benchmark duration (s) | 45.03 | 75.80 |
+| Request throughput (req/s) | 0.36 | **3.38** |
+| Output token throughput (tok/s) | 32.09 | **304.39** |
+| Peak output token throughput (tok/s) | 34.00 | **544.00** |
+| Total token throughput (tok/s) | 351.94 | **3347.94** |
+| Mean TTFT (ms) | **134.60** | 323.77 |
+| Median TTFT (ms) | **134.67** | 250.95 |
+| P99 TTFT (ms) | **135.75** | 1703.99 |
+| Mean TPOT (ms) | **30.00** | 49.19 |
+| Median TPOT (ms) | **29.98** | 50.47 |
+| P99 TPOT (ms) | **30.16** | 60.33 |
+| Median ITL (ms) | 29.98 | 30.05 |
+| P99 ITL (ms) | 30.69 | 408.24 |
 
 ### 结果分析
 
-- **吞吐量线性扩展良好**：从并发 1 到并发 16，输出吞吐从 31.6 tok/s 提升至 349.9 tok/s，约 **11 倍**提升
-- **单请求延迟优秀**：并发 1 时 TTFT 仅 249ms，TPOT 30.8ms
-- **ITL 稳定**：并发 16 时 Median ITL（30.93ms）与并发 1（30.78ms）几乎一致，说明 batching 效率高
-- **TTFT 增加符合预期**：并发 16 时 TTFT 增至 2s，主要是排队等待导致
-- **Peak 吞吐达到 528 tok/s**（输出）和 1750 tok/s（总），仅使用 2 个 Trainium2 Chips
+- **吞吐量线性扩展良好**：从并发 1 到并发 16，输出吞吐从 32 tok/s 提升至 304 tok/s，约 **9.5 倍**提升
+- **单请求延迟优秀**：并发 1 时 TTFT 仅 135ms，TPOT 30ms
+- **ITL 稳定**：并发 16 时 Median ITL（30.05ms）与并发 1（29.98ms）几乎一致
+- **P99 ITL 存在毛刺**：并发 16 时 P99 ITL 408ms，原因是 Neuron 调度器将 Prefill 和 Decode 分开调度（见下文）
+- **Peak 吞吐达到 544 tok/s**（输出）和 3348 tok/s（总），仅使用 2 个 Trainium2 Chips
+
+### 调度机制说明
+
+vllm-neuron 使用 ，其调度特点：
+
+1. **Prefill 和 Decode 分开执行**：当有等待 prefill 的请求时，会暂停所有 decode，先完成 prefill
+2. **Prefill 批大小为 1**：每次只 prefill 一个请求
+3. 这意味着当多个请求同时到达时，需要逐个 prefill，后续请求的 TTFT 会增加
+4. 建议 benchmark 时使用  参数，让输入输出长度有随机性，避免所有请求同时完成导致 TTFT 虚高
