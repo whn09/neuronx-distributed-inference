@@ -130,6 +130,28 @@ python3 -m vllm.entrypoints.openai.api_server \
 - `--max-num-seqs 16`：最大并发序列数
 - `enable_bucketing`：启用 bucket 优化编译效率
 
+### 验证服务
+
+```bash
+# 测试 completions 接口
+curl -s http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/opt/dlami/nvme/Seed-OSS-36B-Instruct",
+    "prompt": "The capital of France is",
+    "max_tokens": 32
+  }' | python3 -m json.tool
+
+# 测试 chat completions 接口
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/opt/dlami/nvme/Seed-OSS-36B-Instruct",
+    "messages": [{"role": "user", "content": "What is 1+1? Answer briefly."}],
+    "max_tokens": 32
+  }' | python3 -m json.tool
+```
+
 ## Benchmark 方法
 
 ### 并发 1
@@ -180,8 +202,8 @@ vllm bench serve \
 | neuronx-distributed-inference | 0.8 |
 | vLLM | 0.13.0 |
 | vllm-neuron | 0.4.1 |
-| 输入长度 | 1024 tokens |
-| 输出长度 | 256 tokens |
+| 输入长度 | ~900 tokens (random-range-ratio=0.03) |
+| 输出长度 | ~90 tokens (random-range-ratio=0.03) |
 
 ### 结果对比
 
@@ -213,6 +235,70 @@ vllm bench serve \
 - **P99 ITL 存在毛刺**：并发 16 时 P99 ITL 408ms，原因是 Neuron 调度器将 Prefill 和 Decode 分开调度（见下文）
 - **Peak 吞吐达到 544 tok/s**（输出）和 3348 tok/s（总），仅使用 2 个 Trainium2 Chips
 
+
+## H100 对比测试
+
+### H100 测试环境
+
+| 项目 | 配置 |
+|------|------|
+| 实例类型 | p5.48xlarge |
+| GPU | 8x H100 80GB（使用其中 1 个） |
+| TP Degree | 1 |
+| vLLM | 0.17.0 |
+| 精度 | BF16 |
+| 测试参数 | input=900, output=90, random-range-ratio=0.03 |
+
+### H100 Benchmark 结果
+
+| 指标 | 并发 1 | 并发 16 |
+|------|--------|---------|
+| Successful requests | 16 | 256 |
+| Failed requests | 0 | 0 |
+| Benchmark duration (s) | 40.81 | 111.32 |
+| Request throughput (req/s) | 0.39 | 2.30 |
+| Output token throughput (tok/s) | 35.41 | 207.27 |
+| Peak output token throughput (tok/s) | 37.00 | 286.00 |
+| Total token throughput (tok/s) | 388.34 | 2279.76 |
+| Mean TTFT (ms) | 113.73 | 3362.40 |
+| Median TTFT (ms) | 106.61 | 3565.49 |
+| P99 TTFT (ms) | 199.80 | 5776.98 |
+| Mean TPOT (ms) | 27.28 | 37.98 |
+| Median TPOT (ms) | 27.28 | 36.61 |
+| P99 TPOT (ms) | 27.29 | 57.56 |
+| Median ITL (ms) | 27.28 | 29.78 |
+| P99 ITL (ms) | 27.76 | 200.53 |
+
+### Trn2 vs H100 对比分析
+
+#### 并发 1（单请求延迟）
+
+| 指标 | Trn2 (TP=8, 2 Chips) | H100 (TP=1, 1 GPU) | 对比 |
+|------|----------------------|---------------------|------|
+| Output throughput (tok/s) | 32.09 | 35.41 | H100 +10% |
+| Mean TTFT (ms) | 134.60 | 113.73 | H100 快 15% |
+| Mean TPOT (ms) | 30.00 | 27.28 | H100 快 9% |
+| Median ITL (ms) | 29.98 | 27.28 | H100 快 9% |
+
+#### 并发 16（高吞吐场景）
+
+| 指标 | Trn2 (TP=8, 2 Chips) | H100 (TP=1, 1 GPU) | 对比 |
+|------|----------------------|---------------------|------|
+| Output throughput (tok/s) | 304.39 | 207.27 | **Trn2 快 1.47x** |
+| Peak output throughput (tok/s) | 544.00 | 286.00 | **Trn2 快 1.90x** |
+| Total throughput (tok/s) | 3347.94 | 2279.76 | **Trn2 快 1.47x** |
+| Request throughput (req/s) | 3.38 | 2.30 | **Trn2 快 1.47x** |
+| Mean TTFT (ms) | 323.77 | 3362.40 | **Trn2 快 10.4x** |
+| Mean TPOT (ms) | 49.19 | 37.98 | H100 快 23% |
+| Median ITL (ms) | 30.05 | 29.78 | 持平 |
+
+#### 对比总结
+
+- **单请求延迟**：H100 略优，TTFT 快 15%，TPOT 快 9%，主要因为单卡无 TP 通信开销
+- **高并发吞吐**：**Trn2 全面领先**，输出吞吐 1.47x，请求吞吐 1.47x，Peak 吞吐 1.90x
+- **高并发 TTFT**：**Trn2 优势巨大**（324ms vs 3362ms），H100 单卡 VRAM 接近满载（36B BF16 ≈ 72GB / 80GB），KV cache 空间有限导致严重排队
+- **Median ITL 两者几乎一致**（~30ms vs ~28ms），说明单 token decode 速度相当
+- **性价比**：Trn2 仅使用 2 个 Chips（16 个中的 2 个），高并发下吞吐已超过单张 H100
 ### 调度机制说明
 
 vllm-neuron 使用 ，其调度特点：
