@@ -8,6 +8,7 @@ from neuronx_distributed_inference.models.mixtral.modeling_mixtral import Neuron
 from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
 from neuronx_distributed_inference.models.mllama.utils import add_instruct
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
+from neuronx_distributed_inference.models.seed_oss.modeling_seed_oss import NeuronSeedOssForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
 from neuronx_distributed_inference.models.qwen3_next.modeling_qwen3_next import NeuronQwen3NextForCausalLM
@@ -51,6 +52,7 @@ MODEL_TYPES = {
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
+    "seed_oss": {"causal-lm": NeuronSeedOssForCausalLM},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
     "qwen3_next": {"causal-lm": NeuronQwen3NextForCausalLM},
