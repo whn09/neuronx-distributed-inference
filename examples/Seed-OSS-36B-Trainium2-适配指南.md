@@ -152,6 +152,10 @@ curl -s http://localhost:8000/v1/chat/completions \
   }' | python3 -m json.tool
 ```
 
+### 验证服务
+
+
+
 ## Benchmark 方法
 
 ### 并发 1
