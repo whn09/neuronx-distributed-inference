@@ -23,6 +23,7 @@ Based on the Qwen3 NXD implementation. Key differences from Qwen3:
 
 from typing import List, Optional, Tuple, Type
 
+import gc
 import torch
 from torch import nn
 from transformers import SeedOssForCausalLM
@@ -192,6 +193,39 @@ class NeuronSeedOssModel(NeuronBaseModel):
         )
 
 
+
+def _helper_concat_and_delete_qkv(state_dict, layer_num, attr):
+    """Helper to concatenate Q/K/V into fused Wqkv and delete originals."""
+    q_key = f"layers.{layer_num}.self_attn.q_proj.{attr}"
+    k_key = f"layers.{layer_num}.self_attn.k_proj.{attr}"
+    v_key = f"layers.{layer_num}.self_attn.v_proj.{attr}"
+    if q_key in state_dict and k_key in state_dict and v_key in state_dict:
+        state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
+            [state_dict[q_key], state_dict[k_key], state_dict[v_key]],
+        )
+        del state_dict[q_key]
+        del state_dict[k_key]
+        del state_dict[v_key]
+
+
+def convert_state_dict_to_fused_qkv(state_dict, cfg: InferenceConfig):
+    """Concatenate separate Q/K/V weights and biases into fused Wqkv for all layers."""
+    mods_to_not_conv = getattr(cfg.neuron_config, "modules_to_not_convert", None)
+    if mods_to_not_conv is None:
+        mods_to_not_conv = []
+
+    for l in range(cfg.num_hidden_layers):
+        _helper_concat_and_delete_qkv(state_dict, l, "weight")
+        _helper_concat_and_delete_qkv(state_dict, l, "bias")  # Seed-OSS has QKV bias
+        if (
+            cfg.neuron_config.quantized_mlp_kernel_enabled or cfg.neuron_config.quantized
+        ) and f"layers.{l}.self_attn" not in mods_to_not_conv:
+            _helper_concat_and_delete_qkv(state_dict, l, "scale")
+
+    gc.collect()
+    return state_dict
+
+
 class NeuronSeedOssForCausalLM(NeuronBaseForCausalLM):
     """
     NXD inference implementation for Seed-OSS (ByteDance).
@@ -222,6 +256,10 @@ class NeuronSeedOssForCausalLM(NeuronBaseForCausalLM):
 
         # To facilitate rank usage in base model
         state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
+
+        if neuron_config.fused_qkv:
+            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
+
         return state_dict
 
     @classmethod
