@@ -236,7 +236,7 @@ class NeuronQwen3ForCausalLM(NeuronBaseForCausalLM):
 
     def get_compiler_args(self):
         compiler_args = "--enable-saturate-infinity --enable-mixed-precision-accumulation --auto-cast=none --model-type transformer -O2"
-        compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=1 --vectorize-strided-dma'"
+        compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2 --vectorize-strided-dma'"
         compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         return compiler_args
 
