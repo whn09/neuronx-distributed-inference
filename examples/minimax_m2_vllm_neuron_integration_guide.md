@@ -2,8 +2,8 @@
 
 本文档总结了 MiniMax M2 模型在 vLLM-Neuron 上的集成工作，包括独立编译脚本 v4 和 vLLM 自动编译流程的适配。
 
-**日期**: 2025-02-02
-**状态**: 独立编译 ✓ | vLLM 集成 (进行中)
+**日期**: 2025-02-02 (初始) / 2026-03-27 (vLLM 集成验证)
+**状态**: 独立编译 ✓ | vLLM 集成 ✓
 
 ---
 
@@ -31,8 +31,8 @@
 |------|------|------|
 | 独立编译 (v4 demo) | ✅ 成功 | 支持 EP、长上下文 |
 | 独立推理 | ✅ 成功 | generation_minimax_m2_v4_demo.py |
-| vLLM 自动编译 | ⚠️ 进行中 | XLA 类型兼容性问题 |
-| vLLM OpenAI API | ⚠️ 进行中 | 依赖自动编译 |
+| vLLM 自动编译 | ✅ 成功 | vLLM 0.16.0 + vllm-neuron release-0.5.0 |
+| vLLM OpenAI API | ✅ 成功 | 2026-03-27 在 trn2.48xlarge 上验证通过 |
 
 ---
 
@@ -286,60 +286,71 @@ class RouterTopKWithBias(RouterTopK):
 
 ## 5. 配置参考
 
-### 5.1 完整 vLLM 命令
+### 5.1 完整 vLLM 启动命令（已验证）
 
+以下命令已于 2026-03-27 在 trn2.48xlarge 上验证通过。
+
+**环境准备**:
+```bash
+# 激活 vLLM 0.16.0 环境
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+
+# 设置超时（大模型编译和加载需要较长时间）
+export VLLM_RPC_TIMEOUT=600000
+export VLLM_ENGINE_READY_TIMEOUT_S=7200
+
+# 使用 vllm-neuron 插件（release-0.5.0 分支）
+cd /home/ubuntu/vllm-neuron
+```
+
+**启动命令**:
 ```bash
 python3 -m vllm.entrypoints.openai.api_server \
     --model "/opt/dlami/nvme/model_hf/MiniMax-M2-BF16" \
     --tokenizer "/opt/dlami/nvme/model_hf/MiniMax-M2-BF16" \
     --tensor-parallel-size 64 \
-    --max-model-len 1024 \
+    --max-model-len 512 \
     --max-num-seqs 1 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --port 8000 \
-    --trust_remote_code \
+    --trust-remote-code \
     --additional-config '{
         "override_neuron_config": {
-            "tp_degree": 64,
-            "moe_tp_degree": 64,
-            "moe_ep_degree": 1,
-            "batch_size": 1,
-            "ctx_batch_size": 1,
-            "tkg_batch_size": 1,
-            "max_context_length": 1024,
-            "seq_len": 1024,
-            "is_continuous_batching": false,
-            "fused_qkv": true,
-            "on_device_sampling_config": {
-                "do_sample": true,
-                "temperature": 0.6,
-                "top_k": 20,
-                "top_p": 0.95
-            },
-            "enable_bucketing": false,
-            "flash_decoding_enabled": false,
-            "logical_nc_config": 2,
             "sequence_parallel_enabled": true,
+            "logical_nc_config": 2,
+            "fused_qkv": true,
+            "is_continuous_batching": false,
+            "async_mode": false,
+            "flash_decoding_enabled": false,
+            "enable_bucketing": true,
+            "context_encoding_buckets": [256],
+            "token_generation_buckets": [512],
+            "use_index_calc_kernel": true,
+            "moe_mask_padded_tokens": true,
             "qkv_kernel_enabled": false,
             "qkv_nki_kernel_enabled": false,
             "attn_kernel_enabled": false,
-            "async_mode": false,
-            "glu_mlp": true,
-            "use_index_calc_kernel": false,
-            "moe_mask_padded_tokens": true,
-            "disable_numeric_cc_token": true,
+            "strided_context_parallel_kernel_enabled": false,
             "router_config": {
                 "act_fn": "sigmoid",
                 "dtype": "float32"
             },
+            "glu_mlp": true,
+            "save_sharded_checkpoint": true,
             "blockwise_matmul_config": {
                 "use_shard_on_intermediate_dynamic_while": false,
                 "skip_dma_token": true
-            }
+            },
+            "disable_numeric_cc_token": true,
+            "scratchpad_page_size": 1024,
+            "moe_tp_degree": 64,
+            "moe_ep_degree": 1
         }
     }'
 ```
+
+> **注意**: 首次启动需要编译，编译时间约 22 分钟。编译产物会缓存到模型目录下的 `neuron-compiled-artifacts/`，后续启动将跳过编译。权重预分片（`save_sharded_checkpoint: true`）约需 20 分钟，峰值内存约 1.2TB。
 
 ### 5.2 关键配置参数说明
 
@@ -399,14 +410,59 @@ python3 -m vllm.entrypoints.openai.api_server \
 ### 6.3 测试 API
 
 ```bash
+# Chat Completion API
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/opt/dlami/nvme/model_hf/MiniMax-M2-BF16",
+    "messages": [{"role": "user", "content": "What is 25 * 37? Think step by step."}],
+    "max_tokens": 256,
+    "temperature": 0.6
+  }'
+
+# Completion API
 curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "MiniMax-M2-BF16",
+    "model": "/opt/dlami/nvme/model_hf/MiniMax-M2-BF16",
     "prompt": "Hello, ",
     "max_tokens": 50
   }'
 ```
+
+---
+
+## 7. Benchmark 结果
+
+### 7.1 测试环境
+
+| 项目 | 值 |
+|------|-----|
+| 实例类型 | trn2.48xlarge |
+| Neuron Cores | 32 (64 logical with NC=2) |
+| 系统内存 | 2TB |
+| 模型 | MiniMax-M2-BF16 (~434GB) |
+| TP | 64 (moe_tp_degree=64, moe_ep_degree=1) |
+| max_model_len | 512 |
+| max_num_seqs | 1 |
+| 日期 | 2026-03-27 |
+
+### 7.2 性能结果
+
+| 指标 | 值 |
+|------|-----|
+| 单请求吞吐 (BS=1, 256 output tokens) | **62.24 tok/s** |
+
+> **注意**: 当前配置为 `is_continuous_batching=false, max_num_seqs=1`，仅支持单请求。
+> 如需更高吞吐，可启用 continuous batching 并增大 batch_size，但需要重新编译。
+
+### 7.3 编译和加载时间
+
+| 阶段 | 时间 |
+|------|------|
+| 编译（首次，-O1） | ~22 分钟 |
+| 权重预分片 (save_sharded_checkpoint=true) | ~20 分钟 |
+| 加载已编译模型 + 已分片权重 | ~5 分钟 |
 
 ---
 
@@ -452,6 +508,6 @@ for k, v in neuron_state_dict.items():
 
 ---
 
-**更新日期**: 2025-02-02
-**版本**: v4
-**技术栈**: AWS Trainium2, Neuron SDK, vLLM-Neuron, NeuronX Distributed Inference
+**更新日期**: 2026-03-27
+**版本**: v4 + vLLM 集成验证
+**技术栈**: AWS Trainium2, Neuron SDK, vLLM 0.16.0, vllm-neuron release-0.5.0, NeuronX Distributed Inference

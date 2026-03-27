@@ -237,6 +237,145 @@ The original HuggingFace checkpoint uses FP8 quantized weights with block-wise 1
 
 Converting between these formats is not straightforward as it would require complete re-quantization, which loses the original quantization accuracy. For now, use BF16 mode by converting the checkpoint on a GPU machine first.
 
+## vLLM-Neuron 部署（已验证）
+
+### 环境准备
+
+```bash
+# 激活 vLLM 0.16.0 环境
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+
+# 设置超时（大模型编译和加载需要较长时间）
+export VLLM_RPC_TIMEOUT=600000
+export VLLM_ENGINE_READY_TIMEOUT_S=7200
+
+# 使用 vllm-neuron 插件（release-0.5.0 分支）
+cd /home/ubuntu/vllm-neuron
+```
+
+### 启动命令（EP=64，已验证）
+
+以下命令已于 2026-03-27 在 trn2.48xlarge 上验证通过。
+
+**关键点**: MiMo-V2-Flash 模型约 577GB（BF16），使用 TP=64 + 纯 tensor parallelism 在权重分片阶段会 OOM（峰值 >2TB）。
+必须使用 **Expert Parallelism (EP=64)** 配置：`moe_tp_degree=1, moe_ep_degree=64`，这样每个 rank 分配 4 个完整的 expert，峰值内存约 1.15TB。
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model "/opt/dlami/nvme/models/MiMo-V2-Flash-BF16" \
+    --tokenizer "/opt/dlami/nvme/models/MiMo-V2-Flash-BF16" \
+    --tensor-parallel-size 64 \
+    --max-model-len 1024 \
+    --max-num-seqs 32 \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --port 8000 \
+    --trust-remote-code \
+    --additional-config '{
+        "override_neuron_config": {
+            "tp_degree": 64,
+            "moe_tp_degree": 1,
+            "moe_ep_degree": 64,
+            "batch_size": 32,
+            "ctx_batch_size": 1,
+            "tkg_batch_size": 32,
+            "max_context_length": 1024,
+            "seq_len": 1024,
+            "is_continuous_batching": true,
+            "fused_qkv": false,
+            "on_device_sampling_config": {
+                "do_sample": true,
+                "temperature": 0.6,
+                "top_k": 20,
+                "top_p": 0.95
+            },
+            "enable_bucketing": true,
+            "context_encoding_buckets": [1024],
+            "token_generation_buckets": [1024],
+            "flash_decoding_enabled": false,
+            "logical_nc_config": 2,
+            "sequence_parallel_enabled": true,
+            "qkv_kernel_enabled": false,
+            "qkv_nki_kernel_enabled": false,
+            "qkv_cte_nki_kernel_fuse_rope": false,
+            "attn_kernel_enabled": false,
+            "strided_context_parallel_kernel_enabled": false,
+            "async_mode": true,
+            "glu_mlp": true,
+            "normalize_top_k_affinities": true,
+            "router_config": {
+                "act_fn": "sigmoid",
+                "dtype": "float32"
+            },
+            "use_index_calc_kernel": true,
+            "moe_mask_padded_tokens": true,
+            "blockwise_matmul_config": {
+                "use_shard_on_intermediate_dynamic_while": true,
+                "skip_dma_token": true
+            },
+            "disable_numeric_cc_token": true,
+            "scratchpad_page_size": 1024
+        }
+    }'
+```
+
+### 测试 API
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/opt/dlami/nvme/models/MiMo-V2-Flash-BF16",
+    "messages": [{"role": "user", "content": "What is 25 * 37? Think step by step."}],
+    "max_tokens": 256,
+    "temperature": 0.6
+  }'
+```
+
+### EP=64 vs TP=64 对比
+
+| 配置 | moe_tp_degree | moe_ep_degree | 权重分片峰值内存 | 结果 |
+|------|--------------|--------------|----------------|------|
+| 纯 TP | 64 | 1 | >2TB | OOM (内核 kill) |
+| 纯 EP | 1 | 64 | ~1.15TB | 成功 |
+
+**原理**: TP 需要将每个 expert 的权重切分到 64 个 rank 上（需要同时在内存中持有所有分片），而 EP 将完整的 expert 分配到不同 rank（256 experts / 64 ranks = 4 experts/rank），大幅降低分片阶段的内存占用。
+
+## Benchmark 结果
+
+### 测试环境
+
+| 项目 | 值 |
+|------|-----|
+| 实例类型 | trn2.48xlarge |
+| Neuron Cores | 32 (64 logical with NC=2) |
+| 系统内存 | 2TB |
+| 模型 | MiMo-V2-Flash-BF16 (~577GB) |
+| 配置 | EP=64 (moe_tp_degree=1, moe_ep_degree=64) |
+| max_model_len | 1024 |
+| max_num_seqs | 32 |
+| 日期 | 2026-03-27 |
+
+### 性能结果
+
+| 并发数 (Batch Size) | 吞吐量 (tok/s) | 单请求平均延迟 (256 tokens) |
+|--------------------|---------------|--------------------------|
+| BS=1 | 29.92 | 8.56s |
+| BS=8 | 215.94 | 9.48s |
+| BS=32 | **649.14** | 12.60s |
+
+### 编译和加载时间
+
+| 阶段 | 时间 |
+|------|------|
+| 编译（首次，-O3） | ~10 分钟（605 秒） |
+| 权重分片加载 (EP=64, on-load sharding) | ~58 分钟 |
+| 峰值内存（权重分片阶段） | ~1.15TB |
+| 运行态内存 | ~49GB（权重已加载到 Neuron 设备） |
+
+> **注意**: 编译产物会缓存到模型目录下的 `neuron-compiled-artifacts/`，后续启动只需权重加载。
+> 如需加速权重加载，可考虑使用 `save_sharded_checkpoint: true` 预分片到磁盘（但需要足够的磁盘空间存储 64 份分片）。
+
 ## References
 
 - [MiMo-V2-Flash on HuggingFace](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
@@ -247,6 +386,7 @@ Converting between these formats is not straightforward as it would require comp
 
 | Date | Changes |
 |------|---------|
+| 2026-03-27 | Added vLLM-Neuron deployment guide with EP=64 config and benchmark results |
 | 2025-01-28 | Fixed attention_sink_bias missing in token generation path (was causing garbage output) |
 | 2025-01-21 | Simplified to BF16-only mode (native FP8 not supported due to scale format incompatibilities) |
 | 2025-01-20 | Implemented CONVERT_TO_MHA for TP=32 support |
