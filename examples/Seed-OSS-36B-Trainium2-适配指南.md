@@ -79,6 +79,16 @@ if model == "seedoss":
     model = "seed_oss"
 ```
 
+### 挂载 NVMe 磁盘
+
+trn2.48xlarge 自带 4 块 NVMe SSD（共约 7TB），需要先组建 RAID0 并挂载到 `/opt/dlami/nvme`：
+
+```bash
+curl -sL https://raw.githubusercontent.com/whn09/aws-neuron-samples/master/torch-neuronx/inference/hf_pretrained_wan2.2_ti2v/setup_nvme.sh -o /tmp/setup_nvme.sh
+chmod +x /tmp/setup_nvme.sh
+echo yes | sudo /tmp/setup_nvme.sh
+```
+
 ### 安装
 
 ```bash
