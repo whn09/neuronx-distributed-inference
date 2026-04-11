@@ -222,19 +222,20 @@ See `perf_test/2_bench_minimax_m2.sh` for full benchmark configurations with BS=
 
 ### NKI Kernel Compatibility
 
-At TP=32, the expert intermediate dimension per rank is `1536/32 = 48`, which falls below the 128-element minimum required by fused MoE NKI kernels. This means the highest-impact kernels are structurally incompatible at the only viable TP degree.
+Tested on-device with SDK 2.29 (NKI 0.3.0). At TP=32, the expert intermediate dimension per rank is `1536/32 = 48`.
 
-| Kernel | Compatible? | Impact | Notes |
-|--------|-------------|--------|-------|
-| Fused MoE expert MLP | No (I=48 < 128) | Very High | Blocked at TP=32 |
-| Router Top-K | Yes | Low | Works with sigmoid + bias |
-| Attention TKG | Yes | Moderate | Can be enabled via flag |
-| Fused QKV | Partially | Low | Small matmul at TP=32 |
+| Kernel | On-Device Result | Throughput | Notes |
+|--------|-----------------|------------|-------|
+| Fused MoE expert MLP | Compiles and runs | **48.9 tok/s** (-2.4% vs baseline) | I=48 padded internally; 6x slower load time |
+| Router Top-K | Works (tested with fused MoE) | Included above | Negligible impact alone |
+| Attention TKG | **BLOCKED** | N/A | Partial RoPE incompatible: `cos shape mismatch: expected (64,1,1), got (32,1,1)` |
+| Fused QKV | Prerequisite for attn NKI | N/A | Cannot test without attention kernel |
 
-Potential paths to enable fused MoE NKI kernels:
-- **EP=4 at TP=8**: I/TP = 1536/8 = 192 (NKI-compatible), but requires 32 total ranks (multi-node)
-- **INT8 quantization + lower TP**: May allow TP=4 (I=384, NKI-compatible) if weights fit in HBM
-- **NKI kernel enhancement**: Relax the 128-element alignment for sub-128 dimensions
+**MoE NKI kernel**: Compiles and produces correct output at I=48 (SDK 2.29 handles sub-128 dimensions via internal padding). However, the 2.4% throughput regression and 6.3x slower load time (1778s vs 284s) make it counterproductive at TP=32. The kernel would benefit models with I/TP >= 128.
+
+**Attention NKI kernel**: Fails at NKI compile time due to partial RoPE (`rotary_dim=64 < head_dim=128`). The kernel expects full-dimension rotary embeddings and does not support `rotary_dim < head_dim`. This is a structural incompatibility.
+
+**Recommendation**: Do not enable NKI kernels at TP=32. Both are either counterproductive (MoE) or incompatible (attention). Lower TP degrees that increase I/TP and use full-dimension RoPE models would benefit from these kernels.
 
 ## Compatibility Matrix
 
