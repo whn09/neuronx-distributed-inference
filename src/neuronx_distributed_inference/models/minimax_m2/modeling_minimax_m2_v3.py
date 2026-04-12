@@ -52,6 +52,17 @@ from neuronx_distributed_inference.models.model_wrapper import (
 from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
 )
+
+# nki-library attention block kernel (partial RoPE support)
+try:
+    from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg
+    from nkilib.core.utils.common_types import (
+        QuantizationType as NkilibQuantizationType,
+    )
+
+    _HAS_NKILIB_ATTN_BLOCK = True
+except ImportError:
+    _HAS_NKILIB_ATTN_BLOCK = False
 from neuronx_distributed_inference.modules.attention.gqa import GQA
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
@@ -850,6 +861,236 @@ class NeuronMiniMaxM2AttentionV3(NeuronAttentionBase):
                 Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
 
         return Q, K, cos_cache, sin_cache
+
+    def attention_block_tokengen_nki_kernel(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        active_mask=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+        rotary_position_ids=None,
+        update_kv_per_layer=True,
+        active_block_table=None,
+        use_polar_compatible_rope=False,
+    ):
+        """
+        Override base class to use nki-library attention_block_tkg kernel with
+        partial RoPE support (rotary_dim < head_dim).
+
+        Uses the nki-library kernel instead of the compiler's private kernel.
+        QK norm is NOT fused into this kernel — MiniMax-M2's flat QK norm is
+        architecturally incompatible with the kernel's per-head norm. This matches
+        the base class behavior which also skips QK norm (use_qk_norm=False).
+        """
+        assert _HAS_NKILIB_ATTN_BLOCK, (
+            "nki-library attention_block_tkg not available. "
+            "Install the nki-library fork with partial RoPE support."
+        )
+
+        from neuronx_distributed.parallel_layers.mappings import (
+            gather_from_sequence_parallel_region,
+            reduce_from_tensor_model_parallel_region,
+            reduce_scatter_to_sequence_parallel_region,
+            gather_from_tensor_model_parallel_region_with_dim,
+            reduce_scatter_to_tensor_model_parallel_region_with_dim,
+        )
+        from neuronx_distributed_inference.modules.attention.attention_base import (
+            EPDispatchOption,
+            get_data_parallel_attention_dp_group,
+        )
+        from neuronxcc.nki.language import nc
+
+        if (
+            self.sequence_parallel_enabled
+            and self.tensor_model_parallel_group is not None
+        ):
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states,
+                self.sequence_dimension,
+                process_group=self.tensor_model_parallel_group,
+            )
+
+        # Get shapes
+        bsz, s_tkg, h = hidden_states.shape
+        h_out = h // 2 if self.is_eagle3_draft else h
+        num_q_heads = self.num_heads
+
+        # Prepare rmsnorm params
+        rmsnorm_enabled = rmsnorm is not None
+        W_gamma = rmsnorm.weight.data.unsqueeze(0) if rmsnorm is not None else None
+
+        # Prepare RoPE params
+        rope_contiguous_layout = not use_polar_compatible_rope
+
+        if self.rotary_emb is not None:
+            if cos_cache is None or sin_cache is None:
+                cos_cache, sin_cache = self.rotary_emb(
+                    hidden_states, rotary_position_ids
+                )
+                # Take first half and reshape to [dim//2, batch_size, seq_len]
+                cos_cache = cos_cache[..., : cos_cache.shape[-1] // 2].permute(2, 0, 1)
+                sin_cache = sin_cache[..., : sin_cache.shape[-1] // 2].permute(2, 0, 1)
+        elif use_polar_compatible_rope:
+            from neuronx_distributed.modules.attention.utils import precompute_freqs_cis
+
+            rotary_freqs = precompute_freqs_cis(
+                self.head_dim,
+                self.neuron_config.max_context_length * 2,
+                self.rope_theta,
+                self.use_scaled_rope,
+                device=hidden_states.device,
+            )
+            rotary_freqs = rotary_freqs[position_ids]
+            cos_cache = rotary_freqs.cos().permute(2, 0, 1)
+            sin_cache = rotary_freqs.sin().permute(2, 0, 1)
+        else:
+            cos_cache = None
+            sin_cache = None
+
+        # Prepare attention mask: merge active_mask and transpose for kernel layout
+        attention_mask = attention_mask.expand(-1, num_q_heads, -1, -1)
+        expected_active_mask_shape = (bsz, 1, s_tkg, s_tkg)
+        if s_tkg == 1:
+            active_mask = torch.ones(
+                expected_active_mask_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            assert active_mask.shape == expected_active_mask_shape, (
+                f"{active_mask.shape} != {expected_active_mask_shape}"
+            )
+        active_mask = active_mask.expand(-1, num_q_heads, -1, -1)
+        attention_mask[:, :, :, -s_tkg:] = active_mask
+        # Transpose to [S_ctx, B, q_heads, S_tkg] for nki-library kernel
+        attention_mask = attention_mask.permute(3, 0, 1, 2)
+
+        # Prepare KV cache
+        K_prior, V_prior = past_key_value[:2]
+        K_prior = K_prior.data
+        V_prior = V_prior.data
+        update_cache_in_kernel = (
+            update_kv_per_layer and self.attn_block_tkg_nki_kernel_cache_update
+        )
+        sink = (
+            self.get_learned_sinks().data.unsqueeze(-1)
+            if self.learned_sinks_size is not None
+            else None
+        )
+        kv_cache_update_idx = position_ids[:, :1].to(torch.int32)
+
+        # Prepare output projection
+        W_out = self.get_o_proj().o_proj.weight.data
+        if self.o_bias:
+            W_out_bias = (
+                self.get_o_proj().o_proj.bias.data / self.tp_degree
+            ).unsqueeze(0)
+        else:
+            W_out_bias = None
+
+        # Prepare QKV projection
+        W_qkv = self.get_qkv_proj().Wqkv.weight.data
+        bias_qkv = (
+            self.get_qkv_proj().Wqkv.bias.data.unsqueeze(0) if self.qkv_bias else None
+        )
+
+        grid = (nc(self.logical_nc_config),)
+
+        attn_output, K, V = attention_block_tkg[grid](
+            # -- input
+            X=hidden_states,
+            X_hidden_dim_actual=getattr(self.config, "original_hidden_size", None),
+            # -- rmsnorm X
+            rmsnorm_X_enabled=rmsnorm_enabled,
+            rmsnorm_X_eps=self.rms_norm_eps,
+            rmsnorm_X_gamma=W_gamma,
+            # -- qkv projections
+            W_qkv=W_qkv,
+            bias_qkv=bias_qkv,
+            quantization_type_qkv=NkilibQuantizationType.NONE,
+            weight_dequant_scale_qkv=None,
+            input_dequant_scale_qkv=None,
+            # -- Q/K processing: pre-RoPE RMSNorm (disabled — MiniMax QK norm is
+            #    flat, not per-head, and cannot be expressed by the kernel)
+            rmsnorm_QK_pre_rope_enabled=False,
+            rmsnorm_QK_pre_rope_eps=0.0,
+            rmsnorm_QK_pre_rope_W_Q=None,
+            rmsnorm_QK_pre_rope_W_K=None,
+            # -- Q/K processing: RoPE with partial rotary_dim
+            cos=cos_cache,
+            sin=sin_cache,
+            rope_contiguous_layout=rope_contiguous_layout,
+            rotary_dim=self.rotary_dim,
+            # -- Q/K processing: post-RoPE RMSNorm (disabled)
+            rmsnorm_QK_post_rope_enabled=False,
+            rmsnorm_QK_post_rope_eps=0.0,
+            rmsnorm_QK_post_rope_W_Q=None,
+            rmsnorm_QK_post_rope_W_K=None,
+            # -- attention
+            K_cache_transposed=self.k_cache_transposed,
+            active_blocks_table=(
+                active_block_table.to(torch.uint32)
+                if active_block_table is not None
+                else None
+            ),
+            K_cache=K_prior,
+            V_cache=V_prior,
+            attention_mask=attention_mask,
+            sink=sink,
+            softmax_scale=None,
+            # -- KV cache update
+            update_cache=update_cache_in_kernel,
+            kv_cache_update_idx=kv_cache_update_idx,
+            # -- output projection
+            W_out=W_out,
+            bias_out=W_out_bias,
+            quantization_type_out=NkilibQuantizationType.NONE,
+            weight_dequant_scale_out=None,
+            input_dequant_scale_out=None,
+            transposed_out=False,
+            # -- output
+            out_in_sb=False,
+        )
+
+        # Reshape and reduce output
+        attn_output = attn_output.reshape((bsz, s_tkg, h_out))
+        if self.sequence_parallel_enabled:
+            attn_output = reduce_scatter_to_sequence_parallel_region(
+                attn_output, 1, process_group=self.tensor_model_parallel_group
+            )
+        else:
+            if self.ep_dispatch_cc_option == EPDispatchOption.AR_AG:
+                attn_output = reduce_from_tensor_model_parallel_region(
+                    attn_output, process_group=self.tensor_model_parallel_group
+                )
+            elif self.ep_dispatch_cc_option == EPDispatchOption.RS_AG:
+                attn_output = reduce_scatter_to_tensor_model_parallel_region_with_dim(
+                    attn_output,
+                    partition_dim=0,
+                    process_group=self.tensor_model_parallel_group,
+                )
+            elif self.ep_dispatch_cc_option == EPDispatchOption.AG_AR:
+                attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                    attn_output,
+                    gather_dim=0,
+                    process_group=get_data_parallel_attention_dp_group(),
+                )
+            else:
+                raise ValueError(
+                    f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}"
+                )
+
+        # KV cache handling
+        if update_cache_in_kernel:
+            KV = past_key_value
+        else:
+            KV = (K, V)
+
+        return attn_output, KV, cos_cache, sin_cache
 
 
 # ---------------------------------------------------------------------------
