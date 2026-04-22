@@ -1371,10 +1371,10 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
             self.neuron_config.pre_rope_rmsnorm = True
             args += " --internal-max-instruction-limit=15000000"
 
-        # FP8 expert weights require the OCP->IEEE-754 FP8 format translation flag.
-        # PyTorch uses float8_e4m3fn (OCP format) but Neuron uses float8_e4m3 (IEEE).
-        if getattr(self.neuron_config, "quantized", False):
-            args += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+        # Note: In SDK 2.28 (neuronx-cc 2.22), FP8 required the flag
+        # --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 for OCP->IEEE format translation.
+        # In SDK 2.29 (neuronx-cc 2.24), this flag was removed — FP8 format handling
+        # is built-in. No additional compiler flag needed for FP8 expert weights.
 
         return args
 

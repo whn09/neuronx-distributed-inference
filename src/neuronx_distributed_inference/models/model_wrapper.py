@@ -179,7 +179,9 @@ class ModelWrapper(torch.nn.Module):
             or self.neuron_config.quantized_mlp_kernel_enabled
             or self.neuron_config.activation_quantization_type
         ):
-            hlo2tensorizer += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 "
+            # Note: --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 was removed in
+            # neuronx-cc 2.24 (SDK 2.29). FP8 format handling is now built-in.
+            pass
 
         if hlo2tensorizer:
             self.compiler_args += f" --internal-hlo2tensorizer-options='{hlo2tensorizer} --verify-hlo=true' "
