@@ -414,16 +414,24 @@ def initialize_minimax_m2_moe_module(
                 ),
                 requires_grad=False,
             )
-            # Copy ALL custom attributes from old weight (expert-parallel,
-            # tensor-model-parallel, partition_dim, partition_stride, etc.)
-            for attr in dir(old_weight):
-                if attr.startswith("_"):
-                    continue
-                if not hasattr(proj.weight, attr):
-                    try:
-                        setattr(proj.weight, attr, getattr(old_weight, attr))
-                    except (AttributeError, TypeError):
-                        pass
+            # Copy NxD parallel attributes from old weight.
+            # Required by shard_children() for tensor-parallel sharding and
+            # expert-parallel assignment.
+            _NXD_WEIGHT_ATTRS = [
+                # tensor_model_parallel attributes (set by set_tensor_model_parallel_attributes)
+                "tensor_model_parallel",
+                "partition_dim",
+                "partition_stride",
+                "num_partitions",
+                "rank_ordering",
+                # expert-parallel attributes (set by _mark_expert_parallel_weights)
+                "expert_model_parallel",
+                "is_prefill",
+                "expert_distribution",
+            ]
+            for attr in _NXD_WEIGHT_ATTRS:
+                if hasattr(old_weight, attr):
+                    setattr(proj.weight, attr, getattr(old_weight, attr))
             del old_weight
 
             # Register .scale buffer for load_state_dict to populate.
