@@ -172,10 +172,13 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         ),
         # Bucketing disabled — single context length for HBM-constrained config
         enable_bucketing=False,
-        # NKI MoE kernels: disabled at TP=32 because intermediate_size/TP=48
-        # which causes overhead from internal padding to 128 in the NKI kernel.
-        router_topk_nki_kernel_enabled=False,
-        expert_mlp_nki_kernel_enabled=False,
+        # NKI MoE kernels: For BF16, disabled at TP=32 because intermediate_size/TP=48
+        # causes overhead from internal padding to 128 in the NKI kernel.
+        # For FP8, MUST be enabled because the CTE blockwise and selective-loading
+        # forward paths don't apply FP8 dequantization scales — only the NKI
+        # blockwise matmul kernel handles FP8 scale tensors correctly.
+        router_topk_nki_kernel_enabled=use_fp8,
+        expert_mlp_nki_kernel_enabled=use_fp8,
         # NKI attention block kernel (fused QKV + RoPE + attention + KV cache)
         attn_block_tkg_nki_kernel_enabled=use_nki_attn,
         attn_block_tkg_nki_kernel_cascaded_attention=use_nki_attn,
@@ -223,8 +226,10 @@ def main():
 
     # FP8 MoE requires UNSAFE_FP8FNCAST=1 for torch_neuronx XLA tracing to
     # accept float8_e4m3fn tensors. Must be set before model trace/compile.
+    # XLA_HANDLE_SPECIAL_SCALAR=1 is also required for correct FP8 scalar handling.
     if args.quantized_checkpoints_path is not None:
         os.environ["UNSAFE_FP8FNCAST"] = "1"
+        os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
 
     print(f"Loading tokenizer from {args.model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
