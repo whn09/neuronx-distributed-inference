@@ -136,17 +136,16 @@ from nkilib.core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 logger = get_logger("attention_cte")
 
+# Feature check: NKI 0.3.0 (SDK 2.29) removed enable_stack_allocator and does not
+# support the address= parameter in nl.ndarray. We detect this at import time so we
+# can branch without try/except (which NKI 0.3.0 also forbids).
+# Additionally, NKI 0.3.0 cannot resolve module-level function references from within
+# kernel code ("unbound variable" error), so we inline nl.ndarray calls directly.
+_HAS_STACK_ALLOCATOR = hasattr(nl, "enable_stack_allocator")
 
-def _psum_ndarray_with_address(shape, dtype, address):
-    """Allocate PSUM tensor with address= if supported, without if not.
-
-    Same rationale as _ndarray_with_address in modular_allocator: the address=
-    parameter may not be supported in all NKI compilation contexts.
-    """
-    try:
-        return nl.ndarray(shape, dtype=dtype, buffer=nl.psum, address=address)
-    except TypeError:
-        return nl.ndarray(shape, dtype=dtype, buffer=nl.psum)
+# Minimum float32 value — used for masked attention positions (e.g., causal mask).
+# This was originally defined in attention_bwd.py but used here without import.
+_FLOAT32_MIN: float = -3.4028235e38
 
 
 """
@@ -1829,7 +1828,7 @@ def _load_q_tile(
                 shape=(_Q_GRP_SZ, d), dtype=load_dtype
             )
             tp_dt = load_dtype
-            psum_buf = _psum_ndarray_with_address((d, _Q_GRP_SZ), tp_dt, (0, 0))
+            psum_buf = nl.ndarray((d, _Q_GRP_SZ), dtype=tp_dt, buffer=nl.psum)
 
             num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ)
             # Convert load() to access pattern
@@ -2002,8 +2001,8 @@ def _load_k_tile(
                     sbuf_addr_max, local_allocator.get_current_address()
                 )
                 tp_dt = load_dtype
-                psum_buf = _psum_ndarray_with_address(
-                    (d, num_pe_tps, sb_p), tp_dt, (0, 0)
+                psum_buf = nl.ndarray(
+                    (d, num_pe_tps, sb_p), dtype=tp_dt, buffer=nl.psum
                 )
 
                 if load_offset is not None:

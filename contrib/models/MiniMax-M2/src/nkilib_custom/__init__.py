@@ -20,7 +20,7 @@ Modified files:
   core/attention/attention_cte.py    - tile_size constants + psum address fallback
   core/embeddings/rope.py            - rotary_dim parameter for partial RoPE
   core/utils/kernel_helpers.py       - num_programs() None check
-  core/utils/modular_allocator.py    - _ndarray_with_address() fallback
+  core/utils/modular_allocator.py    - NKI 0.3.0 compat (inline nl.ndarray, no address=)
   experimental/transformer/attention_block_tkg.py - Flat QK RMSNorm, KV cache B=1 fix,
                                                     rotary_dim threading, signature changes
   experimental/transformer/transformer_tkg.py     - Updated callers for new mandatory params

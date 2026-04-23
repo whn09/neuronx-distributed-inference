@@ -31,21 +31,12 @@ from nkilib.core.utils.allocator import align_to as align_to_fn
 from nkilib.core.utils.allocator import sizeinbytes
 from nkilib.core.utils.kernel_assert import kernel_assert
 
-
-def _ndarray_with_address(shape, dtype, buffer, address):
-    """Allocate nl.ndarray with address= if supported, without if not.
-
-    The `address=` parameter requires `enable_stack_allocator` to be active.
-    In some torchxla tracing contexts, the stack allocator hook may not
-    propagate correctly (e.g., through inlined sub-functions). In that case,
-    fall back to allocation without explicit address, which lets the compiler
-    handle memory placement automatically (less optimal but functional).
-    """
-    try:
-        return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, address=address)
-    except TypeError:
-        # Stack allocator not active — fall back to compiler-managed allocation
-        return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer)
+# Feature check: NKI 0.3.0 (SDK 2.29) removed enable_stack_allocator and does not
+# support the address= parameter in nl.ndarray. We detect this at import time so we
+# can branch without try/except (which NKI 0.3.0 also forbids).
+# Additionally, NKI 0.3.0 cannot resolve module-level function references from within
+# kernel code ("unbound variable" error), so we inline nl.ndarray calls directly.
+_HAS_STACK_ALLOCATOR = hasattr(nl, "enable_stack_allocator")
 
 
 class ModularAllocator(nl.NKIObject):
@@ -199,11 +190,10 @@ class ModularAllocator(nl.NKIObject):
 
         # Handle empty block_dim case - return a single tensor
         if len(block_dim) == 0:
-            tensor = _ndarray_with_address(
+            tensor = nl.ndarray(
                 shape=shape,
                 dtype=dtype,
                 buffer=nl.sbuf,
-                address=(base_partition, self._current_address),
             )
             self._current_address += tile_size_bytes
             return tensor
@@ -254,11 +244,10 @@ def _allocate_recursive(
             addr_offset += idx * stride
             stride *= num_free_tiles[dim_idx]
 
-        tensor = _ndarray_with_address(
+        tensor = nl.ndarray(
             shape=shape,
             dtype=dtype,
             buffer=nl.sbuf,
-            address=(base_partition, sca + addr_offset * tile_size_bytes),
         )
         return tensor
     else:
