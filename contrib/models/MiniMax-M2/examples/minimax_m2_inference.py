@@ -29,19 +29,20 @@ Usage:
         --max-new-tokens 128 \
         --enable-nki-attention
 
-    # With FP8 MoE weights (halves MoE HBM, allows longer context):
+    # With FP8 checkpoint, dequanted to BF16 (recommended — avoids CTE DGE issue):
     # Step 1: Preprocess the FP8 checkpoint
     python conversion_script/preprocess_minimax_m2_fp8.py \
         --hf_model_path /mnt/models/MiniMax-M2 \
         --save_path /mnt/models/MiniMax-M2-fp8-neuron
-    # Step 2: Run with --quantized-checkpoints-path
+    # Step 2: Run with --fp8-dequant (loads FP8, dequants to BF16 during conversion)
     python minimax_m2_inference.py \
         --model-path /mnt/models/MiniMax-M2-fp8-neuron \
-        --compiled-model-path /mnt/models/MiniMax-M2-compiled-fp8 \
+        --compiled-model-path /mnt/models/MiniMax-M2-compiled-fp8dq \
         --quantized-checkpoints-path /mnt/models/MiniMax-M2-fp8-neuron \
+        --fp8-dequant \
         --tp-degree 32 \
         --batch-size 1 \
-        --max-context-length 512 \
+        --max-context-length 128 \
         --max-new-tokens 128
 """
 
@@ -118,8 +119,16 @@ def parse_args():
         type=str,
         default=None,
         help="Path to preprocessed FP8 checkpoint (from preprocess_minimax_m2_fp8.py). "
-        "Enables FP8 MoE inference, halving expert weight HBM and allowing "
-        "longer context lengths.",
+        "When used with --fp8-dequant (recommended): loads FP8 checkpoint, dequantizes "
+        "expert weights to BF16 during conversion, model runs in BF16. "
+        "Without --fp8-dequant: attempts native FP8 inference (blocked by compiler DGE issue).",
+    )
+    parser.add_argument(
+        "--fp8-dequant",
+        action="store_true",
+        help="Dequantize FP8 expert weights to BF16 during checkpoint loading. "
+        "Model runs entirely in BF16 — avoids CTE DGE compiler issue in SDK 2.29. "
+        "Requires --quantized-checkpoints-path or FP8 checkpoint at --model-path.",
     )
     return parser.parse_args()
 
@@ -144,12 +153,23 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
 
     use_nki_attn = args.enable_nki_attention
     use_fp8 = args.quantized_checkpoints_path is not None
+    fp8_dequant = getattr(args, "fp8_dequant", False)
+    # Native FP8 inference (quantized=True) — only when FP8 checkpoint provided
+    # AND --fp8-dequant is NOT set. With --fp8-dequant, weights are dequanted
+    # to BF16 during conversion and the model runs in BF16.
+    use_fp8_native = use_fp8 and not fp8_dequant
     if use_nki_attn:
         print(
             "INFO: NKI attention kernel enabled with in-kernel KV cache update "
             "(cache_update=True). Expected ~54 tok/s vs ~44 tok/s baseline."
         )
-    if use_fp8:
+    if use_fp8 and fp8_dequant:
+        print(
+            f"INFO: FP8 dequant mode. Loading FP8 checkpoint from "
+            f"{args.quantized_checkpoints_path or args.model_path}, dequantizing "
+            f"expert weights to BF16 during conversion. Model runs in BF16."
+        )
+    elif use_fp8:
         print(
             f"INFO: FP8 MoE inference enabled. Loading preprocessed checkpoint from "
             f"{args.quantized_checkpoints_path}. Expert weights stay in FP8 (1 byte/param "
@@ -172,14 +192,12 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         ),
         # Bucketing disabled — single context length for HBM-constrained config
         enable_bucketing=False,
-        # NKI MoE kernels: For BF16, disabled at TP=32 because intermediate_size/TP=48
+        # NKI MoE kernels: For native FP8 (use_fp8_native), enable NKI TKG kernels
+        # (MoEFusedTKG handles FP8 scales correctly).
+        # For fp8-dequant or BF16: disabled at TP=32 because intermediate_size/TP=48
         # causes overhead from internal padding to 128 in the NKI kernel.
-        # For FP8, MUST be enabled — the standard CTE forward paths
-        # (torch_blockwise_matmul_inference, forward_selective_loading) don't apply
-        # FP8 dequantization scales. Only the NKI kernels (BlockwiseMatmulNKIFunc
-        # for CTE, MoEFusedTKG for TKG) handle FP8 scale tensors correctly.
-        router_topk_nki_kernel_enabled=use_fp8,
-        expert_mlp_nki_kernel_enabled=use_fp8,
+        router_topk_nki_kernel_enabled=use_fp8_native,
+        expert_mlp_nki_kernel_enabled=use_fp8_native,
         # NKI attention block kernel (fused QKV + RoPE + attention + KV cache)
         attn_block_tkg_nki_kernel_enabled=use_nki_attn,
         attn_block_tkg_nki_kernel_cascaded_attention=use_nki_attn,
@@ -188,20 +206,21 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         qkv_kernel_enabled=use_nki_attn,
         # fused_qkv=True always — uses fused QKV weight for cleaner loading
         fused_qkv=True,
-        # FP8 MoE quantization: keep expert weights in FP8 with .scale tensors.
-        # The preprocessing script rescales from OCP range (448) to Neuron (240).
-        quantized=use_fp8,
-        quantized_checkpoints_path=args.quantized_checkpoints_path,
+        # FP8 MoE quantization: only enable when using native FP8 (not dequant mode).
+        # In dequant mode, quantized=False and weights are BF16 at runtime.
+        quantized=use_fp8_native,
+        quantized_checkpoints_path=args.quantized_checkpoints_path
+        if use_fp8_native
+        else None,
         quantization_type="per_channel_symmetric"
-        if use_fp8
+        if use_fp8_native
         else "per_tensor_symmetric",
-        quantization_dtype="f8e4m3" if use_fp8 else "int8",
+        quantization_dtype="f8e4m3" if use_fp8_native else "int8",
         # Per-channel scales (preprocessing converts blockwise->per-channel)
         quantization_block_size=None,
         quantization_block_axis=None,
-        # Exclude ALL modules from NxD convert(). Attention is BF16 (dequantized
-        # in preprocessing). MoE expert weights use MoEFusedTKG's internal FP8
-        # path (scale tensors passed to NKI kernel), not NxD quantization.
+        # Exclude ALL modules from NxD convert() when native FP8.
+        # In dequant mode, no convert() is called (quantized=False).
         modules_to_not_convert=[
             "self_attn",
             "lm_head",
@@ -211,7 +230,7 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
             "expert_mlps",
             "router",
         ]
-        if use_fp8
+        if use_fp8_native
         else None,
     )
 
@@ -228,10 +247,13 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
 def main():
     args = parse_args()
 
-    # FP8 MoE requires UNSAFE_FP8FNCAST=1 for torch_neuronx XLA tracing to
+    # FP8 native inference requires UNSAFE_FP8FNCAST=1 for torch_neuronx XLA tracing to
     # accept float8_e4m3fn tensors. Must be set before model trace/compile.
     # XLA_HANDLE_SPECIAL_SCALAR=1 is also required for correct FP8 scalar handling.
-    if args.quantized_checkpoints_path is not None:
+    # NOT needed for --fp8-dequant mode (model is BF16, no FP8 in XLA graph).
+    if args.quantized_checkpoints_path is not None and not getattr(
+        args, "fp8_dequant", False
+    ):
         os.environ["UNSAFE_FP8FNCAST"] = "1"
         os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
 

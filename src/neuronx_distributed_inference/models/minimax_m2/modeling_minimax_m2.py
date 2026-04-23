@@ -144,6 +144,33 @@ def convert_state_dict_to_fused_qkv(state_dict: Dict[str, Any], cfg: InferenceCo
     return state_dict
 
 
+def _dequant_fp8_weight(
+    weight: torch.Tensor, scale: torch.Tensor, target_dtype: torch.dtype
+) -> torch.Tensor:
+    """Dequantize an FP8 weight tensor using its scale, returning target_dtype.
+
+    Supports:
+      - Per-channel scale (1D): weight [I, H] * scale [I] -> [I, H] in target_dtype
+      - Blockwise scale (2D): weight [I, H] * expanded_scale [I, H] -> [I, H] in target_dtype
+    """
+    w_f32 = weight.to(torch.float32)
+    s_f32 = scale.to(torch.float32)
+    if s_f32.dim() == 1:
+        # Per-channel: scale[I] broadcasts over H dimension
+        result = w_f32 * s_f32.unsqueeze(1)
+    elif s_f32.dim() == 2:
+        # Blockwise: expand scale to match weight shape
+        block_rows = weight.shape[0] // s_f32.shape[0]
+        block_cols = weight.shape[1] // s_f32.shape[1]
+        expanded = s_f32.repeat_interleave(block_rows, dim=0).repeat_interleave(
+            block_cols, dim=1
+        )
+        result = w_f32 * expanded
+    else:
+        raise ValueError(f"Unsupported scale dimensions: {s_f32.shape}")
+    return result.to(target_dtype)
+
+
 def maybe_dequantize_layer(neuron_state_dict: dict, config):
     """Dequantize FP8 layers (weight_scale_inv) to the configured torch dtype."""
     scale_layers = []
@@ -603,39 +630,71 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
             s1_key_0 = f"layers.{layer_idx}.block_sparse_moe.experts.0.w1.scale"
             has_scales = s1_key_0 in neuron_state_dict
 
+            # Determine if we should dequant FP8 -> BF16 during stacking.
+            # When quantized=False and weights are FP8, dequant using scales
+            # so the model receives BF16 weights (avoids FP8 in XLA graph).
+            dequant_during_stack = (
+                has_scales and not is_quantized and dtype == torch.float8_e4m3fn
+            )
+            target_dtype = (
+                config.neuron_config.torch_dtype if dequant_during_stack else dtype
+            )
+
             # Stack gate (w1) + up (w3) into gate_up_proj: [E, H, 2*I]
             gate_up_proj = torch.empty(
                 config.num_local_experts,
                 hidden_size,
                 2 * intermediate_size,
-                dtype=dtype,
+                dtype=target_dtype,
                 device=device,
             )
-            gate_scales = [] if has_scales else None
-            up_scales = [] if has_scales else None
+            # Only collect scales when quantized=True (FP8 runtime); skip when dequanting
+            gate_scales = [] if (has_scales and not dequant_during_stack) else None
+            up_scales = [] if (has_scales and not dequant_during_stack) else None
 
             for expert_idx in range(config.num_local_experts):
                 ew1 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight"
                 ew3 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight"
 
-                gate_up_slice = torch.narrow(gate_up_proj, 0, expert_idx, 1)
-                torch.narrow(gate_up_slice, 2, 0, intermediate_size).copy_(
-                    neuron_state_dict[ew1].T
-                )
-                torch.narrow(
-                    gate_up_slice, 2, intermediate_size, intermediate_size
-                ).copy_(neuron_state_dict[ew3].T)
-                del neuron_state_dict[ew1], neuron_state_dict[ew3]
-
-                # Collect and remove scale tensors if present
-                if has_scales:
+                if dequant_during_stack:
+                    # Dequant FP8 -> BF16 using per-channel scale before stacking.
+                    # Weight is [I, H] in FP8, scale is [I] (per-channel) or [I/B, H/B] (blockwise).
+                    # After .T -> [H, I], we need scale to broadcast along last dim (I).
                     es1 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.scale"
                     es3 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.scale"
-                    # Per-channel scales are 1D [I] (per output feature of original weight).
-                    # No transposition needed — the scale aligns with the output dim
-                    # which becomes the last dim after weight transposition to [H, I].
-                    gate_scales.append(neuron_state_dict.pop(es1))
-                    up_scales.append(neuron_state_dict.pop(es3))
+                    w1_dq = _dequant_fp8_weight(
+                        neuron_state_dict[ew1], neuron_state_dict[es1], target_dtype
+                    )
+                    w3_dq = _dequant_fp8_weight(
+                        neuron_state_dict[ew3], neuron_state_dict[es3], target_dtype
+                    )
+                    gate_up_slice = torch.narrow(gate_up_proj, 0, expert_idx, 1)
+                    torch.narrow(gate_up_slice, 2, 0, intermediate_size).copy_(w1_dq.T)
+                    torch.narrow(
+                        gate_up_slice, 2, intermediate_size, intermediate_size
+                    ).copy_(w3_dq.T)
+                    del neuron_state_dict[ew1], neuron_state_dict[ew3]
+                    del neuron_state_dict[es1], neuron_state_dict[es3]
+                    del w1_dq, w3_dq
+                else:
+                    gate_up_slice = torch.narrow(gate_up_proj, 0, expert_idx, 1)
+                    torch.narrow(gate_up_slice, 2, 0, intermediate_size).copy_(
+                        neuron_state_dict[ew1].T
+                    )
+                    torch.narrow(
+                        gate_up_slice, 2, intermediate_size, intermediate_size
+                    ).copy_(neuron_state_dict[ew3].T)
+                    del neuron_state_dict[ew1], neuron_state_dict[ew3]
+
+                    # Collect and remove scale tensors if present (FP8 runtime path)
+                    if has_scales:
+                        es1 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.scale"
+                        es3 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.scale"
+                        # Per-channel scales are 1D [I] (per output feature of original weight).
+                        # No transposition needed — the scale aligns with the output dim
+                        # which becomes the last dim after weight transposition to [H, I].
+                        gate_scales.append(neuron_state_dict.pop(es1))
+                        up_scales.append(neuron_state_dict.pop(es3))
 
                 if (expert_idx + 1) % gc_interval == 0:
                     gc.collect()
@@ -657,7 +716,8 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
 
             # Fuse and store gate_up scales: [E, I] + [E, I] -> [E, 2*I]
             # TKG kernel reads as .view(E, 2, -1) -> [E, 2, I]
-            if has_scales:
+            # Only store when quantized=True (FP8 runtime); skip when dequanted to BF16.
+            if gate_scales is not None:
                 gate_s = torch.stack(gate_scales, dim=0)  # [E, I]
                 up_s = torch.stack(up_scales, dim=0)  # [E, I]
                 gate_up_scale = torch.cat([gate_s, up_s], dim=-1)  # [E, 2*I]
@@ -671,23 +731,32 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 config.num_local_experts,
                 intermediate_size,
                 hidden_size,
-                dtype=dtype,
+                dtype=target_dtype,
                 device=device,
             )
-            down_scales = [] if has_scales else None
+            down_scales = [] if (has_scales and not dequant_during_stack) else None
 
             for expert_idx in range(config.num_local_experts):
                 ew2 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight"
-                torch.narrow(down_proj, 0, expert_idx, 1).copy_(
-                    neuron_state_dict[ew2].T
-                )
-                del neuron_state_dict[ew2]
 
-                if has_scales:
+                if dequant_during_stack:
                     es2 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.scale"
-                    # Per-channel scale is 1D [H] (per output feature of w2).
-                    # No transposition needed.
-                    down_scales.append(neuron_state_dict.pop(es2))
+                    w2_dq = _dequant_fp8_weight(
+                        neuron_state_dict[ew2], neuron_state_dict[es2], target_dtype
+                    )
+                    torch.narrow(down_proj, 0, expert_idx, 1).copy_(w2_dq.T)
+                    del neuron_state_dict[ew2], neuron_state_dict[es2], w2_dq
+                else:
+                    torch.narrow(down_proj, 0, expert_idx, 1).copy_(
+                        neuron_state_dict[ew2].T
+                    )
+                    del neuron_state_dict[ew2]
+
+                    if has_scales:
+                        es2 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.scale"
+                        # Per-channel scale is 1D [H] (per output feature of w2).
+                        # No transposition needed.
+                        down_scales.append(neuron_state_dict.pop(es2))
 
                 if (expert_idx + 1) % gc_interval == 0:
                     gc.collect()
@@ -699,7 +768,8 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"
             ] = down_proj
 
-            if has_scales:
+            # Only store down scales when quantized=True (FP8 runtime)
+            if down_scales is not None:
                 down_s = torch.stack(down_scales, dim=0)
                 neuron_state_dict[
                     f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"
@@ -1412,7 +1482,9 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         )
         args += " --auto-cast=none"
         args += " --internal-enable-dge-levels vector_dynamic_offsets"
-        args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
+        # Note: --internal-hlo2tensorizer-options is added by model_wrapper.__init__
+        # (includes --verify-hlo=true and FP8 flags when quantized=True).
+        # Do NOT add it here to avoid duplicate flags.
 
         if self.neuron_config.scratchpad_page_size:
             args += (
@@ -1426,10 +1498,10 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
             self.neuron_config.pre_rope_rmsnorm = True
             args += " --internal-max-instruction-limit=15000000"
 
-        # Note: In SDK 2.28 (neuronx-cc 2.22), FP8 required the flag
-        # --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 for OCP->IEEE format translation.
-        # In SDK 2.29 (neuronx-cc 2.24), this flag was removed — FP8 format handling
-        # is built-in. No additional compiler flag needed for FP8 expert weights.
+        # Note: FP8 compiler flags (--experimental-unsafe-fp8e4m3fn-as-fp8e4m3) are
+        # added by model_wrapper.__init__ inside --internal-hlo2tensorizer-options
+        # when quantized=True. In --fp8-dequant mode (quantized=False), no FP8
+        # flags are needed since the model runs in BF16.
 
         return args
 
