@@ -383,6 +383,11 @@ def _patch_fused_tkg_with_selection_bias(model=None):
         if B * S == 1:
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))
             padded = True
+            logger.info(
+                "Padded TKG hidden_states from %s to %s for NKI SBUF compat",
+                hidden_states_shape,
+                hidden_states.shape,
+            )
 
         if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
