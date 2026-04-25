@@ -69,9 +69,30 @@ try:
 except ImportError:
     logger.warning("vllm_neuron not found; skipping vLLM-neuron patch")
 
+# ------------------------------------------------------------------
+# 5. Register in vLLM ModelRegistry so architecture resolution works
+# ------------------------------------------------------------------
+# Without this, vLLM falls back to a default model (Qwen3-0.6B) when it
+# encounters the unknown architecture MiMoV2FlashForCausalLM, which
+# causes model_config.model to resolve incorrectly.
+try:
+    from vllm.model_executor.models import ModelRegistry  # noqa: E402
+
+    # Register using the Qwen3MoE class as a stand-in.  vLLM-neuron never
+    # instantiates the vLLM model class (it uses NxDI's model class instead),
+    # but the registry entry must exist so that inspect_model_cls() succeeds
+    # and vLLM preserves the user-supplied --model path.
+    ModelRegistry.register_model(
+        "MiMoV2FlashForCausalLM",
+        "vllm.model_executor.models.qwen3_moe:Qwen3MoeForCausalLM",
+    )
+    logger.info("Registered MiMoV2FlashForCausalLM in vLLM ModelRegistry")
+except Exception as e:
+    logger.warning("Could not register in vLLM ModelRegistry: %s", e)
+
 
 # ------------------------------------------------------------------
-# 5. Optional: launch vLLM when run as a script
+# 6. Optional: launch vLLM when run as a script
 # ------------------------------------------------------------------
 def main():
     """Launch vLLM api_server with MiMo-V2-Flash registered."""
