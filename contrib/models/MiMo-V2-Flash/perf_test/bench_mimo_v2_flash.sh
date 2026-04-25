@@ -20,14 +20,13 @@ set -e
 # this model on Trn2 — use the BF16 checkpoint with the old bench recipe
 # (`moe_tp_degree=64, moe_ep_degree=1, batch_size=1`).
 
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 
 MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2-Flash-Neuron-FP8}"
-# The NxDI contrib MiMo-V2-Flash modeling code is registered into vLLM /
-# NxDI lookup tables by vllm-neuron's register() hook using this env var.
-# Default to this contrib package's own src/ relative to the script.
-: "${NXDI_CONTRIB_MIMO_V2_FLASH_SRC:=$(cd "$(dirname "$0")/.." && pwd)/src}"
-export NXDI_CONTRIB_MIMO_V2_FLASH_SRC
+MODEL_NAME="${MIMO_V2_FLASH_NAME:-MiMo-V2-Flash}"
+# Contrib src/ directory (for the registration script).
+CONTRIB_SRC="$(cd "$(dirname "$0")/.." && pwd)/src"
+export NXDI_CONTRIB_MIMO_V2_FLASH_SRC="$CONTRIB_SRC"
 
 # First-time Flash FP8 compile takes 30-60 minutes; extend vLLM's ready
 # timeout and the compiler's environment variables for FP8 numerics.
@@ -90,7 +89,7 @@ run_bench() {
     echo "    Benchmark: concurrency=$concurrency, prompts=$num_prompts"
     vllm bench serve \
         --backend vllm \
-        --model "$MODEL_PATH" \
+        --model "$MODEL_NAME" \
         --tokenizer "$MODEL_PATH" \
         --endpoint /v1/completions \
         --dataset-name random \
@@ -106,7 +105,7 @@ run_bench() {
 # Helper: stop server
 stop_server() {
     echo "  Stopping vLLM server..."
-    pkill -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+    pkill -f "register_vllm.py\|vllm.entrypoints.openai.api_server" 2>/dev/null || true
     sleep 5
 }
 
@@ -117,7 +116,7 @@ sanity_check() {
         -H 'Content-Type: application/json' \
         -d '{
             "messages": [{"role": "user", "content": "What is 1+1? Answer briefly."}],
-            "model": "'"$MODEL_PATH"'",
+            "model": "'"$MODEL_NAME"'",
             "max_tokens": 64,
             "temperature": 0.0,
             "stream": false
@@ -138,16 +137,17 @@ echo ""
 CONFIG_NAME="bs32_tp64_moetp1_ep64"
 echo "--- Config 1: BS=32, moe_tp=1/moe_ep=64, CB + bucketing ---"
 
-python3 -m vllm.entrypoints.openai.api_server \
+python3 "$CONTRIB_SRC/register_vllm.py" \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
+    --served-model-name "$MODEL_NAME" \
     --tensor-parallel-size 64 \
     --max-model-len 1024 \
     --max-num-seqs 32 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --port $PORT \
-    --trust_remote_code \
+    --trust-remote-code \
     --additional-config '{
         "override_neuron_config": {
             '"$COMMON_MIMO_CONFIG"',
@@ -182,16 +182,17 @@ stop_server
 CONFIG_NAME="bs128_tp64_moetp1_ep64"
 echo "--- Config 2: BS=128, moe_tp=1/moe_ep=64, CB + bucketing ---"
 
-python3 -m vllm.entrypoints.openai.api_server \
+python3 "$CONTRIB_SRC/register_vllm.py" \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
+    --served-model-name "$MODEL_NAME" \
     --tensor-parallel-size 64 \
     --max-model-len 1024 \
     --max-num-seqs 128 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --port $PORT \
-    --trust_remote_code \
+    --trust-remote-code \
     --additional-config '{
         "override_neuron_config": {
             '"$COMMON_MIMO_CONFIG"',
