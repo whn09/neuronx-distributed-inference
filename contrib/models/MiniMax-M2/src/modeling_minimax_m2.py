@@ -1414,7 +1414,9 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
                 try:
                     import compat  # noqa: F401 — patches applied on import
 
-                    logger.info(
+                    import logging as _logging
+
+                    _logging.getLogger(__name__).info(
                         "compat: FP8 in-graph dequant patches loaded (no EP mode)"
                     )
                 except ImportError:
