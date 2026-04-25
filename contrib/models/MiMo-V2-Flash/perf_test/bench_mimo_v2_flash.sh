@@ -57,7 +57,7 @@ COMMON_MIMO_CONFIG='"tp_degree": 64,
             "quantization_block_axis": [1, 2],
             "quantization_block_size": [128, 128],
             "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj"],
-            "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"}'
+            "blockwise_matmul_config": {"use_shard_on_intermediate_dynamic_while": true, "skip_dma_token": true}'
 
 # Helper: wait for vLLM server to be ready. First-time compilation of a
 # 256-expert MoE model takes 30-90 minutes, so we poll for up to 2 hours.
@@ -160,7 +160,7 @@ python3 -m vllm.entrypoints.openai.api_server \
             "seq_len": 1024,
             "is_continuous_batching": true,
             "enable_bucketing": true,
-            "context_encoding_buckets": [1024],
+            "context_encoding_buckets": [128, 256, 512, 1024],
             "token_generation_buckets": [1024],
             "async_mode": true,
             "on_device_sampling_config": {
@@ -204,7 +204,7 @@ python3 -m vllm.entrypoints.openai.api_server \
             "seq_len": 1024,
             "is_continuous_batching": true,
             "enable_bucketing": true,
-            "context_encoding_buckets": [1024],
+            "context_encoding_buckets": [128, 256, 512, 1024],
             "token_generation_buckets": [1024],
             "async_mode": true,
             "on_device_sampling_config": {

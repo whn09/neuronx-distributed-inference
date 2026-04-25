@@ -180,7 +180,14 @@ class MiMoV2InferenceConfig(InferenceConfig):
         # Set intermediate_size for MoE layers
         self.intermediate_size = self.moe_intermediate_size
 
-        # Check and pad intermediate size if needed
+        # SDK 2.29: the shard_hidden NKI kernel is missing from nkilib.
+        # Force the shard_on_intermediate path to avoid NotImplementedError
+        # during CTE MoE computation.  Must be set BEFORE maybe_pad_intermediate()
+        # so the padding check sees the flag.
+        self.neuron_config.blockwise_matmul_config.use_shard_on_intermediate_dynamic_while = True
+
+        # Check and pad intermediate size if needed (must come after
+        # shard_on_intermediate is set so padding is applied correctly)
         self.maybe_pad_intermediate()
 
         # Router configuration
