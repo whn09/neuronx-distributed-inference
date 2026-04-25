@@ -365,7 +365,7 @@ def _patch_fused_tkg_with_selection_bias(model=None):
 
         Falls back to stock method if router has no e_score_correction_bias.
         """
-        import neuronxcc.nki.language as nl
+        import nki.language as nl
 
         # Check if router has selection bias; if not, fall back to stock
         bias_param = getattr(self.router, "e_score_correction_bias", None)
