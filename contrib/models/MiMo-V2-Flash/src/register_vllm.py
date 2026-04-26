@@ -70,29 +70,42 @@ except ImportError:
     logger.warning("vllm_neuron not found; skipping vLLM-neuron patch")
 
 # ------------------------------------------------------------------
-# 5. Register in vLLM ModelRegistry so architecture resolution works
+# 5. Patch NxDI load_pretrained_config for trust_remote_code
 # ------------------------------------------------------------------
-# Without this, vLLM falls back to a default model (Qwen3-0.6B) when it
-# encounters the unknown architecture MiMoV2FlashForCausalLM, which
-# causes model_config.model to resolve incorrectly.
+# NxDI's load_pretrained_config calls AutoConfig.from_pretrained()
+# without trust_remote_code=True.  MiMo-V2-Flash's HF checkpoint has
+# an auto_map that requires custom code, so we patch the function to
+# pass the flag.  We patch both the original module and the model
+# loader's imported reference.
 try:
-    from vllm.model_executor.models import ModelRegistry  # noqa: E402
+    import neuronx_distributed_inference.utils.hf_adapter as _hf_adapter  # noqa: E402
+    from transformers import AutoConfig as _AutoConfig  # noqa: E402
 
-    # Register using the Qwen3MoE class as a stand-in.  vLLM-neuron never
-    # instantiates the vLLM model class (it uses NxDI's model class instead),
-    # but the registry entry must exist so that inspect_model_cls() succeeds
-    # and vLLM preserves the user-supplied --model path.
-    ModelRegistry.register_model(
-        "MiMoV2FlashForCausalLM",
-        "vllm.model_executor.models.qwen3_moe:Qwen3MoeForCausalLM",
-    )
-    logger.info("Registered MiMoV2FlashForCausalLM in vLLM ModelRegistry")
+    _orig_ac_from_pretrained = _AutoConfig.from_pretrained.__func__
+
+    @classmethod
+    def _trusted_from_pretrained(cls, *args, **kwargs):
+        kwargs.setdefault("trust_remote_code", True)
+        return _orig_ac_from_pretrained(cls, *args, **kwargs)
+
+    _AutoConfig.from_pretrained = _trusted_from_pretrained
+    logger.info("Patched AutoConfig.from_pretrained to default trust_remote_code=True")
 except Exception as e:
-    logger.warning("Could not register in vLLM ModelRegistry: %s", e)
+    logger.warning("Could not patch AutoConfig.from_pretrained: %s", e)
+
+# ------------------------------------------------------------------
+# 6. vLLM ModelRegistry
+# ------------------------------------------------------------------
+# vLLM 0.16 already has a native MiMoV2FlashForCausalLM entry in its
+# ModelRegistry (mapped to the GPU implementation).  We do NOT overwrite
+# it — the native entry allows inspect_model_cls() to succeed so that
+# the architecture is resolved correctly.  vLLM-neuron's model loader
+# bypasses the vLLM model class entirely and uses our NxDI class from
+# step 3+4 instead.
 
 
 # ------------------------------------------------------------------
-# 6. Optional: launch vLLM when run as a script
+# 7. Optional: launch vLLM when run as a script
 # ------------------------------------------------------------------
 def main():
     """Launch vLLM api_server with MiMo-V2-Flash registered."""
@@ -115,6 +128,15 @@ def main():
     )
     parser = make_arg_parser(parser)
     args = parser.parse_args()
+
+    # vLLM 0.16 splits --model into model_tag (the user value) and model
+    # (a pydantic default).  The ``vllm serve`` CLI copies model_tag →
+    # model, but we bypass that path by calling run_server() directly.
+    # Replicate the same mapping here so model_config.model is correct.
+    if hasattr(args, "model_tag") and args.model_tag is not None:
+        args.model = args.model_tag
+        logger.info("Set args.model from model_tag: %s", args.model)
+
     uvloop.run(run_server(args))
 
 

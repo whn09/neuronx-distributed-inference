@@ -376,13 +376,23 @@ def process_mimo_v2_checkpoint(
             weight = state_dict[weight_key]
             scale = state_dict.get(scale_key)
 
-            # Handle FP8 weights - convert to per-row scaling for Neuron
-            # Neuron framework expects per-row (per-channel) scaling for attention layers
-            if weight.dtype == torch.float8_e4m3fn and scale is not None:
-                weight, scale = rescale_fp8_to_per_row(weight, scale)
-            # Handle BF16 weights (convert to FP8 with per-row scales)
-            elif weight.dtype == torch.bfloat16:
-                weight, scale = convert_bf16_to_fp8_per_row(weight)
+            # o_proj is in modules_to_not_convert — keep it as BF16.
+            # NxDI will only do a raw dtype cast for these weights, so
+            # storing FP8 would corrupt the values at load time.
+            if proj == "o_proj":
+                if weight.dtype == torch.float8_e4m3fn and scale is not None:
+                    # Dequantize back to BF16
+                    weight = (weight.float() * scale.float()).to(torch.bfloat16)
+                # else: already BF16, keep as-is
+                scale = None
+            else:
+                # Handle FP8 weights - convert to per-row scaling for Neuron
+                # Neuron framework expects per-row (per-channel) scaling for attention layers
+                if weight.dtype == torch.float8_e4m3fn and scale is not None:
+                    weight, scale = rescale_fp8_to_per_row(weight, scale)
+                # Handle BF16 weights (convert to FP8 with per-row scales)
+                elif weight.dtype == torch.bfloat16:
+                    weight, scale = convert_bf16_to_fp8_per_row(weight)
 
             # NOTE: Do NOT apply CONVERT_TO_MHA replication here.
             # The Neuron framework handles K/V replication internally.
@@ -409,6 +419,18 @@ def process_mimo_v2_checkpoint(
             new_key = f"layers.{layer_idx}.mlp.router.linear_router.weight"
             new_state_dict[new_key] = state_dict[router_key]
 
+        # MoE router bias (e_score_correction_bias) — used for sigmoid routing
+        router_bias_key = f"{prefix}mlp.gate.e_score_correction_bias"
+        if router_bias_key in state_dict_keys:
+            new_key = f"layers.{layer_idx}.mlp.router.e_score_correction_bias"
+            new_state_dict[new_key] = state_dict[router_bias_key]
+
+        # Attention sink bias — per-head bias for attention sink tokens
+        sink_bias_key = f"{prefix}self_attn.attention_sink_bias"
+        if sink_bias_key in state_dict_keys:
+            new_key = f"layers.{layer_idx}.self_attn.attention_sink_bias"
+            new_state_dict[new_key] = state_dict[sink_bias_key]
+
         # Process MoE experts
         if is_moe_layer:
             # Prepare fused gate_up and down projections
@@ -433,11 +455,13 @@ def process_mimo_v2_checkpoint(
                     if gate_w.dtype == torch.float8_e4m3fn and gate_s is not None:
                         gate_w, gate_s = rescale_fp8_weight_blockwise(gate_w, gate_s)
                     elif gate_w.dtype == torch.bfloat16:
-                        gate_w, gate_s = convert_bf16_to_fp8_blockwise(gate_w, block_size)
+                        gate_w, gate_s = convert_bf16_to_fp8_blockwise(
+                            gate_w, block_size
+                        )
 
                     gate_weights.append(gate_w.T)  # Transpose for fusion
                     if gate_s is not None:
-                        gate_scales.append(gate_s)
+                        gate_scales.append(gate_s.T)  # Transpose scale to match weight
 
                 # Up projection
                 up_w_key = f"{expert_prefix}up_proj.weight"
@@ -454,7 +478,7 @@ def process_mimo_v2_checkpoint(
 
                     up_weights.append(up_w.T)  # Transpose for fusion
                     if up_s is not None:
-                        up_scales.append(up_s)
+                        up_scales.append(up_s.T)  # Transpose scale to match weight
 
                 # Down projection
                 down_w_key = f"{expert_prefix}down_proj.weight"
@@ -467,11 +491,13 @@ def process_mimo_v2_checkpoint(
                     if down_w.dtype == torch.float8_e4m3fn and down_s is not None:
                         down_w, down_s = rescale_fp8_weight_blockwise(down_w, down_s)
                     elif down_w.dtype == torch.bfloat16:
-                        down_w, down_s = convert_bf16_to_fp8_blockwise(down_w, block_size)
+                        down_w, down_s = convert_bf16_to_fp8_blockwise(
+                            down_w, block_size
+                        )
 
                     down_weights.append(down_w.T)  # Transpose for fusion
                     if down_s is not None:
-                        down_scales.append(down_s)
+                        down_scales.append(down_s.T)  # Transpose scale to match weight
 
             # Fuse gate and up projections
             if gate_weights and up_weights:
@@ -482,7 +508,9 @@ def process_mimo_v2_checkpoint(
                 # Concatenate gate and up: [num_experts, hidden_size, 2 * intermediate_size]
                 gate_up_fused = torch.cat([gate_stacked, up_stacked], dim=2)
 
-                new_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+                new_key = (
+                    f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+                )
                 new_state_dict[new_key] = gate_up_fused
 
                 # Fuse scales if present
@@ -495,7 +523,9 @@ def process_mimo_v2_checkpoint(
                     # Concatenate scales along last dim
                     gate_up_scale = torch.cat([gate_s_stacked, up_s_stacked], dim=-1)
 
-                    new_scale_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.scale"
+                    new_scale_key = (
+                        f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.scale"
+                    )
                     new_state_dict[new_scale_key] = gate_up_scale
 
             # Down projection
@@ -508,7 +538,9 @@ def process_mimo_v2_checkpoint(
 
                 if down_scales:
                     down_s_stacked = torch.stack(down_scales, dim=0)
-                    new_scale_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.scale"
+                    new_scale_key = (
+                        f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.scale"
+                    )
                     new_state_dict[new_scale_key] = down_s_stacked
         else:
             # Non-MoE layer: regular MLP with gate_proj, up_proj, down_proj
@@ -563,19 +595,37 @@ def process_mimo_v2_checkpoint(
 
     # Copy config.json
     import shutil
+
     shutil.copy(config_path, os.path.join(save_path, "config.json"))
 
     # Copy tokenizer files
-    for tokenizer_file in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
+    for tokenizer_file in [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "merges.txt",
+        "vocab.json",
+    ]:
         src_path = os.path.join(hf_model_path, tokenizer_file)
         if os.path.exists(src_path):
             shutil.copy(src_path, os.path.join(save_path, tokenizer_file))
+
+    # Copy custom HF config/modeling Python files referenced by auto_map.
+    # Without these, AutoConfig.from_pretrained(save_path, trust_remote_code=True)
+    # fails because HF cannot locate the custom classes.
+    for py_file in ["configuration_mimo_v2_flash.py", "modeling_mimo_v2_flash.py"]:
+        src_path = os.path.join(hf_model_path, py_file)
+        if os.path.exists(src_path):
+            shutil.copy(src_path, os.path.join(save_path, py_file))
 
     print(f"\nPreprocessing complete!", flush=True)
     print(f"  Total parameters: {len(new_state_dict)}", flush=True)
 
     # Print FP8 weight count
-    fp8_count = sum(1 for v in new_state_dict.values() if v.dtype == torch.float8_e4m3fn)
+    fp8_count = sum(
+        1 for v in new_state_dict.values() if v.dtype == torch.float8_e4m3fn
+    )
     scale_count = sum(1 for k in new_state_dict.keys() if k.endswith(".scale"))
     print(f"  FP8 weights: {fp8_count}", flush=True)
     print(f"  Scale parameters: {scale_count}", flush=True)
