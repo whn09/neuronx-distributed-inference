@@ -557,6 +557,8 @@ def initialize_minimax_m2_moe_module(
         )
         gu_scale.partition_dim = 1
         gu_scale.partition_stride = 1
+        gu_scale.tensor_model_parallel = True
+        gu_scale.num_partitions = config.neuron_config.tp_degree
         gate_up.scale = gu_scale
 
         # down_proj.scale: [E, H] — no partitioning (H is output dim, not TP-split)
