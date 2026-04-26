@@ -23,6 +23,21 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+# Patch nkilib modules BEFORE any NxDI imports that trigger nkilib loading.
+# Replaces 6 nkilib modules with custom versions that add:
+#   - Partial RoPE support (rotary_dim < d_head for MiniMax-M2's 64/128 head)
+#   - Flat QK RMSNorm (pre-head-split normalization)
+#   - KV cache B=1 correctness fix
+#   - Torchxla compatibility fixes
+# Source: jimburtoft/nki-library branch feature/minimax-m2-attention
+# No-op if nkilib_custom is not present (e.g. when running Henan's EP=64 path).
+try:
+    from nkilib_custom import patch_nkilib_modules
+
+    patch_nkilib_modules()
+except ImportError:
+    pass
+
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -138,8 +153,13 @@ def convert_state_dict_to_fused_qkv(state_dict: Dict[str, Any], cfg: InferenceCo
         if (
             cfg.neuron_config.quantized_mlp_kernel_enabled
             or cfg.neuron_config.quantized
-        ) and f"layers.{layer_idx}.self_attn" not in mods_to_not_conv:
-            _helper_concat_and_delete_qkv(state_dict, layer_idx, "scale")
+        ):
+            # Only fuse .scale keys if they still exist (they may have been
+            # removed by dequant_fp8_scales_to_bf16 when self_attn is in
+            # modules_to_not_convert).
+            q_scale_key = f"layers.{layer_idx}.self_attn.q_proj.scale"
+            if q_scale_key in state_dict:
+                _helper_concat_and_delete_qkv(state_dict, layer_idx, "scale")
     gc.collect()
     return state_dict
 
@@ -167,6 +187,85 @@ def maybe_dequantize_layer(neuron_state_dict: dict, config):
         del neuron_state_dict[key]
 
 
+def dequant_fp8_scales_to_bf16(neuron_state_dict: dict, config, module_patterns=None):
+    """Dequant FP8 weights to BF16 using `.scale` tensors from preprocessing.
+
+    When modules are in modules_to_not_convert (e.g. fused TKG path at TP=32),
+    NxDI doesn't create quantized wrappers, so FP8 weights and scales can't be
+    loaded through the normal quantization path. This function dequants FP8
+    weights to BF16 during state dict conversion and removes the .scale keys.
+
+    Handles both:
+    - Block-wise scales: 3D weights [E, dim1, dim2] with 3D scales [E, s1, s2]
+    - Per-row scales: 2D weights [out, in] with 2D scales [out, 1]
+
+    Args:
+        neuron_state_dict: State dict being converted.
+        config: Inference config (for target dtype).
+        module_patterns: List of substrings to match in key names. If None,
+            matches all .scale keys. E.g. ["expert_mlps.mlp_op"] for expert
+            MLPs only, or ["expert_mlps.mlp_op", "self_attn"] for both.
+    """
+    target_dtype = getattr(config.neuron_config, "torch_dtype", torch.bfloat16)
+    scale_keys_to_remove = []
+
+    for key in list(neuron_state_dict.keys()):
+        if not key.endswith(".scale"):
+            continue
+
+        # Filter by module patterns if specified
+        if module_patterns is not None:
+            if not any(pat in key for pat in module_patterns):
+                continue
+
+        weight_key = key.rsplit(".scale", 1)[0] + ".weight"
+        if weight_key not in neuron_state_dict:
+            continue
+
+        weight = neuron_state_dict[weight_key]
+        scale = neuron_state_dict[key]
+
+        if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            continue
+
+        w_float = weight.to(torch.float32)
+        s_float = scale.to(torch.float32)
+
+        ndims = w_float.dim()
+        if ndims == 3:
+            # Block-wise: [E, dim1, dim2] * scale broadcast
+            E, dim1, dim2 = w_float.shape
+            _, s_dim1, s_dim2 = s_float.shape
+            block1 = dim1 // s_dim1
+            block2 = dim2 // s_dim2
+            s_expanded = s_float.repeat_interleave(block1, dim=1).repeat_interleave(
+                block2, dim=2
+            )
+            dequanted = w_float * s_expanded
+        elif ndims == 2:
+            # Per-row: [out, in] * [out, 1] broadcast
+            dequanted = w_float * s_float
+        else:
+            dequanted = w_float
+
+        neuron_state_dict[weight_key] = dequanted.to(target_dtype)
+        scale_keys_to_remove.append(key)
+
+    for key in scale_keys_to_remove:
+        del neuron_state_dict[key]
+
+    if scale_keys_to_remove:
+        import logging as _log
+
+        _log.getLogger(__name__).info(
+            "Dequanted %d FP8 weight tensors to %s (scales removed from state dict)",
+            len(scale_keys_to_remove),
+            target_dtype,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-M2 specific modules
 # ---------------------------------------------------------------------------
 # MiniMax-M2 specific modules
 # ---------------------------------------------------------------------------
@@ -303,7 +402,10 @@ class RouterTopKWithBias(RouterTopK):
 
 
 def initialize_minimax_m2_moe_module(
-    config: InferenceConfig, rmsnorm=None, init_tkg_module=False
+    config: InferenceConfig,
+    rmsnorm=None,
+    init_tkg_module=False,
+    register_fp8_row_scales=False,
 ):
     """
     Create the MoE module for MiniMax-M2 with e_score_correction_bias.
@@ -315,6 +417,14 @@ def initialize_minimax_m2_moe_module(
 
     The bias values (~8.0-9.5) dominate sigmoid scores (0-1) and are critical
     for correct expert selection. Without them, ~75% of experts are wrong.
+
+    Args:
+        register_fp8_row_scales: If True, register `.scale` nn.Parameters on
+            the gate_up_proj and down_proj modules for native FP8 ROW mode.
+            These parameters receive per-row scales from the preprocessed
+            checkpoint and are passed to the nkilib TKG kernel for FP8
+            dequantization post-matmul. gate_up_proj.scale is partitioned on
+            its last dim (same as weight) so NxDI TP-shards it correctly.
     """
     from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
     from neuronx_distributed.modules.moe.model import MoE
@@ -423,6 +533,112 @@ def initialize_minimax_m2_moe_module(
     )
 
     moe.eval()
+
+    # Register FP8 per-row scale parameters on the expert MLP modules.
+    # These must exist BEFORE state dict loading so NxDI can match the
+    # `.scale` keys from the preprocessed checkpoint. The gate_up_proj
+    # scale needs partition metadata matching the weight's TP sharding
+    # (last dim = 2*IM, split across TP ranks). down_proj scale is on
+    # the H dimension which is NOT TP-sharded.
+    #
+    # CRITICAL: NxDI parallel layers (ColumnParallelLinear, etc.) create
+    # their weight with the **per-rank** shape at init time (e.g.
+    # output_size_per_partition = output_size / tp_degree). The XLA trace
+    # runs with these per-rank shapes. shard_children then takes the FULL
+    # checkpoint tensor and slices it to match the per-rank parameter shape.
+    # Therefore, the scale parameter MUST also be created with the per-rank
+    # shape — NOT the full shape.
+    if register_fp8_row_scales:
+        gate_up = moe.expert_mlps.mlp_op.gate_up_proj
+        down = moe.expert_mlps.mlp_op.down_proj
+
+        # Use the original (un-padded) intermediate size for scale shapes.
+        # config.intermediate_size may have been padded by _maybe_pad_intermediate
+        # for shard-on-I alignment, but the preprocessing script doesn't pad.
+        moe_im = getattr(config, "moe_intermediate_size", config.intermediate_size)
+        tp_degree = config.neuron_config.tp_degree
+
+        # gate_up_proj.scale: per-rank shape [E, 2*IM_TP] where IM_TP = IM / tp_degree.
+        # Full checkpoint shape is [E, 2*IM]; shard_children slices dim=1 per rank.
+        #
+        # IMPORTANT: Partition attributes (partition_dim, tensor_model_parallel, etc.)
+        # must be set AFTER assigning the parameter to the module. NxDI's
+        # register_empty_parameter (used during shard-phase model re-creation on meta
+        # device) copies param.__dict__ as kwargs to Parameter.__new__(), which doesn't
+        # accept custom attributes. Setting them after assignment avoids this because
+        # register_parameter has already run by then.
+        im_tp = moe_im // tp_degree
+        gu_scale = nn.Parameter(
+            torch.ones(config.num_local_experts, 2 * im_tp, dtype=torch.float32),
+            requires_grad=False,
+        )
+        gate_up.scale = gu_scale
+        # Now set partition metadata on the registered parameter
+        gate_up.scale.partition_dim = 1
+        gate_up.scale.partition_stride = (
+            2  # Must match weight's stride=2 (gate|up interleaved)
+        )
+        gate_up.scale.tensor_model_parallel = True
+        gate_up.scale.num_partitions = tp_degree
+
+        # down_proj.scale: [E, H] — no partitioning (H is output dim, not TP-split)
+        dn_scale = nn.Parameter(
+            torch.ones(
+                config.num_local_experts, config.hidden_size, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        down.scale = dn_scale
+
+        # Set quantization_type to a dummy value so ExpertMLPsV2.forward_blockwise
+        # doesn't crash when it checks gate_up_proj.quantization_type (line 184 in
+        # expert_mlps_v2.py). The check is: scale is not None AND quantization_type
+        # == EXPERT_WISE_PER_CHANNEL_SYMMETRIC. We set a non-matching value (None)
+        # so the branch is skipped.
+        gate_up.quantization_type = None
+        down.quantization_type = None
+
+        # Replace BF16 weight parameters with FP8-dtype parameters so that
+        # model_builder.py won't cast FP8 checkpoint weights to BF16 during
+        # loading. The module's weight must match the checkpoint dtype for the
+        # framework to skip the lossy cast (which discards scale information).
+        # We keep the same shape and partition metadata — only the dtype changes.
+        #
+        # IMPORTANT: Same pattern as .scale — assign the bare parameter FIRST,
+        # then set partition attributes AFTER. NxDI's register_empty_parameter
+        # copies param.__dict__ as kwargs to Parameter.__new__() on re-creation,
+        # so custom attrs must not be present at assignment time.
+        gate_up_w = gate_up.weight
+        fp8_gu_w = nn.Parameter(
+            torch.zeros(gate_up_w.shape, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        gate_up.weight = fp8_gu_w
+        # Copy partition metadata from the original weight AFTER assignment
+        for attr in (
+            "partition_dim",
+            "partition_stride",
+            "tensor_model_parallel",
+            "num_partitions",
+        ):
+            if hasattr(gate_up_w, attr):
+                setattr(gate_up.weight, attr, getattr(gate_up_w, attr))
+
+        down_w = down.weight
+        fp8_dn_w = nn.Parameter(
+            torch.zeros(down_w.shape, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        down.weight = fp8_dn_w
+        for attr in (
+            "partition_dim",
+            "partition_stride",
+            "tensor_model_parallel",
+            "num_partitions",
+        ):
+            if hasattr(down_w, attr):
+                setattr(down.weight, attr, getattr(down_w, attr))
+
     return moe
 
 
@@ -463,6 +679,39 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
     # and lose the FP8 path's ~2x throughput advantage.
     if not getattr(config.neuron_config, "quantized", False):
         maybe_dequantize_layer(neuron_state_dict, config)
+
+    # Dequant FP8 weights with block-wise .scale to BF16 for modules that are
+    # excluded from NxDI's quantization conversion. Block-wise 128x128 scales
+    # from preprocess_minimax_m2_fp8.py can't be TP-sharded at TP=32.
+    # Also dequant attention FP8 weights (per-row .scale) when self_attn is
+    # excluded. No-op if no matching .scale keys are present.
+    #
+    # EXCEPTION: When expert MLP scales are per-row (2D), they are compatible
+    # with native FP8 ROW quantization in the nkilib TKG kernel. In this case,
+    # skip dequanting expert MLPs — keep FP8 weights and per-row scales for
+    # the kernel to consume directly. We detect per-row by checking if the
+    # gate_up_proj.scale is 2D (per-row) vs 3D (block-wise).
+    mods_to_skip = get_modules_to_not_convert(config.neuron_config) or []
+    dequant_patterns = []
+    expert_has_per_row_scales = False
+
+    if "expert_mlps" in mods_to_skip or "block_sparse_moe" in mods_to_skip:
+        # Check if expert scales are per-row (2D) or block-wise (3D)
+        sample_gu_scale_key = (
+            "layers.0.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
+        )
+        if sample_gu_scale_key in neuron_state_dict:
+            sample_scale = neuron_state_dict[sample_gu_scale_key]
+            if sample_scale.dim() == 2:
+                expert_has_per_row_scales = True
+            else:
+                dequant_patterns.append("expert_mlps.mlp_op")
+        # If key not present (e.g. BF16 checkpoint), nothing to dequant
+
+    if "self_attn" in mods_to_skip:
+        dequant_patterns.append("self_attn")
+    if dequant_patterns:
+        dequant_fp8_scales_to_bf16(neuron_state_dict, config, dequant_patterns)
 
     with torch.no_grad():
         tp_degree = config.neuron_config.tp_degree
@@ -650,7 +899,9 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 old_scale_key = f"{prefix}.{proj}.scale"
                 new_scale_key = f"{prefix}.qkv_proj.{proj}.scale"
                 if old_scale_key in neuron_state_dict:
-                    neuron_state_dict[new_scale_key] = neuron_state_dict.pop(old_scale_key)
+                    neuron_state_dict[new_scale_key] = neuron_state_dict.pop(
+                        old_scale_key
+                    )
 
     # --- Expand MoE blockwise scales along the TP-partitioned dim (FP8 only). ---
     # NxDI's shard_checkpoint splits the scale on its partition dim into
@@ -660,8 +911,12 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
     # ranks share one scale block — we need to replicate scale entries along
     # that dim. Adjacent ranks whose weight falls inside the same 128-wide
     # block genuinely share that block's scale. No-op when the .scale keys
-    # are absent (BF16 path) or moe_tp is large enough (e.g. moe_tp=1).
-    if getattr(config.neuron_config, "quantized", False):
+    # are absent (BF16 path), moe_tp is large enough (e.g. moe_tp=1), or
+    # scales are per-row (2D) rather than block-wise (3D).
+    if (
+        getattr(config.neuron_config, "quantized", False)
+        and not expert_has_per_row_scales
+    ):
         moe_tp = (
             getattr(config.neuron_config, "moe_tp_degree", None)
             or config.neuron_config.tp_degree
@@ -669,9 +924,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
         for layer_idx in range(config.num_hidden_layers):
             # down_proj (RowParallel on intermediate dim). Scale:
             # [E, I_blocks, H_blocks]
-            dp_key = (
-                f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"
-            )
+            dp_key = f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"
             if dp_key in neuron_state_dict:
                 s = neuron_state_dict[dp_key]
                 i_blocks = s.shape[1]
@@ -681,7 +934,9 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 if i_per_rank < 128:
                     ranks_per_block = 128 // i_per_rank
                     s_exp = s.unsqueeze(2).expand(-1, -1, ranks_per_block, -1)
-                    s_exp = s_exp.reshape(s.shape[0], i_blocks * ranks_per_block, h_blocks)
+                    s_exp = s_exp.reshape(
+                        s.shape[0], i_blocks * ranks_per_block, h_blocks
+                    )
                     assert s_exp.shape[1] == moe_tp, (
                         f"down_proj.scale expansion produced {s_exp.shape[1]} rows, "
                         f"expected moe_tp={moe_tp}"
@@ -694,9 +949,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
             # (via _apply_blockwise_scale_stride_fix), so the full scale must
             # have last-dim=moe_tp with gate entries 0..moe_tp/2 and up
             # entries moe_tp/2..moe_tp. Expand each half independently.
-            gu_key = (
-                f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
-            )
+            gu_key = f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
             if gu_key in neuron_state_dict:
                 s = neuron_state_dict[gu_key]
                 h_blocks = s.shape[1]
@@ -799,10 +1052,32 @@ class MiniMaxM2InferenceConfig(InferenceConfig):
                 self.intermediate_size = padded
 
     def _enable_moe_fused_nki_kernel(self):
-        """Enable fused MoE NKI kernel if the per-TP intermediate dimension is aligned."""
-        i_tp = self.intermediate_size // self.neuron_config.moe_tp_degree
+        """Enable fused MoE NKI kernel if requested.
+
+        NxDI guards this with MOE_TKG_MK_INTERMEDIATE_PER_TP=128 alignment,
+        but the nkilib moe_block_tkg kernel handles non-aligned I via
+        TiledRange with ceiling division. MiniMax-M2 at TP=32 has I_TP=48,
+        which works in the nkilib kernel but fails the NxDI guard.
+
+        We bypass the alignment check here because:
+        1. Our replacement _moe_fused_tkg_kernel uses moe_block_tkg_kernel
+           from nkilib (not NxDI's internal kernel paths)
+        2. nkilib's TiledRange handles remainderI tiles correctly
+        3. MiniMax-M2 uses bf16/FP8 (not MXFP), so no MX alignment constraints
+        """
         if getattr(self.neuron_config, "moe_fused_nki_kernel_enabled", False):
+            i_tp = self.intermediate_size // self.neuron_config.moe_tp_degree
             if i_tp % MOE_TKG_MK_INTERMEDIATE_PER_TP == 0:
+                self.moe_fused_nki_kernel_enabled = True
+            else:
+                import logging as _log
+
+                _log.getLogger(__name__).info(
+                    "Enabling fused MoE TKG despite I_TP=%d not aligned to %d "
+                    "(nkilib handles partial tiles via TiledRange)",
+                    i_tp,
+                    MOE_TKG_MK_INTERMEDIATE_PER_TP,
+                )
                 self.moe_fused_nki_kernel_enabled = True
 
     def get_required_attributes(self) -> List[str]:
@@ -1266,14 +1541,19 @@ class NeuronMiniMaxM2DecoderLayer(nn.Module):
         )
 
         # Fused MoE kernel absorbs post-attention layernorm
+        fp8_row = getattr(config.neuron_config, "fp8_native_row_mode", False)
         if self.moe_fused_nki_kernel_enabled:
             self.block_sparse_moe = initialize_minimax_m2_moe_module(
                 config=config,
                 rmsnorm=self.post_attention_layernorm,
                 init_tkg_module=True,
+                register_fp8_row_scales=fp8_row,
             )
         else:
-            self.block_sparse_moe = initialize_minimax_m2_moe_module(config=config)
+            self.block_sparse_moe = initialize_minimax_m2_moe_module(
+                config=config,
+                register_fp8_row_scales=fp8_row,
+            )
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
@@ -1380,11 +1660,55 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         # quantization-layer classes are in effect when NxDI builds the
         # decoder. Gated on quantized=True so the BF16 path is untouched.
         ncfg = kwargs.get("config") or (args[1] if len(args) > 1 else None)
-        if ncfg is not None and getattr(getattr(ncfg, "neuron_config", None), "quantized", False):
+        if ncfg is not None and getattr(
+            getattr(ncfg, "neuron_config", None), "quantized", False
+        ):
             self._apply_ep_scale_fix()
             self._apply_blockwise_scale_stride_fix()
             self._apply_2d_per_channel_fix()
+
+        # When running without expert parallelism (e.g. TP=32, no EP), the
+        # CTE and TKG MoE dispatch paths don't apply FP8 scales correctly:
+        # - CTE's blockwise kernel stub needs restoring from nkilib
+        # - TKG's ExpertFusedLinear does bare FP8 matmul without scales
+        # The compat module patches both paths with in-graph FP8->BF16 dequant.
+        # This is a no-op when EP is used (Henan's TP=64/EP=64 config).
+        if ncfg is not None:
+            moe_ep = getattr(getattr(ncfg, "neuron_config", None), "moe_ep_degree", 1)
+            if moe_ep <= 1:
+                try:
+                    import compat  # noqa: F401 — patches applied on import
+
+                    import logging as _logging
+
+                    _logging.getLogger(__name__).info(
+                        "compat: FP8 in-graph dequant patches loaded (no EP mode)"
+                    )
+                except ImportError:
+                    pass  # compat.py not present, skip
+
         super().__init__(*args, **kwargs)
+
+    def _apply_fused_tkg_selection_bias(self):
+        """Ensure the class-level fused MoE TKG selection_bias patch is applied.
+
+        The patch is class-level (on MoEFusedTKG._moe_fused_tkg_kernel) and is
+        normally applied when ``import compat`` runs in __init__. This method
+        serves as a safety net — it re-calls the (idempotent) patch function
+        from compile()/load() so the kernel is ready before tracing begins.
+        """
+        if not getattr(self.config, "moe_fused_nki_kernel_enabled", False):
+            return
+        try:
+            import compat
+
+            compat._patch_fused_tkg_with_selection_bias()
+        except Exception as e:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "compat: Failed to patch fused TKG with selection_bias: %s", e
+            )
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
@@ -1465,7 +1789,9 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
             BaseQuantizeParallelLinear,
         )
 
-        if getattr(BaseQuantizeParallelLinear, "_minimax_m2_blockwise_stride_patched", False):
+        if getattr(
+            BaseQuantizeParallelLinear, "_minimax_m2_blockwise_stride_patched", False
+        ):
             return
 
         _original_setup = BaseQuantizeParallelLinear._setup_for_scale
@@ -1515,11 +1841,18 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
                 return
             original_from_float = cls.from_float
 
-            def _patched_from_float(klass, mod, q_config=None, _orig=original_from_float):
-                if q_config is not None and q_config.get("quantization_type") == \
-                        QuantizationType.BLOCKWISE_SYMMETRIC:
+            def _patched_from_float(
+                klass, mod, q_config=None, _orig=original_from_float
+            ):
+                if (
+                    q_config is not None
+                    and q_config.get("quantization_type")
+                    == QuantizationType.BLOCKWISE_SYMMETRIC
+                ):
                     q_config = dict(q_config)
-                    q_config["quantization_type"] = QuantizationType.PER_CHANNEL_SYMMETRIC
+                    q_config["quantization_type"] = (
+                        QuantizationType.PER_CHANNEL_SYMMETRIC
+                    )
                     q_config["quantization_per_channel_axis"] = 0
                     q_config.pop("block_axis", None)
                     q_config.pop("block_size", None)
@@ -1545,10 +1878,13 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         # save_sharded_checkpoint=True serializes shards during compile() and
         # that code path reads scale.partition_stride — patches must be live.
         self._install_fp8_patches()
+        # Patch fused TKG with selection_bias before tracing begins.
+        self._apply_fused_tkg_selection_bias()
         return super().compile(*args, **kwargs)
 
     def load(self, *args, **kwargs):
         self._install_fp8_patches()
+        self._apply_fused_tkg_selection_bias()
         return super().load(*args, **kwargs)
 
     @classmethod
@@ -1560,6 +1896,7 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         Skip if the checkpoint directory already contains a Neuron-FP8
         index produced by the preprocess script."""
         import os as _os
+
         qpath = (
             getattr(config.neuron_config, "quantized_checkpoints_path", None)
             or model_path
