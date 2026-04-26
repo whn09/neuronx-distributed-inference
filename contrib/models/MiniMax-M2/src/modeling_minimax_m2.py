@@ -568,6 +568,14 @@ def initialize_minimax_m2_moe_module(
         )
         down.scale = dn_scale
 
+        # Set quantization_type to a dummy value so ExpertMLPsV2.forward_blockwise
+        # doesn't crash when it checks gate_up_proj.quantization_type (line 184 in
+        # expert_mlps_v2.py). The check is: scale is not None AND quantization_type
+        # == EXPERT_WISE_PER_CHANNEL_SYMMETRIC. We set a non-matching value (None)
+        # so the branch is skipped.
+        gate_up.quantization_type = None
+        down.quantization_type = None
+
     return moe
 
 
