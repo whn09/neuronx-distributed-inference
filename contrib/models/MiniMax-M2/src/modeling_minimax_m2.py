@@ -560,16 +560,24 @@ def initialize_minimax_m2_moe_module(
 
         # gate_up_proj.scale: per-rank shape [E, 2*IM_TP] where IM_TP = IM / tp_degree.
         # Full checkpoint shape is [E, 2*IM]; shard_children slices dim=1 per rank.
+        #
+        # IMPORTANT: Partition attributes (partition_dim, tensor_model_parallel, etc.)
+        # must be set AFTER assigning the parameter to the module. NxDI's
+        # register_empty_parameter (used during shard-phase model re-creation on meta
+        # device) copies param.__dict__ as kwargs to Parameter.__new__(), which doesn't
+        # accept custom attributes. Setting them after assignment avoids this because
+        # register_parameter has already run by then.
         im_tp = moe_im // tp_degree
         gu_scale = nn.Parameter(
             torch.ones(config.num_local_experts, 2 * im_tp, dtype=torch.float32),
             requires_grad=False,
         )
-        gu_scale.partition_dim = 1
-        gu_scale.partition_stride = 1
-        gu_scale.tensor_model_parallel = True
-        gu_scale.num_partitions = tp_degree
         gate_up.scale = gu_scale
+        # Now set partition metadata on the registered parameter
+        gate_up.scale.partition_dim = 1
+        gate_up.scale.partition_stride = 1
+        gate_up.scale.tensor_model_parallel = True
+        gate_up.scale.num_partitions = tp_degree
 
         # down_proj.scale: [E, H] — no partitioning (H is output dim, not TP-split)
         dn_scale = nn.Parameter(
