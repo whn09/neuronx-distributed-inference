@@ -90,6 +90,11 @@ def rescale_fp8_to_per_row(
     """Block-wise FP8 + blockwise scale -> Neuron per-row FP8.
 
     Dequantize to float32 using block broadcast, then per-row requantize.
+
+    NOTE: The returned FP8 bytes use PyTorch's OCP encoding (max 448).
+    The returned scales are "true" scales: fp8_ocp_value * scale = real_value.
+    If Neuron hardware interprets FP8 bytes differently (max 240), the caller
+    must apply a correction factor at runtime (see compat.py TKG path).
     """
     out_features, in_features = weight.shape
     scale_h, scale_w = scale.shape

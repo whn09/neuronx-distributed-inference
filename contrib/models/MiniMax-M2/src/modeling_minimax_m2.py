@@ -598,6 +598,42 @@ def initialize_minimax_m2_moe_module(
         gate_up.quantization_type = None
         down.quantization_type = None
 
+        # Replace BF16 weight parameters with FP8-dtype parameters so that
+        # model_builder.py won't cast FP8 checkpoint weights to BF16 during
+        # loading. The module's weight must match the checkpoint dtype for the
+        # framework to skip the lossy cast (which discards scale information).
+        # We keep the same shape and partition metadata — only the dtype changes.
+        gate_up_w = gate_up.weight
+        fp8_gu_w = nn.Parameter(
+            torch.zeros(gate_up_w.shape, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        # Copy all partition metadata from the original weight
+        for attr in (
+            "partition_dim",
+            "partition_stride",
+            "tensor_model_parallel",
+            "num_partitions",
+        ):
+            if hasattr(gate_up_w, attr):
+                setattr(fp8_gu_w, attr, getattr(gate_up_w, attr))
+        gate_up.weight = fp8_gu_w
+
+        down_w = down.weight
+        fp8_dn_w = nn.Parameter(
+            torch.zeros(down_w.shape, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        for attr in (
+            "partition_dim",
+            "partition_stride",
+            "tensor_model_parallel",
+            "num_partitions",
+        ):
+            if hasattr(down_w, attr):
+                setattr(fp8_dn_w, attr, getattr(down_w, attr))
+        down.weight = fp8_dn_w
+
     return moe
 
 
