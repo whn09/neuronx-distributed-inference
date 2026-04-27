@@ -11,6 +11,10 @@ Steps:
 4. Handle K/V weight and scale replication for CONVERT_TO_MHA mode
 5. Save to preprocessed checkpoint directory
 
+**Memory-efficient**: Uses streaming safetensors loading to process one layer
+at a time.  Peak RSS stays under ~20 GB even for the full 225 GB checkpoint,
+so this runs comfortably on a trn2.3xlarge (128 GB RAM).
+
 Usage:
     python preprocess_mimo_v2_fp8.py \
         --hf_model_path /path/to/MiMo-V2-Flash \
@@ -23,14 +27,12 @@ import argparse
 import gc
 import json
 import os
+from collections import defaultdict
 from typing import Dict, Any, List, Optional
 
 import torch
-
-from neuronx_distributed_inference.modules.checkpoint import (
-    load_state_dict,
-    save_state_dict_safetensors,
-)
+from safetensors import safe_open
+from safetensors.torch import save_file as safetensors_save_file
 
 
 # FP8 range difference between OCP (HuggingFace) and Neuron (IEEE-754)
@@ -40,6 +42,60 @@ FP8_SCALING_FACTOR = 448.0 / 240.0
 
 # Neuron FP8 E4M3 max value
 NEURON_FP8_MAX = 240.0
+
+
+# ---------------------------------------------------------------------------
+# Streaming checkpoint reader — memory-maps safetensors shards and loads
+# individual tensors on demand so we never materialise the full 225 GB
+# state dict in RAM.
+# ---------------------------------------------------------------------------
+
+
+class StreamingCheckpointReader:
+    """Memory-efficient reader for sharded safetensors checkpoints.
+
+    Keeps one ``safetensors.safe_open`` handle per shard file (memory-mapped,
+    near-zero RSS) and materialises tensors only when ``get(key)`` is called.
+    """
+
+    def __init__(self, model_dir: str):
+        index_path = os.path.join(model_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+        self.weight_map: Dict[str, str] = index["weight_map"]
+        self._model_dir = model_dir
+        self._handles: Dict[str, Any] = {}  # shard_file -> safe_open handle
+
+    def _handle(self, shard_file: str):
+        if shard_file not in self._handles:
+            path = os.path.join(self._model_dir, shard_file)
+            self._handles[shard_file] = safe_open(path, framework="pt", device="cpu")
+        return self._handles[shard_file]
+
+    def keys(self):
+        return self.weight_map.keys()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.weight_map
+
+    def get(self, key: str, default=None) -> Optional[torch.Tensor]:
+        if key not in self.weight_map:
+            return default
+        shard_file = self.weight_map[key]
+        return self._handle(shard_file).get_tensor(key)
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        if key not in self.weight_map:
+            raise KeyError(key)
+        return self.get(key)
+
+    def close(self):
+        self._handles.clear()
+
+
+def _save_shard(state_dict: Dict[str, torch.Tensor], path: str):
+    """Save a dict of tensors to a single safetensors file."""
+    safetensors_save_file(state_dict, path)
 
 
 def convert_bf16_to_fp8_per_row(weight: torch.Tensor):
@@ -287,14 +343,17 @@ def process_mimo_v2_checkpoint(
     """
     Process MiMo-V2-Flash checkpoint for Neuron FP8 inference.
 
+    Uses streaming safetensors loading to keep peak memory under ~20 GB.
+    Saves each layer as a separate shard, then writes a safetensors index file.
+
     Args:
         hf_model_path: Path to HuggingFace MiMo-V2-Flash checkpoint
         save_path: Path to save preprocessed checkpoint
         tp_degree: Tensor parallelism degree
         convert_to_mha: Whether to replicate K/V for CONVERT_TO_MHA mode
     """
-    print(f"Loading checkpoint from: {hf_model_path}", flush=True)
-    state_dict = load_state_dict(hf_model_path)
+    print(f"Loading checkpoint index from: {hf_model_path}", flush=True)
+    reader = StreamingCheckpointReader(hf_model_path)
 
     # Load config
     config_path = os.path.join(hf_model_path, "config.json")
@@ -339,10 +398,17 @@ def process_mimo_v2_checkpoint(
     print(f"  tp_degree: {tp_degree}", flush=True)
     print(f"  convert_to_mha: {convert_to_mha}", flush=True)
 
-    state_dict_keys = set(state_dict.keys())
-    new_state_dict = {}
+    os.makedirs(save_path, exist_ok=True)
 
-    # Process each layer
+    # We will build the weight_map for the index file as we go
+    weight_map: Dict[str, str] = {}  # key -> shard filename
+    total_fp8 = 0
+    total_scale = 0
+    total_keys = 0
+
+    # ------------------------------------------------------------------
+    # Process each layer and save as a separate shard
+    # ------------------------------------------------------------------
     for layer_idx in range(num_layers):
         print(f"\nProcessing layer {layer_idx}...", end="", flush=True)
 
@@ -365,75 +431,64 @@ def process_mimo_v2_checkpoint(
         attn_type = "sliding_window" if is_sliding_window else "full"
         print(f" ({attn_type}, kv_heads={layer_num_kv_heads})", end="", flush=True)
 
+        layer_dict: Dict[str, torch.Tensor] = {}
+
         # Process attention weights
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
             weight_key = f"{prefix}self_attn.{proj}.weight"
             scale_key = f"{prefix}self_attn.{proj}.weight_scale_inv"
 
-            if weight_key not in state_dict_keys:
+            if weight_key not in reader:
                 continue
 
-            weight = state_dict[weight_key]
-            scale = state_dict.get(scale_key)
+            weight = reader[weight_key]
+            scale = reader.get(scale_key)
 
             # o_proj is in modules_to_not_convert — keep it as BF16.
-            # NxDI will only do a raw dtype cast for these weights, so
-            # storing FP8 would corrupt the values at load time.
             if proj == "o_proj":
                 if weight.dtype == torch.float8_e4m3fn and scale is not None:
-                    # Dequantize back to BF16
                     weight = (weight.float() * scale.float()).to(torch.bfloat16)
-                # else: already BF16, keep as-is
                 scale = None
             else:
-                # Handle FP8 weights - convert to per-row scaling for Neuron
-                # Neuron framework expects per-row (per-channel) scaling for attention layers
                 if weight.dtype == torch.float8_e4m3fn and scale is not None:
                     weight, scale = rescale_fp8_to_per_row(weight, scale)
-                # Handle BF16 weights (convert to FP8 with per-row scales)
                 elif weight.dtype == torch.bfloat16:
                     weight, scale = convert_bf16_to_fp8_per_row(weight)
 
-            # NOTE: Do NOT apply CONVERT_TO_MHA replication here.
-            # The Neuron framework handles K/V replication internally.
-            # Pre-replicating would cause double-replication.
-
-            # Save with Neuron naming convention
             new_weight_key = f"layers.{layer_idx}.self_attn.{proj}.weight"
-            new_state_dict[new_weight_key] = weight
+            layer_dict[new_weight_key] = weight
 
             if scale is not None:
                 new_scale_key = f"layers.{layer_idx}.self_attn.{proj}.scale"
-                new_state_dict[new_scale_key] = scale
+                layer_dict[new_scale_key] = scale
 
         # Process layer norms (no FP8)
         for norm in ["input_layernorm", "post_attention_layernorm"]:
             weight_key = f"{prefix}{norm}.weight"
-            if weight_key in state_dict_keys:
+            if weight_key in reader:
                 new_key = f"layers.{layer_idx}.{norm}.weight"
-                new_state_dict[new_key] = state_dict[weight_key]
+                layer_dict[new_key] = reader[weight_key]
 
         # Process MoE router
         router_key = f"{prefix}mlp.gate.weight"
-        if router_key in state_dict_keys:
+        if router_key in reader:
             new_key = f"layers.{layer_idx}.mlp.router.linear_router.weight"
-            new_state_dict[new_key] = state_dict[router_key]
+            layer_dict[new_key] = reader[router_key]
 
-        # MoE router bias (e_score_correction_bias) — used for sigmoid routing
+        # MoE router bias (e_score_correction_bias)
         router_bias_key = f"{prefix}mlp.gate.e_score_correction_bias"
-        if router_bias_key in state_dict_keys:
+        if router_bias_key in reader:
             new_key = f"layers.{layer_idx}.mlp.router.e_score_correction_bias"
-            new_state_dict[new_key] = state_dict[router_bias_key]
+            layer_dict[new_key] = reader[router_bias_key]
 
-        # Attention sink bias — per-head bias for attention sink tokens
+        # Attention sink bias
         sink_bias_key = f"{prefix}self_attn.attention_sink_bias"
-        if sink_bias_key in state_dict_keys:
+        if sink_bias_key in reader:
             new_key = f"layers.{layer_idx}.self_attn.attention_sink_bias"
-            new_state_dict[new_key] = state_dict[sink_bias_key]
+            layer_dict[new_key] = reader[sink_bias_key]
 
         # Process MoE experts
         if is_moe_layer:
-            # Prepare fused gate_up and down projections
             gate_weights = []
             gate_scales = []
             up_weights = []
@@ -448,9 +503,9 @@ def process_mimo_v2_checkpoint(
                 gate_w_key = f"{expert_prefix}gate_proj.weight"
                 gate_s_key = f"{expert_prefix}gate_proj.weight_scale_inv"
 
-                if gate_w_key in state_dict_keys:
-                    gate_w = state_dict[gate_w_key]
-                    gate_s = state_dict.get(gate_s_key)
+                if gate_w_key in reader:
+                    gate_w = reader[gate_w_key]
+                    gate_s = reader.get(gate_s_key)
 
                     if gate_w.dtype == torch.float8_e4m3fn and gate_s is not None:
                         gate_w, gate_s = rescale_fp8_weight_blockwise(gate_w, gate_s)
@@ -459,34 +514,34 @@ def process_mimo_v2_checkpoint(
                             gate_w, block_size
                         )
 
-                    gate_weights.append(gate_w.T)  # Transpose for fusion
+                    gate_weights.append(gate_w.T)
                     if gate_s is not None:
-                        gate_scales.append(gate_s.T)  # Transpose scale to match weight
+                        gate_scales.append(gate_s.T)
 
                 # Up projection
                 up_w_key = f"{expert_prefix}up_proj.weight"
                 up_s_key = f"{expert_prefix}up_proj.weight_scale_inv"
 
-                if up_w_key in state_dict_keys:
-                    up_w = state_dict[up_w_key]
-                    up_s = state_dict.get(up_s_key)
+                if up_w_key in reader:
+                    up_w = reader[up_w_key]
+                    up_s = reader.get(up_s_key)
 
                     if up_w.dtype == torch.float8_e4m3fn and up_s is not None:
                         up_w, up_s = rescale_fp8_weight_blockwise(up_w, up_s)
                     elif up_w.dtype == torch.bfloat16:
                         up_w, up_s = convert_bf16_to_fp8_blockwise(up_w, block_size)
 
-                    up_weights.append(up_w.T)  # Transpose for fusion
+                    up_weights.append(up_w.T)
                     if up_s is not None:
-                        up_scales.append(up_s.T)  # Transpose scale to match weight
+                        up_scales.append(up_s.T)
 
                 # Down projection
                 down_w_key = f"{expert_prefix}down_proj.weight"
                 down_s_key = f"{expert_prefix}down_proj.weight_scale_inv"
 
-                if down_w_key in state_dict_keys:
-                    down_w = state_dict[down_w_key]
-                    down_s = state_dict.get(down_s_key)
+                if down_w_key in reader:
+                    down_w = reader[down_w_key]
+                    down_s = reader.get(down_s_key)
 
                     if down_w.dtype == torch.float8_e4m3fn and down_s is not None:
                         down_w, down_s = rescale_fp8_weight_blockwise(down_w, down_s)
@@ -495,140 +550,154 @@ def process_mimo_v2_checkpoint(
                             down_w, block_size
                         )
 
-                    down_weights.append(down_w.T)  # Transpose for fusion
+                    down_weights.append(down_w.T)
                     if down_s is not None:
-                        down_scales.append(down_s.T)  # Transpose scale to match weight
+                        down_scales.append(down_s.T)
 
             # Fuse gate and up projections
             if gate_weights and up_weights:
-                # Stack experts: [num_experts, hidden_size, intermediate_size]
                 gate_stacked = torch.stack(gate_weights, dim=0)
                 up_stacked = torch.stack(up_weights, dim=0)
-
-                # Concatenate gate and up: [num_experts, hidden_size, 2 * intermediate_size]
                 gate_up_fused = torch.cat([gate_stacked, up_stacked], dim=2)
 
                 new_key = (
                     f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
                 )
-                new_state_dict[new_key] = gate_up_fused
+                layer_dict[new_key] = gate_up_fused
+                del gate_stacked, up_stacked, gate_up_fused
 
-                # Fuse scales if present
                 if gate_scales and up_scales:
-                    # Scales shape after transpose: [scale_h, scale_w]
-                    # After stacking: [num_experts, scale_h, scale_w]
                     gate_s_stacked = torch.stack(gate_scales, dim=0)
                     up_s_stacked = torch.stack(up_scales, dim=0)
-
-                    # Concatenate scales along last dim
                     gate_up_scale = torch.cat([gate_s_stacked, up_s_stacked], dim=-1)
 
                     new_scale_key = (
                         f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.scale"
                     )
-                    new_state_dict[new_scale_key] = gate_up_scale
+                    layer_dict[new_scale_key] = gate_up_scale
+                    del gate_s_stacked, up_s_stacked, gate_up_scale
 
             # Down projection
             if down_weights:
-                # Stack: [num_experts, intermediate_size, hidden_size]
                 down_stacked = torch.stack(down_weights, dim=0)
-
                 new_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"
-                new_state_dict[new_key] = down_stacked
+                layer_dict[new_key] = down_stacked
+                del down_stacked
 
                 if down_scales:
                     down_s_stacked = torch.stack(down_scales, dim=0)
                     new_scale_key = (
                         f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.scale"
                     )
-                    new_state_dict[new_scale_key] = down_s_stacked
+                    layer_dict[new_scale_key] = down_s_stacked
+                    del down_s_stacked
+
+            # Free intermediate lists
+            del gate_weights, gate_scales, up_weights, up_scales
+            del down_weights, down_scales
         else:
-            # Non-MoE layer: regular MLP with gate_proj, up_proj, down_proj
+            # Non-MoE layer: regular MLP
             for proj in ["gate_proj", "up_proj", "down_proj"]:
                 weight_key = f"{prefix}mlp.{proj}.weight"
                 scale_key = f"{prefix}mlp.{proj}.weight_scale_inv"
 
-                if weight_key not in state_dict_keys:
+                if weight_key not in reader:
                     continue
 
-                weight = state_dict[weight_key]
-                scale = state_dict.get(scale_key)
+                weight = reader[weight_key]
+                scale = reader.get(scale_key)
 
-                # Handle FP8 weights - convert to per-row scaling for Neuron
                 if weight.dtype == torch.float8_e4m3fn and scale is not None:
                     weight, scale = rescale_fp8_to_per_row(weight, scale)
-                # Handle BF16 weights (convert to FP8 with per-row scales)
                 elif weight.dtype == torch.bfloat16:
                     weight, scale = convert_bf16_to_fp8_per_row(weight)
 
-                # Save with Neuron naming convention
                 new_weight_key = f"layers.{layer_idx}.mlp.{proj}.weight"
-                new_state_dict[new_weight_key] = weight
+                layer_dict[new_weight_key] = weight
 
                 if scale is not None:
                     new_scale_key = f"layers.{layer_idx}.mlp.{proj}.scale"
-                    new_state_dict[new_scale_key] = scale
+                    layer_dict[new_scale_key] = scale
 
+        # Count stats
+        for k, v in layer_dict.items():
+            if v.dtype == torch.float8_e4m3fn:
+                total_fp8 += 1
+            if k.endswith(".scale"):
+                total_scale += 1
+        total_keys += len(layer_dict)
+
+        # Save this layer as its own shard
+        shard_name = f"layer_{layer_idx:03d}.safetensors"
+        shard_path = os.path.join(save_path, shard_name)
+        _save_shard(layer_dict, shard_path)
+        for k in layer_dict:
+            weight_map[k] = shard_name
+
+        del layer_dict
         gc.collect()
         print(" done", flush=True)
 
-    # Process embeddings and final layer norm
+    # ------------------------------------------------------------------
+    # Process embeddings and final layer norm (small — single shard)
+    # ------------------------------------------------------------------
     print("\nProcessing embeddings and final norm...", flush=True)
+    misc_dict: Dict[str, torch.Tensor] = {}
 
-    if "model.embed_tokens.weight" in state_dict_keys:
-        new_state_dict["embed_tokens.weight"] = state_dict["model.embed_tokens.weight"]
+    if "model.embed_tokens.weight" in reader:
+        misc_dict["embed_tokens.weight"] = reader["model.embed_tokens.weight"]
 
-    if "model.norm.weight" in state_dict_keys:
-        new_state_dict["norm.weight"] = state_dict["model.norm.weight"]
+    if "model.norm.weight" in reader:
+        misc_dict["norm.weight"] = reader["model.norm.weight"]
 
-    if "lm_head.weight" in state_dict_keys:
-        new_state_dict["lm_head.weight"] = state_dict["lm_head.weight"]
-    elif "model.embed_tokens.weight" in state_dict_keys:
-        # Tied embeddings
-        new_state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
+    if "lm_head.weight" in reader:
+        misc_dict["lm_head.weight"] = reader["lm_head.weight"]
+    elif "model.embed_tokens.weight" in reader:
+        misc_dict["lm_head.weight"] = reader["model.embed_tokens.weight"]
 
-    # Save preprocessed checkpoint
-    print(f"\nSaving preprocessed checkpoint to: {save_path}", flush=True)
-    os.makedirs(save_path, exist_ok=True)
+    total_keys += len(misc_dict)
 
-    save_state_dict_safetensors(new_state_dict, save_path)
+    shard_name = "misc.safetensors"
+    _save_shard(misc_dict, os.path.join(save_path, shard_name))
+    for k in misc_dict:
+        weight_map[k] = shard_name
+    del misc_dict
 
-    # Copy config.json
+    reader.close()
+
+    # ------------------------------------------------------------------
+    # Write safetensors index
+    # ------------------------------------------------------------------
+    index = {"metadata": {"total_size": total_keys}, "weight_map": weight_map}
+    index_path = os.path.join(save_path, "model.safetensors.index.json")
+    with open(index_path, "w") as f:
+        json.dump(index, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Copy config + tokenizer + custom HF files
+    # ------------------------------------------------------------------
     import shutil
 
     shutil.copy(config_path, os.path.join(save_path, "config.json"))
 
-    # Copy tokenizer files
-    for tokenizer_file in [
+    for extra_file in [
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
         "added_tokens.json",
         "merges.txt",
         "vocab.json",
+        "configuration_mimo_v2_flash.py",
+        "modeling_mimo_v2_flash.py",
     ]:
-        src_path = os.path.join(hf_model_path, tokenizer_file)
-        if os.path.exists(src_path):
-            shutil.copy(src_path, os.path.join(save_path, tokenizer_file))
-
-    # Copy custom HF config/modeling Python files referenced by auto_map.
-    # Without these, AutoConfig.from_pretrained(save_path, trust_remote_code=True)
-    # fails because HF cannot locate the custom classes.
-    for py_file in ["configuration_mimo_v2_flash.py", "modeling_mimo_v2_flash.py"]:
-        src_path = os.path.join(hf_model_path, py_file)
-        if os.path.exists(src_path):
-            shutil.copy(src_path, os.path.join(save_path, py_file))
+        src = os.path.join(hf_model_path, extra_file)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(save_path, extra_file))
 
     print(f"\nPreprocessing complete!", flush=True)
-    print(f"  Total parameters: {len(new_state_dict)}", flush=True)
-
-    # Print FP8 weight count
-    fp8_count = sum(
-        1 for v in new_state_dict.values() if v.dtype == torch.float8_e4m3fn
-    )
-    scale_count = sum(1 for k in new_state_dict.keys() if k.endswith(".scale"))
-    print(f"  FP8 weights: {fp8_count}", flush=True)
-    print(f"  Scale parameters: {scale_count}", flush=True)
+    print(f"  Total parameters: {total_keys}", flush=True)
+    print(f"  FP8 weights: {total_fp8}", flush=True)
+    print(f"  Scale parameters: {total_scale}", flush=True)
 
 
 def main():

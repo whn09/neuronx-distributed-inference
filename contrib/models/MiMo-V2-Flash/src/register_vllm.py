@@ -94,6 +94,30 @@ except Exception as e:
     logger.warning("Could not patch AutoConfig.from_pretrained: %s", e)
 
 # ------------------------------------------------------------------
+# 5b. Patch AutoTokenizer.from_pretrained for trust_remote_code
+# ------------------------------------------------------------------
+# vLLM 0.16's tokenizer creation path also calls
+# AutoTokenizer.from_pretrained without trust_remote_code=True.
+# MiMo-V2-Flash's config maps to a custom config class that the
+# tokenizer registry doesn't recognise, so we must force the flag.
+try:
+    from transformers import AutoTokenizer as _AutoTokenizer  # noqa: E402
+
+    _orig_at_from_pretrained = _AutoTokenizer.from_pretrained.__func__
+
+    @classmethod
+    def _trusted_tokenizer_from_pretrained(cls, *args, **kwargs):
+        kwargs.setdefault("trust_remote_code", True)
+        return _orig_at_from_pretrained(cls, *args, **kwargs)
+
+    _AutoTokenizer.from_pretrained = _trusted_tokenizer_from_pretrained
+    logger.info(
+        "Patched AutoTokenizer.from_pretrained to default trust_remote_code=True"
+    )
+except Exception as e:
+    logger.warning("Could not patch AutoTokenizer.from_pretrained: %s", e)
+
+# ------------------------------------------------------------------
 # 6. vLLM ModelRegistry
 # ------------------------------------------------------------------
 # vLLM 0.16 already has a native MiMoV2FlashForCausalLM entry in its

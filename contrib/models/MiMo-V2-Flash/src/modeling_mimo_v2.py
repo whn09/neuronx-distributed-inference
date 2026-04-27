@@ -87,68 +87,64 @@ def get_rmsnorm_cls():
     return MiMoV2RMSNorm if cpu_mode() else CustomRMSNorm
 
 
-def _patch_fused_tkg_for_sigmoid():
-    """Patch MoEFusedTKG kernel to use ISA router fallback for sigmoid routing.
+def _patch_fused_tkg_for_noaux_tc_bias():
+    """Disable the fused TKG mega-kernel for models with e_score_correction_bias.
 
-    The fused TKG NKI router kernel only supports softmax. For MiMo's sigmoid
-    routing, we inject use_router_topk_nki_kernel=False into kernel calls,
-    which forces the ISA (instruction-set) router fallback that supports
-    sigmoid via the config's router_act_fn setting.
+    MiMo-V2-Flash uses noaux_tc routing: sigmoid(logits) + e_score_correction_bias
+    for top-k selection, with unbiased sigmoid scores as affinity weights.  The
+    fused TKG NKI kernel (moe_block_tkg) does routing internally and has no
+    ``selection_bias`` parameter on stock SDK 2.29.  When the fused kernel runs,
+    it bypasses RouterTopK.forward() entirely — so the monkey-patched forward
+    from _apply_router_noaux_tc_fix() never executes and the bias is silently
+    lost, routing tokens to wrong experts.
 
-    On SDK 2.29, the fused TKG's moe_block_tkg natively supports sigmoid via
-    RouterActFnType.SIGMOID, so this patch may be a harmless no-op — but we
-    apply it defensively to cover SDK versions where the NKI kernel path
-    does not support sigmoid.
+    Fix: patch MoEFusedTKG._can_use_nki_kernel at the CLASS level to return
+    False for ``"moe_fused"`` when the router has e_score_correction_bias.  This
+    forces the non-fused path in MoEFusedTKG.forward(), which calls
+    _router_topk() → self.router() → our patched RouterTopK.forward() with the
+    bias.  The non-fused path still uses individual NKI kernels for expert MLP
+    computation, so it is not a full software fallback.
+
+    This is a class-level (not instance-level) patch so it takes effect before
+    any MoEFusedTKG instances are created.  It is idempotent.
     """
     try:
-        import neuronx_distributed.modules.moe.moe_fused_tkg as fused_tkg_mod
-
-        class _PatchedKernelCall:
-            """Wrapper that injects use_router_topk_nki_kernel=False."""
-
-            def __init__(self, original):
-                self._original = original
-
-            def __getitem__(self, grid):
-                original_grid_call = self._original[grid]
-
-                def patched_call(*args, **kwargs):
-                    kwargs["use_router_topk_nki_kernel"] = False
-                    return original_grid_call(*args, **kwargs)
-
-                return patched_call
-
-        patched_any = False
-
-        if hasattr(fused_tkg_mod, "_moe_token_gen_selective_load_kernel_nki_call"):
-            original_kernel = (
-                fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call
-            )
-            if original_kernel is not None:
-                fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call = (
-                    _PatchedKernelCall(original_kernel)
-                )
-                patched_any = True
-
-        if hasattr(fused_tkg_mod, "_moe_tkg_forward_all_experts_nki_call"):
-            original_all = fused_tkg_mod._moe_tkg_forward_all_experts_nki_call
-            if original_all is not None:
-                fused_tkg_mod._moe_tkg_forward_all_experts_nki_call = (
-                    _PatchedKernelCall(original_all)
-                )
-                patched_any = True
-
-        if patched_any:
-            logger.warning("Patched MoEFusedTKG for sigmoid routing (ISA fallback)")
-        else:
-            logger.warning(
-                "No fused TKG kernels found to patch (SDK 2.29 may use "
-                "different API). Sigmoid routing will use ISA fallback via config."
-            )
+        from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG
     except ImportError:
-        logger.info("moe_fused_tkg module not available, skipping patch")
-    except Exception as e:
-        logger.warning("Failed to patch MoEFusedTKG for sigmoid: %s", e)
+        logger.info("MoEFusedTKG not available; skipping noaux_tc bias patch")
+        return
+
+    if getattr(MoEFusedTKG, "_mimo_noaux_tc_bias_patched", False):
+        logger.debug("MoEFusedTKG already patched for noaux_tc bias")
+        return
+
+    _orig_can_use = MoEFusedTKG._can_use_nki_kernel
+
+    def _patched_can_use_nki_kernel(self, kernel_type, hidden_states=None):
+        """Return False for moe_fused when router has e_score_correction_bias.
+
+        The e_score_correction_bias parameter exists only when
+        _apply_router_noaux_tc_fix() has monkey-patched RouterTopK.  If present,
+        the fused mega-kernel would ignore the bias and produce wrong routing.
+        Force the non-fused path so RouterTopK.forward() runs with the bias.
+        """
+        bias = getattr(self.router, "e_score_correction_bias", None)
+        if bias is not None:
+            logger.info(
+                "Disabling fused TKG mega-kernel: router has "
+                "e_score_correction_bias (noaux_tc routing requires non-fused "
+                "path for correct expert selection)"
+            )
+            return False
+        # No bias — fall through to stock logic
+        return _orig_can_use(self, kernel_type, hidden_states)
+
+    MoEFusedTKG._can_use_nki_kernel = _patched_can_use_nki_kernel
+    MoEFusedTKG._mimo_noaux_tc_bias_patched = True
+    logger.info(
+        "Patched MoEFusedTKG._can_use_nki_kernel (class-level) to disable "
+        "fused mega-kernel for noaux_tc routing with e_score_correction_bias"
+    )
 
 
 class MiMoV2RMSNorm(nn.Module):
@@ -362,8 +358,10 @@ class MiMoV2InferenceConfig(InferenceConfig):
             moe_tp,
         )
 
-        # Patch the fused TKG kernel calls for sigmoid routing
-        _patch_fused_tkg_for_sigmoid()
+        # Note: _patch_fused_tkg_for_sigmoid() is no longer needed.
+        # SDK 2.29 natively supports sigmoid via RouterActFnType.SIGMOID.
+        # _patch_fused_tkg_for_noaux_tc_bias() (called from __init__) handles
+        # disabling the fused mega-kernel when e_score_correction_bias is present.
 
     def maybe_pad_intermediate(self):
         """Pad intermediate size if required for efficient computation."""
@@ -1453,6 +1451,18 @@ def convert_mimo_v2_hf_to_neuron_state_dict(
         )
         del neuron_state_dict[gate_key]
 
+        # Map e_score_correction_bias for noaux_tc routing.
+        # The monkey-patched RouterTopK.__init__ (from _apply_router_noaux_tc_fix)
+        # creates self.e_score_correction_bias as an nn.Parameter on the router.
+        # HF key: layers.{i}.mlp.gate.e_score_correction_bias
+        # NxDI key: layers.{i}.mlp.router.e_score_correction_bias
+        bias_key = f"layers.{layer_idx}.mlp.gate.e_score_correction_bias"
+        if bias_key in neuron_state_dict:
+            neuron_state_dict[
+                f"layers.{layer_idx}.mlp.router.e_score_correction_bias"
+            ] = neuron_state_dict[bias_key].detach().clone()
+            del neuron_state_dict[bias_key]
+
         # Get dimensions from first expert
         expert_0_gate = f"layers.{layer_idx}.mlp.experts.0.gate_proj.weight"
         if expert_0_gate not in neuron_state_dict:
@@ -1704,7 +1714,7 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
     _model_cls = NeuronMiMoV2Model
 
     def __init__(self, *args, **kwargs):
-        # Install FP8 monkey-patches BEFORE super().__init__ so the patched
+        # Install monkey-patches BEFORE super().__init__ so the patched
         # RouterTopK.__init__ and quantization layer classes are in effect
         # when NxDI builds the decoder (and instantiates routers). Harnesses
         # that drive us via model.compile()/model.load() (e.g. vllm-neuron)
@@ -1712,10 +1722,20 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
         # compile()/load() is too late — RouterTopK instances would already
         # lack our e_score_correction_bias parameter, silently routing tokens
         # to wrong experts and producing gibberish output.
-        #
-        # _install_fp8_patches() reads self.neuron_config, which needs to
-        # exist; grab it from the args or the config arg the same way the
-        # base class does.
+
+        # Router bias fix is UNCONDITIONAL — MiMo's noaux_tc routing needs
+        # e_score_correction_bias for BOTH BF16 and FP8 precisions.  Without
+        # this the bias is silently dropped and tokens route to wrong experts.
+        self._apply_router_noaux_tc_fix()
+
+        # Fused TKG mega-kernel bypass: the stock nkilib moe_block_tkg on
+        # SDK 2.29 does not support `selection_bias`, so the fused mega-kernel
+        # would silently discard the bias.  This class-level patch forces the
+        # non-fused path (RMSNorm → RouterTopK.forward() → expert MLP) so
+        # our monkey-patched RouterTopK.forward() with the bias is always used.
+        _patch_fused_tkg_for_noaux_tc_bias()
+
+        # FP8-only quantization patches — need neuron_config to check.
         ncfg = kwargs.get("config") or (args[1] if len(args) > 1 else None)
         if ncfg is not None and getattr(
             getattr(ncfg, "neuron_config", None), "quantized", False
@@ -1723,7 +1743,6 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
             self._apply_ep_scale_fix()
             self._apply_blockwise_scale_stride_fix()
             self._apply_2d_per_channel_fix()
-            self._apply_router_noaux_tc_fix()
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -1964,22 +1983,30 @@ class NeuronMiMoV2ForCausalLM(NeuronBaseForCausalLM):
         RouterTopK._mimo_v2_noaux_tc_patched = True
 
     def _install_fp8_patches(self):
-        """Install all FP8-specific runtime patches. No-op for BF16."""
+        """Install all FP8-specific runtime patches. No-op for BF16.
+
+        Note: _apply_router_noaux_tc_fix() is NOT here — it is called
+        unconditionally in __init__ since MiMo's noaux_tc routing needs
+        the bias for both BF16 and FP8.
+        """
         if not getattr(self.neuron_config, "quantized", False):
             return
         self._apply_ep_scale_fix()
         self._apply_blockwise_scale_stride_fix()
         self._apply_2d_per_channel_fix()
-        self._apply_router_noaux_tc_fix()
 
     def compile(self, *args, **kwargs):
         # save_sharded_checkpoint=True serializes shards during compile() and
         # that code path reads scale.partition_stride — patches must be live.
         self._install_fp8_patches()
+        # Idempotent safety net: ensure fused TKG bypass is active before tracing.
+        _patch_fused_tkg_for_noaux_tc_bias()
         return super().compile(*args, **kwargs)
 
     def load(self, *args, **kwargs):
         self._install_fp8_patches()
+        # Idempotent safety net: ensure fused TKG bypass is active before loading.
+        _patch_fused_tkg_for_noaux_tc_bias()
         return super().load(*args, **kwargs)
 
     @classmethod
