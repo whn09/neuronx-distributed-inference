@@ -4,7 +4,7 @@ set -e
 # MiMo-V2-Flash FP8 vLLM benchmark on Trn2.
 #
 # Requires a Neuron-FP8 preprocessed checkpoint (see
-# `src/conversion_script/preprocess_mimo_v2_flash_fp8.py`). The configs below
+# `src/conversion_script/preprocess_mimo_v2_fp8.py --attn_bf16`). The configs below
 # all use moe_tp_degree=1 / moe_ep_degree=64 (experts sharded by expert
 # parallelism only, no intra-expert TP split) because moe_tp_degree=64 collapses
 # the per-rank FP8 blockwise scale to a singleton — per-rank expert
@@ -20,14 +20,13 @@ set -e
 # this model on Trn2 — use the BF16 checkpoint with the old bench recipe
 # (`moe_tp_degree=64, moe_ep_degree=1, batch_size=1`).
 
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 
 MODEL_PATH="${MIMO_V2_FLASH_PATH:-/opt/dlami/nvme/models/MiMo-V2-Flash-Neuron-FP8}"
-# The NxDI contrib MiMo-V2-Flash modeling code is registered into vLLM /
-# NxDI lookup tables by vllm-neuron's register() hook using this env var.
-# Default to this contrib package's own src/ relative to the script.
-: "${NXDI_CONTRIB_MIMO_V2_FLASH_SRC:=$(cd "$(dirname "$0")/.." && pwd)/src}"
-export NXDI_CONTRIB_MIMO_V2_FLASH_SRC
+MODEL_NAME="${MIMO_V2_FLASH_NAME:-MiMo-V2-Flash}"
+# Contrib src/ directory (for the registration script).
+CONTRIB_SRC="$(cd "$(dirname "$0")/.." && pwd)/src"
+export NXDI_CONTRIB_MIMO_V2_FLASH_SRC="$CONTRIB_SRC"
 
 # First-time Flash FP8 compile takes 30-60 minutes; extend vLLM's ready
 # timeout and the compiler's environment variables for FP8 numerics.
@@ -42,6 +41,12 @@ mkdir -p "$RESULTS_DIR"
 # <compiled-path>/weights/tp{N}_sharded_checkpoint.safetensors during compile;
 # load() then reads those directly (~30s) instead of re-sharding the entire
 # checkpoint on every vllm-neuron startup (~10+ min).
+#
+# modules_to_not_convert includes q/k/v_proj because the recommended FP8
+# preprocessing uses --attn_bf16 to keep attention weights in BF16, avoiding
+# the lossy blockwise → per-row FP8 re-quantization that degrades reasoning
+# quality.  If preprocessing without --attn_bf16, remove q/k/v_proj from this
+# list.
 COMMON_MIMO_CONFIG='"tp_degree": 64,
             "logical_nc_config": 2,
             "fused_qkv": false,
@@ -56,8 +61,8 @@ COMMON_MIMO_CONFIG='"tp_degree": 64,
             "quantization_type": "blockwise_symmetric",
             "quantization_block_axis": [1, 2],
             "quantization_block_size": [128, 128],
-            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj"],
-            "blockwise_matmul_config": {"use_shard_on_block_dynamic_while": true, "block_sharding_strategy": "PING_PONG"}'
+            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj", "q_proj", "k_proj", "v_proj"],
+            "blockwise_matmul_config": {"use_shard_on_intermediate_dynamic_while": true, "skip_dma_token": true}'
 
 # Helper: wait for vLLM server to be ready. First-time compilation of a
 # 256-expert MoE model takes 30-90 minutes, so we poll for up to 2 hours.
@@ -90,7 +95,7 @@ run_bench() {
     echo "    Benchmark: concurrency=$concurrency, prompts=$num_prompts"
     vllm bench serve \
         --backend vllm \
-        --model "$MODEL_PATH" \
+        --model "$MODEL_NAME" \
         --tokenizer "$MODEL_PATH" \
         --endpoint /v1/completions \
         --dataset-name random \
@@ -106,7 +111,7 @@ run_bench() {
 # Helper: stop server
 stop_server() {
     echo "  Stopping vLLM server..."
-    pkill -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+    pkill -f "register_vllm.py\|vllm.entrypoints.openai.api_server" 2>/dev/null || true
     sleep 5
 }
 
@@ -117,7 +122,7 @@ sanity_check() {
         -H 'Content-Type: application/json' \
         -d '{
             "messages": [{"role": "user", "content": "What is 1+1? Answer briefly."}],
-            "model": "'"$MODEL_PATH"'",
+            "model": "'"$MODEL_NAME"'",
             "max_tokens": 64,
             "temperature": 0.0,
             "stream": false
@@ -138,16 +143,17 @@ echo ""
 CONFIG_NAME="bs32_tp64_moetp1_ep64"
 echo "--- Config 1: BS=32, moe_tp=1/moe_ep=64, CB + bucketing ---"
 
-python3 -m vllm.entrypoints.openai.api_server \
+python3 "$CONTRIB_SRC/register_vllm.py" \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
+    --served-model-name "$MODEL_NAME" \
     --tensor-parallel-size 64 \
     --max-model-len 1024 \
     --max-num-seqs 32 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --port $PORT \
-    --trust_remote_code \
+    --trust-remote-code \
     --additional-config '{
         "override_neuron_config": {
             '"$COMMON_MIMO_CONFIG"',
@@ -160,7 +166,7 @@ python3 -m vllm.entrypoints.openai.api_server \
             "seq_len": 1024,
             "is_continuous_batching": true,
             "enable_bucketing": true,
-            "context_encoding_buckets": [1024],
+            "context_encoding_buckets": [128, 256, 512, 1024],
             "token_generation_buckets": [1024],
             "async_mode": true,
             "on_device_sampling_config": {
@@ -182,16 +188,17 @@ stop_server
 CONFIG_NAME="bs128_tp64_moetp1_ep64"
 echo "--- Config 2: BS=128, moe_tp=1/moe_ep=64, CB + bucketing ---"
 
-python3 -m vllm.entrypoints.openai.api_server \
+python3 "$CONTRIB_SRC/register_vllm.py" \
     --model "$MODEL_PATH" \
     --tokenizer "$MODEL_PATH" \
+    --served-model-name "$MODEL_NAME" \
     --tensor-parallel-size 64 \
     --max-model-len 1024 \
     --max-num-seqs 128 \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching \
     --port $PORT \
-    --trust_remote_code \
+    --trust-remote-code \
     --additional-config '{
         "override_neuron_config": {
             '"$COMMON_MIMO_CONFIG"',
@@ -204,7 +211,7 @@ python3 -m vllm.entrypoints.openai.api_server \
             "seq_len": 1024,
             "is_continuous_batching": true,
             "enable_bucketing": true,
-            "context_encoding_buckets": [1024],
+            "context_encoding_buckets": [128, 256, 512, 1024],
             "token_generation_buckets": [1024],
             "async_mode": true,
             "on_device_sampling_config": {
