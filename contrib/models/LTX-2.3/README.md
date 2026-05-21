@@ -28,55 +28,63 @@ Key parameters:
 
 ## Performance
 
-Numbers from a single trn2.3xlarge run, SDK 2.28, 384×512 / 25 frames / 8 steps, single-stage T2V with Neuron-compiled Gemma 3:
+Numbers from a single trn2.48xlarge run, SDK 2.28, single-stage T2V with Neuron-compiled Gemma 3 (TP=4) and the distilled 22B backbone (TP=4):
+
+### Warm-state per-run wall clock (after warmup-run)
+
+| Resolution | Frames | DiT step (warm) | Denoise (8 steps) | Video decode (CPU) | Audio decode (CPU) | Run total |
+|---|---:|---:|---:|---:|---:|---:|
+| 384×512 | 25 | 0.3 s | 2.4 s | 7.2 s | 2.5 s | ~12 s |
+| 384×512 | 81 | 0.6 s | **5.1 s** | **3.6 s** | **3.4 s** | **16.2 s** |
+
+Cold-start overheads (one-time per process, recorded in the discarded warmup run):
 
 | Phase | Time | Notes |
 |---|---:|---|
-| `text_encode` (Neuron Gemma 3, warm) | ~1.3 s | Tokenize + forward + post-process; cold first call adds ~16 s NEFF warmup |
-| `transformer_warmup` (DiT, 1 call) | 138.5 s | First NEFF load onto cores |
-| `transformer_forward` step 1 (cold) | 174.6 s | Neuron device initialization |
-| `transformer_forward` steps 2–8 (warm) | **0.3 s / step** | Steady-state |
-| Total denoising (8 steps) | 176.9 s | Dominated by step-1 cold start |
-| `video_decode` (CPU VAE) | 7.2 s | 25 frames @ 384×512 |
-| `video_decode` (Neuron tiled VAE, TP=4) | 23.5 s @ 1024×1536 / 121 f | 33 tiles × 610 ms; 3.3× faster than CPU VAE at that resolution |
-| `audio_decode` (CPU) | 2.5 s | Stereo 48 kHz WAV |
+| `transformer_warmup` (DiT NEFF load) | ~190 s | First NEFF load onto cores |
+| `transformer_forward` step 1 (cold) | ~270–380 s | Neuron device init + step-invariant cache fill |
+| Gemma 3 NEFF rehydration | ~360 s | One-time per instance, persists across processes |
 
-Per-step warm DiT detail (384×512, with the AdaLN dedup + step-invariant caching CPU optimizations enabled):
+`video_decode` on the Neuron tiled VAE (TP=4, see `tiled_vae_decode_23.py`) is **3.3× faster than CPU at 1024×1536 / 121 f** (23.5 s vs ~78 s) but loses to CPU at 384×512 (overhead beats the savings).
 
-| Component | Time | % of step |
-|---|---:|---:|
-| CPU preprocess | 33.1 ms | 11.9 % |
-| Neuron backbone forward | 244.1 ms | 87.4 % |
-| Euler step | 2.1 ms | 0.7 % |
-| **Total per step** | **279.3 ms** | 100 % |
+CPU-side optimizations applied in `pipeline.py` to keep the warm step short:
 
-Two CPU preprocessing optimizations close the gap to the Neuron forward:
-
-1. **AdaLN deduplication** — when all tokens share the same sigma (T2V), the AdaLN MLP is computed once instead of per-token (768 tokens). Saves ~47 ms / step.
-2. **Step-invariant caching** — RoPE embeddings, context projection, and attention masks are constant across denoising steps; computed once on step 1 and reused. Saves ~57 ms / step (context projection alone is ~55 ms).
-
-Overall per-step improvement vs unoptimized baseline: 330 ms → 279 ms (15.4 % reduction).
+1. **AdaLN deduplication (T2V)** — when all tokens share the same sigma, the AdaLN MLP is computed once and broadcast (~47 ms / step at 25 f).
+2. **Step-invariant caching** — RoPE, context projection, and additive attention masks are constant across denoising steps; computed once on step 1 and reused for steps 2–N (~57 ms / step at 25 f).
 
 ### Phase-timer output
 
-Every `generate_ltx23.py` run emits a `=== Phase breakdown ===` summary at exit, populated by `PhaseTimer` (mirrors the helper used in `contrib/models/Wan2.2-TI2V-5B/src/run_wan2.2_ti2v.py`). Sample:
+Every `generate_ltx23.py` run emits one `=== Phase breakdown [<run-label>] ===` per timed run, populated by `PhaseTimer` (mirrors the helper in `contrib/models/Wan2.2-TI2V-5B/src/run_wan2.2_ti2v.py`). The discarded warmup-run absorbs the step-1 cold start; the `[main]` block is the steady-state number you want for benchmarking. Sample (384×512 / 81 frames):
 
 ```
-=== Phase breakdown (E2E) ===
-  text_encode           1.30s  (  0.7%)  calls=  1  avg= 1304.2ms
-  transformer_warmup  138.50s  ( 70.3%)  calls=  1  avg=138502.6ms
-  transformer_forward  37.50s  ( 19.0%)  calls=  8  avg= 4687.8ms
-  video_decode          7.20s  (  3.7%)  calls=  1  avg= 7195.4ms
-  audio_decode          2.50s  (  1.3%)  calls=  1  avg= 2501.3ms
-  (unaccounted)         9.97s  (  5.0%)
-  total               197.00s
+=== Phase breakdown [warmup] ===
+  text_encode             9.26s  (  2.3%)  calls=  1  avg= 9256.6ms
+  transformer_warmup    201.38s  ( 50.7%)  calls=  1  avg=201375.9ms
+  transformer_forward   385.55s  ( 97.1%)  calls=  8  avg=48193.8ms   <- step 1 = 381s cold
+  video_decode            3.56s  (  0.9%)  calls=  1  avg= 3564.5ms
+  audio_decode            3.49s  (  0.9%)  calls=  1  avg= 3490.7ms
+
+=== Phase breakdown [main] ===
+  transformer_forward     5.14s  ( 31.7%)  calls=  8  avg=  643.0ms   <- 8/8 steady-state
+  video_decode            3.54s  ( 21.9%)  calls=  1  avg= 3542.8ms
+  audio_decode            3.37s  ( 20.8%)  calls=  1  avg= 3370.8ms
+
+=== Run summary ===
+  warmup        397.18s
+  main           16.21s
 ```
 
-Phases are recorded for both single-stage and two-stage paths (and on the Phase-1-only `--save-s1-latent` early-return path).
+Phases are recorded for both single-stage and two-stage paths (and on the Phase-1-only `--save-s1-latent` early-return path). Pass `--num-runs N` to record `[run_1/N] … [run_N/N]` after the warmup, or `--no-warmup-run` to time the cold path on purpose.
 
 ### Resolution sweep
 
-A multi-resolution wall-clock sweep (512×384, 720×480, 1280×704 at 25 / 121 frames) is **TODO**. Each row needs a fresh DiT + VAE compile (~30 min) plus an 8-step inference (~3 min cold), so the table will be filled in by a follow-up PR.
+| Resolution | Frames | latent_f × video_seq | DiT step (warm) | Run total (warm) |
+|---|---:|---|---:|---:|
+| 384×512 | 25 | 4 × 768 | 0.3 s | ~12 s |
+| 384×512 | 81 | 11 × 2112 | 0.6 s | 16.2 s |
+| 720×480, 1280×704 | 25 / 121 | — | — | TODO |
+
+Each new row needs a fresh DiT compile (latent_f / video_seq are baked into the NEFF; see `--num-frames` on `compile.py transformer`) plus a re-shard. With the artifacts in place, a warm-run measurement is cheap (~16 s for 81 f).
 
 ## Prerequisites
 
@@ -158,7 +166,10 @@ python3 src/shard_weights.py encoder \
 ### 5. Run Inference
 
 ```bash
-# Text-to-Video (T2V) with Neuron-compiled Gemma 3 (recommended path)
+# Text-to-Video (T2V) with Neuron-compiled Gemma 3 (recommended path).
+# Default behavior runs a discarded warmup-run (~5 min on 81 f) followed by
+# one timed run; pass --num-runs N to record N timed runs, or --no-warmup-run
+# to skip the warmup.
 python3 src/generate_ltx23.py \
   --neuron-gemma \
   --model-path /opt/dlami/nvme/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
@@ -167,6 +178,7 @@ python3 src/generate_ltx23.py \
   --gemma-sharded-dir /opt/dlami/nvme/models/gemma-3-12b-it_sharded \
   --backbone-sharded-dir /opt/dlami/nvme/models/LTX-2.3/backbone_sharded \
   --compile-dir /opt/dlami/nvme/compiled_models_ltx23/backbone \
+  --num-frames 81 \
   --prompt "A golden retriever puppy runs across a sunny green meadow" \
   --output-dir ./out
 
@@ -276,4 +288,4 @@ LTX-2.3/
 
 Henan Wan (whn09), forked from jimburtoft/contrib/ltx-2.3.
 
-**Last Updated:** 2026-05-21 (PhaseTimer + unified compile.sh)
+**Last Updated:** 2026-05-21 (warmup-run + 81-frame baseline)
