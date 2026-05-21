@@ -53,7 +53,7 @@ class BlockKVCacheManager(KVCacheManager):
         block_size = config.neuron_config.pa_block_size
         max_num_blocks_per_seq = (config.neuron_config.max_length + block_size - 1) // block_size
         if config.neuron_config.is_prefix_caching and max_num_blocks_per_seq < 128 and \
-                not (config.neuron_config.attn_tkg_nki_kernel_enabled or config.neuron_config.attn_block_tkg_nki_kernel_enabled):
+                not config.neuron_config.attn_block_tkg_nki_kernel_enabled:
             # Enable tiling on block_size dimension to avoid V cache transpose.
             # The tiling factor is the smallest power of 2 that's larger than or equal to
             # 128 / max_num_blocks_per_seq, so that the block_size dimension can be
@@ -130,6 +130,11 @@ class BlockKVCacheManager(KVCacheManager):
 
     def get_kv_by_layer_id(self, idx, active_block_table, kvcache_buffer=None, **kwargs):
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer=kvcache_buffer)
+
+        if self.kv_quant_config:
+            k_cache = self._dequantize_cache(k_cache, idx, is_key=True)
+            v_cache = self._dequantize_cache(v_cache, idx, is_key=False)
+
         if self.is_prefix_caching:
             key_state = self._get_block_cache_and_reshape_bhsd(k_cache, active_block_table)
             value_state = self._get_block_cache_and_reshape_bhsd(v_cache, active_block_table)
@@ -239,15 +244,22 @@ class BlockKVCacheManager(KVCacheManager):
         kvcache_buffer=None,
         **kwargs,
     ):
+        latest_k, latest_v = kv_per_layer[0], kv_per_layer[1]
+
+        # Quantize before writing to cache
+        if self.kv_quant_config:
+            latest_k = self._quantize_cache(latest_k, idx, is_key=True)
+            latest_v = self._quantize_cache(latest_v, idx, is_key=False)
+
         k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer=kvcache_buffer)
         slot_mapping = scatter_index
         k_cache = self._update_cache_into_block_layout(
-            latest=kv_per_layer[0],
+            latest=latest_k,
             cache=k_cache,
             slot_mapping=slot_mapping,
         )
         v_cache = self._update_cache_into_block_layout(
-            latest=kv_per_layer[1],
+            latest=latest_v,
             cache=v_cache,
             slot_mapping=slot_mapping,
         )

@@ -1,5 +1,7 @@
 # Standard Library
+import os
 import unittest
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -9,6 +11,7 @@ import torch_neuronx
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace import parallel_model_trace
+from torch_neuronx.utils import get_platform_target
 
 from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.modules.generation.sampling import (
@@ -18,6 +21,10 @@ from neuronx_distributed_inference.modules.generation.sampling import (
     prepare_sampling_params,
     validate_sampling_params
 )
+
+# Setup platform target for NKI kernels
+if not os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
 
 
 class TestSampling(unittest.TestCase):
@@ -226,6 +233,90 @@ class TestSampling(unittest.TestCase):
             # Reset groups
             parallel_state.destroy_model_parallel()
             torch.distributed.destroy_process_group()
+
+
+class TestSamplerMultinomialEdgeCases:
+    """Test edge cases for Sampler._multinomial"""
+
+    @pytest.fixture
+    def mock_neuron_config(self):
+        config = Mock()
+        config.on_cpu = True
+        config.on_device_sampling_config = Mock()
+        config.on_device_sampling_config.do_sample = True
+        config.on_device_sampling_config.dynamic = False
+        config.on_device_sampling_config.deterministic = False
+        config.on_device_sampling_config.global_topk = 0
+        config.on_device_sampling_config.top_k_kernel_enabled = False
+        return config
+
+    @pytest.fixture
+    def sampler(self, mock_neuron_config):
+        return Sampler(mock_neuron_config, do_sample=True)
+
+    @pytest.mark.parametrize(
+        "probs",
+        [
+            # Create probabilities that sum to just below 1.0
+            # 2d case
+            torch.tensor([[0.249, 0.249, 0.249, 0.249]], dtype=torch.float32),
+            # 3d case
+            torch.tensor([
+                [[0.19, 0.19, 0.19, 0.19, 0.19],
+                [0.18, 0.20, 0.20, 0.20, 0.18],
+                [0.21, 0.19, 0.19, 0.19, 0.19]],
+                [[0.20, 0.19, 0.19, 0.19, 0.19],
+                [0.19, 0.19, 0.20, 0.20, 0.19],
+                [0.18, 0.20, 0.20, 0.20, 0.19]]
+            ], dtype=torch.float32),
+        ]
+    )
+    def test_rand_near_one_with_cumsum_below_one(self, sampler, probs):
+        """
+        Test that a random value close to 1 produces valid indices even when cumsum < 1
+        Cumsum != 1 can occur due to floating point inaccuracy
+        """
+        # Mock _rand_selector to return value very close to 1.0
+        with patch.object(sampler, '_rand_selector') as mock_rand:
+            mock_rand.return_value = torch.full(probs.shape, 0.9999999)
+
+            dim = probs.ndim - 1
+            counts = sampler._multinomial(probs, dim=dim, num_samples=1)
+
+            # All results should pick the last token
+            assert torch.all(counts == probs.shape[dim] - 1)
+            mock_rand.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "probs",
+        [
+            # Create probabilities that sum to just above 1.0
+            # 2d case
+            torch.tensor([[0.251, 0.251, 0.251, 0.251, 0.001]], dtype=torch.float32),
+            # 3d case
+            torch.tensor([
+                [[0.21, 0.21, 0.21, 0.21, 0.21, 0.001],
+                [0.21, 0.20, 0.20, 0.20, 0.21, 0.001]],
+                [[0.21, 0.21, 0.21, 0.21, 0.21, 0.001],
+                [0.21, 0.20, 0.20, 0.20, 0.21, 0.001]]
+            ], dtype=torch.float32),
+        ]
+    )
+    def test_rand_near_one_with_cumsum_above_one(self, sampler, probs):
+        """
+        Test that a random value close to 1 correctly samples tokens beyond 1 when cumsum > 1
+        Cumsum != 1 can occur due to floating point inaccuracy
+        """
+        # Mock _rand_selector to return value very close to 1.0
+        with patch.object(sampler, '_rand_selector') as mock_rand:
+            mock_rand.return_value = torch.full(probs.shape, 0.9999999)
+
+            dim = probs.ndim - 1
+            counts = sampler._multinomial(probs, dim=dim, num_samples=1)
+
+            # All results should pick the last token
+            assert torch.all(counts == probs.shape[dim] - 1)
+            mock_rand.assert_called_once()
 
 
 def get_sampler(topk, num_beams, on_device=True):

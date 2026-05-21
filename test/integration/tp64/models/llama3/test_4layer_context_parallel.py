@@ -113,7 +113,7 @@ STRIDED_KERNEL_CP_CONFIG_CP16_TP4 = NeuronConfig(
 )
 
 @pytest.fixture(scope="module", autouse=True)
-def model_path():
+def model_path(set_module_seed):
     # Load model from config, and save with random weights.
     config_path = os.path.dirname(os.path.abspath(__file__)) + "/config.json"
 
@@ -139,13 +139,13 @@ def model_path():
         pytest.param(SP_DISABLED_NEURON_CONFIG_CP4_TP16, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
         pytest.param(PERF_CONFIG_CP4_TP16, 311.78, 803.67, True, None),
         pytest.param(KERNEL_CONFIG_CP4_TP16, float('inf'), 0, False, 0.024),
-        pytest.param(KERNEL_CONFIG_CP8_TP8, float('inf'), 0, False, 0.024, marks=pytest.mark.xfail),
+        pytest.param(KERNEL_CONFIG_CP8_TP8, float('inf'), 0, False, 0.024),
         pytest.param(STRIDED_KERNEL_CP_SP_CONFIG_CP16_TP4, float('inf'), 0, False, 0.024),
         pytest.param(STRIDED_KERNEL_CP_SP_CONFIG_CP4_TP16, float('inf'), 0, False, 0.024),
         pytest.param(STRIDED_KERNEL_CP_CONFIG_CP16_TP4, float('inf'), 0, False, 0.024),
-        pytest.param(STRIDED_KERNEL_CP_SP_CONFIG_CP8_TP8, float('inf'), 0, False, 0.024, marks=pytest.mark.xfail),
-        pytest.param(SP_NEURON_CONFIG_CP8_TP8, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
-        pytest.param(SP_DISABLED_NEURON_CONFIG_CP8_TP8, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE, marks=pytest.mark.xfail),
+        pytest.param(STRIDED_KERNEL_CP_SP_CONFIG_CP8_TP8, float('inf'), 0, False, 0.024),
+        pytest.param(SP_NEURON_CONFIG_CP8_TP8, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
+        pytest.param(SP_DISABLED_NEURON_CONFIG_CP8_TP8, float('inf'), 0, False, DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE),
     ],
     # fmt: on
 )

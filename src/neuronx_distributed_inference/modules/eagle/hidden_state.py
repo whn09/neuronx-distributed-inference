@@ -1,5 +1,76 @@
 import torch
 
+import nki
+import nki.isa as nisa
+import nki.language as nl
+
+
+@nki.jit
+def rolling_buffer_set_state(
+    buffer: nl.ndarray,  # float [max_batch_size, buffer_size, hidden_size] - mutable
+    hidden_states: nl.ndarray,   # float [batch_size, hidden_size]
+    batch_ids: nl.ndarray,       # int   [batch_size]
+    position_ids: nl.ndarray,    # int   [batch_size]
+):
+    """
+    Insert hidden states into a rolling buffer at the batch & token position.
+
+    This kernel is used to ensure that large DMAs are performed for the hidden
+    state update. When this kernel is not used, it is possible to encounter
+    inefficient LNC sharding that uses many small DMAs in order to perform the
+    state write.
+
+    For simplicity, this kernel uses single index DMAs and a single NeuronCore
+    for each scatter.
+
+    Arguments:
+        buffer: The rolling buffer to insert values into.
+        hidden_states: The new hidden states to insert into the rolling buffer.
+        batch_ids: The batch or sequence ids for each hidden state
+        position_ids: The position of each token. This function assumes that position
+            modification has been applied (positions_ids % buffer_length).
+
+    Returns:
+        The rolling buffer modified in-place.
+    """
+    batch_size = batch_ids.shape[0]
+    max_batch_size, buffer_size, hidden_size = buffer.shape
+
+    # Validate that inputs are of expected size
+    assert hidden_states.shape[0] == batch_size
+    assert position_ids.shape[0] == batch_size
+    assert buffer.shape[0] >= batch_size
+    assert buffer.shape[-1] == hidden_states.shape[-1]
+
+    reshaped = buffer.reshape((max_batch_size * buffer_size, hidden_size))
+
+    batch_id_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    position_id_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    index = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+
+    # Loop over batch to avoid issues with HBM -> HBM Vector DMAs (uCode-135)
+    for i in range(batch_size):
+        # Compute positional offset into the rolling buffer
+        nisa.dma_copy(dst=batch_id_sb, src=batch_ids[i])
+        nisa.dma_copy(dst=position_id_sb, src=position_ids[i])
+        nisa.tensor_scalar(dst=base, data=batch_id_sb, op0=nl.multiply, operand0=buffer_size)
+        nisa.tensor_tensor(dst=index, data1=base, data2=position_id_sb, op=nl.add)
+
+        # Scatter into the hidden buffer on one NeuronCore
+        nisa.dma_copy(
+            dst=reshaped.ap(
+                pattern=[[hidden_size, 1], [1, hidden_size]],
+                offset=0,
+                scalar_offset=index,
+                indirect_dim=0
+            ),
+            src=hidden_states[i, 0:hidden_size],
+            oob_mode=nisa.oob_mode.skip
+        )
+
+    return buffer
+
 
 class HiddenStateRollingBuffer(torch.nn.Module):
     """
@@ -36,6 +107,7 @@ class HiddenStateRollingBuffer(torch.nn.Module):
         dtype: torch.dtype = torch.float32,
         inplace: bool = False,
         apply_seq_ids_mask: bool = False,
+        use_kernel: bool = False,
     ):
         super().__init__()
         self.max_batch_size = max_batch_size
@@ -47,6 +119,7 @@ class HiddenStateRollingBuffer(torch.nn.Module):
             torch.zeros(self.shape, dtype=dtype), requires_grad=False
         )
         self.apply_seq_ids_mask = apply_seq_ids_mask
+        self.use_kernel = use_kernel
 
     def set_state(
         self,
@@ -63,7 +136,12 @@ class HiddenStateRollingBuffer(torch.nn.Module):
         hidden_state = hidden_state.squeeze(1)
         index = (seq_ids, position_ids % self.buffer_length)
 
-        result = torch.index_put(self.hidden_states, index, hidden_state)
+        # Always use kernel scatter when executing on-device
+        if hidden_state.device.type == 'cpu' or not self.use_kernel:
+            result = torch.index_put(self.hidden_states, index, hidden_state)
+        else:
+            result = rolling_buffer_set_state(self.hidden_states.data, hidden_state, *index)
+
         if self.inplace:
             self.hidden_states.data = result
         return result

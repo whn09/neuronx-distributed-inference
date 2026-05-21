@@ -13,7 +13,7 @@ from neuronx_distributed_inference.modules.generation.sampling import prepare_sa
 IMAGE_TO_TEXT_MODEL_WRAPPER_INPUT_KEYS = ("input_ids", "attention_mask", "position_ids", "seq_ids", "sampling_params", "prev_hidden",
                                           "adapter_ids", "accepted_indices", "current_length", "medusa_mask", "scatter_index", "slot_mapping",
                                           "active_block_table", "num_queries", "computed_context_lens", "tile_q_indices", "tile_block_tables",
-                                          "tile_masks", "inputs_embeds", "kv_cache", "active_mask", "rotary_position_id", "vision_embeddings", "vision_mask")
+                                          "tile_masks", "inputs_embeds", "kv_cache", "active_mask", "rotary_position_ids", "vision_embeddings", "vision_mask")
 
 
 class ImageToTextModelWrapper(ModelWrapper):
@@ -30,6 +30,8 @@ class ImageToTextModelWrapper(ModelWrapper):
         tag="",
         compiler_args: str = None,
         priority_model_idx: int = None,
+        pipeline_execution: bool = False,
+        return_ranked_to_cpu: bool = False,
         model_init_kwargs={},
     ) -> None:
         # This wrapper is for image understanding models which include a vision and text model. The model conditionally contains
@@ -47,6 +49,8 @@ class ImageToTextModelWrapper(ModelWrapper):
             tag=tag,
             compiler_args=compiler_args,
             priority_model_idx=priority_model_idx,
+            pipeline_execution=pipeline_execution,
+            return_ranked_to_cpu=return_ranked_to_cpu,
             model_init_kwargs=model_init_kwargs,
         )
 
@@ -140,9 +144,10 @@ class ImageToTextModelWrapper(ModelWrapper):
         │    18 │ inputs_embeds         │
         │    19 │ kv_cache              │
         │    20 │ active_mask           │
-        │    21 │ rotary_position_id    │
+        │    21 │ rotary_position_ids   │
         │    22 │ vision_embeddings     │
         │    23 │ vision_mask           │
+        │    24 │deepstack_vision_embeds│
         └───────┴───────────────────────┘
         """
 
@@ -196,8 +201,8 @@ class ImageToTextModelWrapper(ModelWrapper):
             batch_sort_indices=indices if not self.is_prefix_caching else None,
         )
         padded_args.append(padded_sampling_params)
-        # add args prev_hidden --> vision_mask without padding
-        for i, arg in enumerate(args[5:24]):
+        # add args prev_hidden --> deepstack_vision_embeds without padding
+        for i, arg in enumerate(args[5:25]):
             padded_args.append(arg)
 
         outputs = self._forward(*padded_args)
@@ -293,7 +298,7 @@ class ImageToTextModelWrapper(ModelWrapper):
                         torch.empty(0),  # inputs_embeds: Optional[torch.FloatTensor] = None,
                         torch.empty(0),  # kv_cache: Optional[torch.Tensor] = None,
                         torch.empty(0),  # active_mask=None,
-                        torch.empty(0),  # rotary_position_id=None,
+                        torch.empty(0),  # rotary_position_ids=None,
                         vision_embeddings,
                         vision_mask,
                     )

@@ -28,14 +28,19 @@ class TestKVCacheManager(unittest.TestCase):
                         "torch_dtype": torch.float32,
                         "attention_dtype": torch.float32,
                         "kv_cache_quant": False,
+                        "kv_quant_config": None,
                         "tp_degree": 1,
                         "cp_degree": 1,
                         "attention_dp_degree": 1,
                         "max_length": 10,
                         "batch_size": 2,
+                        "max_batch_size": 2,
                         "k_cache_transposed": False,
                         "apply_seq_ids_mask": False,
                         "is_prefill_stage": True,
+                        "logical_nc_config": 1,
+                        "switch_cc": False,
+                        "token_generation_batches": None,
                     },
                 )
                 self.num_cores_per_group = 1
@@ -430,8 +435,6 @@ class TestKVCacheManager(unittest.TestCase):
         self.config.neuron_config.is_continuous_batching = False
         self.config.neuron_config.kv_cache_padding_size  = 0
         self.config.neuron_config.max_length = 16
-        self.config.neuron_config.attn_tkg_builtin_kernel_enabled = False
-        self.config.neuron_config.attn_tkg_nki_kernel_enabled = False
         self.config.neuron_config.attn_block_tkg_nki_kernel_enabled = False
 
         kv_cache_manager = KVCacheManager(config=self.config, num_kv_head=num_kv_heads, windowed_context_encoding_size=wce_size)

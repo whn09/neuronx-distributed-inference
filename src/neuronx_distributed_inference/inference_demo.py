@@ -13,6 +13,7 @@ import torch
 from neuronx_distributed.quantization.quantization_config import (
     ActivationQuantizationType,
     QuantizationType,
+    KVQuantizationConfig,
 )
 from transformers import AutoTokenizer, GenerationConfig
 
@@ -25,10 +26,12 @@ from neuronx_distributed_inference.models.config import (
 )
 from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
 from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaForCausalLM
+from neuronx_distributed_inference.models.mistral.modeling_mistral import NeuronMistralForCausalLM
 from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
 from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
 from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+from neuronx_distributed_inference.models.gemma3.modeling_gemma3 import NeuronGemma3ForCausalLM
 from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.accuracy import (
     check_accuracy,
@@ -50,11 +53,13 @@ set_random_seed(0)
 
 MODEL_TYPES = {
     "llama": {"causal-lm": NeuronLlamaForCausalLM},
+    "mistral": {"causal-lm": NeuronMistralForCausalLM},
     "mixtral": {"causal-lm": NeuronMixtralForCausalLM},
     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
+    "gemma3": {"causal-lm": NeuronGemma3ForCausalLM},
 }
 
 
@@ -154,6 +159,7 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
 
     # On device sampling
     run_parser.add_argument("--on-device-sampling", action="store_true")
+    run_parser.add_argument("--sampling-dp-degree", type=int)
 
     # Bucketing
     run_parser.add_argument("--enable-bucketing", action="store_true")
@@ -169,6 +175,24 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
         "--quantization-type", type=str, choices=[t.value for t in QuantizationType]
     )
     run_parser.add_argument("--kv-cache-quant", action="store_true")
+
+    def str_to_quantization_type(value):
+        for qt in QuantizationType:
+            if qt.value == value:
+                return qt
+
+        raise ValueError(f"Invalid quantization type: {value}")
+
+    run_parser.add_argument("--k-quant-method", type=str_to_quantization_type,
+                            default=QuantizationType.PER_TENSOR_SYMMETRIC,
+                            help="Quantization method for K cache (choices: per_tensor_symmetric, per_channel_symmetric, per_key_symmetric)")
+    run_parser.add_argument("--v-quant-method", type=str_to_quantization_type,
+                            default=QuantizationType.PER_TENSOR_SYMMETRIC,
+                            help="Quantization method for V cache (choices: per_tensor_symmetric, per_channel_symmetric, per_key_symmetric)")
+    run_parser.add_argument("--kv-quant-dtype", type=to_torch_dtype, default="float8_e4m3fn",
+                            help="Quantization dtype for KV cache")
+    run_parser.add_argument("--kv-direct-cast", action=argparse.BooleanOptionalAction, default=True,
+                            help="Use direct casting for KV quantization (use --no-kv-direct-cast to disable)")
     run_parser.add_argument("--quantization-dtype", type=str)
     run_parser.add_argument(
         "--modules-to-not-convert-file",
@@ -280,7 +304,6 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--attn-kernel-enabled", action=argparse.BooleanOptionalAction, default=None)
     run_parser.add_argument("--strided-context-parallel-kernel-enabled", action="store_true")
     run_parser.add_argument("--mlp-kernel-enabled", action="store_true")
-    run_parser.add_argument("--mlp-tkg-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
     run_parser.add_argument("--fused-rmsnorm-skip-gamma", action="store_true")
     run_parser.add_argument(
@@ -292,12 +315,9 @@ def setup_run_parser(run_parser: argparse.ArgumentParser):
     run_parser.add_argument("--quantize-clamp-bound", type=float, default=float("inf"))
     run_parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
     run_parser.add_argument("--qkv-kernel-fuse-residual-add", action="store_true")
-    run_parser.add_argument("--attn-tkg-nki-kernel-enabled", action="store_true")
-    run_parser.add_argument("--attn-tkg-builtin-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-cascaded-attention", action="store_true")
     run_parser.add_argument("--attn-block-tkg-nki-kernel-cache-update", action="store_true")
-    run_parser.add_argument("--attn-block-cte-nki-kernel-enabled", action="store_true")
     run_parser.add_argument("--k-cache-transposed", action="store_true")
     run_parser.add_argument("--is-eagle3", action="store_true")
 
@@ -427,6 +447,21 @@ def create_neuron_config(model_cls, args):
         config_kwargs["chunked_prefill_config"] = ChunkedPrefillConfig(
             max_num_seqs=max_num_seqs,
         )
+
+    if args.kv_cache_quant:
+        kv_quant_kwargs = {}
+
+        if hasattr(args, "k_quant_method") and args.k_quant_method:
+            kv_quant_kwargs["k_quant_method"] = args.k_quant_method
+        if hasattr(args, "v_quant_method") and args.v_quant_method:
+            kv_quant_kwargs["v_quant_method"] = args.v_quant_method
+        if hasattr(args, "kv_quant_dtype") and args.kv_quant_dtype:
+            kv_quant_kwargs["quant_dtype"] = args.kv_quant_dtype
+        if hasattr(args, "kv_direct_cast"):
+            kv_quant_kwargs["direct_cast"] = args.kv_direct_cast
+
+        config_kwargs["kv_quant_config"] = KVQuantizationConfig(**kv_quant_kwargs)
+
     if (args.quantized and args.quantization_dtype == "f8e4m3") or args.kv_cache_quant:
         os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
         os.environ["UNSAFE_FP8FNCAST"] = "1"

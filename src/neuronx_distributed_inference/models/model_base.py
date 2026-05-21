@@ -17,12 +17,10 @@ from neuronx_distributed.parallel_layers.mappings import (
     _gather_along_dim,
     _reduce_scatter_along_dim,
     gather_from_sequence_parallel_region,
-    _traced_spmd_tiled_rs,
-    _traced_tiled_rs,
 )
 from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group
-from neuronxcc.nki.compiler.backends.neuron.dimensions import CCPipeline   # noqa: N813
 from neuronx_distributed.quantization.quantization_utils import convert_qint8_to_int8_state_dict
+from neuronx_distributed.utils.tensor_capture.registry import TensorRegistry
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -41,9 +39,6 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402
     ModelWrapper,
 )
 from neuronx_distributed_inference.modules.async_execution import causal_lm_async_execution
-from neuronx_distributed_inference.modules.attention import utils as attn_utils
-from neuronx_distributed_inference.modules.chunked_prefill.scheduler import GridTileScheduler
-from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
 from neuronx_distributed_inference.modules.eagle.hidden_state import HiddenStateRollingBuffer
 from neuronx_distributed_inference.modules.eagle.token_tree import TokenTree
 from neuronx_distributed_inference.modules.flashdecode.utils import (
@@ -52,7 +47,7 @@ from neuronx_distributed_inference.modules.flashdecode.utils import (
     turn_2d_mask_to_4d,
 )
 from neuronx_distributed_inference.modules.generation.sampling import (
-    Sampler,
+    create_sampler,
     mask_padded_logits,
     prepare_sampling_params,
     rand_like,
@@ -62,7 +57,6 @@ from neuronx_distributed_inference.modules.generation.sampling import (
 from neuronx_distributed_inference.modules.generation.seq_parallel_logits_slice import (
     seq_parallel_slice_last_token,
 )
-from neuronx_distributed_inference.modules.kvcache import utils as kvcache_utils
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import BlockKVCacheManager, generate_tokengen_slot_mapping, generate_fusedspec_slot_mapping
 from neuronx_distributed_inference.modules.kvcache.data_parallel_kv_cache_manager import DataParallelKVCacheManager
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
@@ -71,16 +65,6 @@ from neuronx_distributed_inference.utils.distributed import get_tp_group
 from neuronx_distributed_inference.utils.random import set_random_seed
 from neuronx_distributed_inference.modules.attention.utils import get_kernel_cache_size_bucket, stride_tensor, chunk_and_reorder_tensor
 from neuronx_distributed_inference.modules.attention.attention_process_groups import get_flattened_inverted_tp_cp_group_mesh
-from neuronxcc.nki.language import nc
-try:
-    from neuronxcc.nki._pre_prod_kernels.attention_token_gen import (
-        gen_cache_mask_for_attention_tkg_kernel,
-    )
-except ImportError:
-    logging.warning(
-        "Use a more recent neuron compiler version to enable gen_cache_mask_for_attention_tkg_kernel"
-    )
-    gen_cache_mask_for_attention_tkg_kernel = None
 
 
 class NeuronBaseModel(nn.Module):
@@ -110,7 +94,6 @@ class NeuronBaseModel(nn.Module):
         self.rank_util = SPMDRank(world_size=self.config.neuron_config.tp_degree)
         self.num_cores_per_group = config.num_cores_per_group
         self.is_block_kv_layout = config.neuron_config.is_block_kv_layout
-        self.is_chunked_prefill = config.neuron_config.is_chunked_prefill
         self.is_prefix_caching = config.neuron_config.is_prefix_caching
         self.attention_chunk_size = None
         self.sliding_window = None
@@ -177,7 +160,10 @@ class NeuronBaseModel(nn.Module):
 
     def init_inference_optimization(self, config: InferenceConfig):
         if self.on_device_sampling:
-            self.sampler = Sampler(config.neuron_config)
+            lm_head_tp_degree = None
+            if hasattr(self, "lm_head") and hasattr(self.lm_head, "tensor_parallel_group"):
+                lm_head_tp_degree = self.lm_head.tensor_parallel_group.size()
+            self.sampler = create_sampler(config.neuron_config, lm_head_tp_degree)
 
         if config.neuron_config.attention_dp_degree > 1:
             self.kv_mgr = DataParallelKVCacheManager(config, num_kv_head=self.num_key_value_heads, global_rank=self.rank_util)
@@ -256,36 +242,6 @@ class NeuronBaseModel(nn.Module):
         mask = (j <= i) & (j >= (i - window_size + 1))  # Create mask: causal and within window
         mask = mask[None, None, :, :].expand(self.batch_size, 1, self.n_positions, self.n_positions)
         return mask
-
-    def _create_chunked_prefill_attn_mask(
-        self,
-        attention_mask: torch.Tensor,
-        is_for_context_encoding: bool,
-        query_lens: torch.Tensor,
-        key_lens: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        if is_for_context_encoding:
-            # CTE usecase, and it only needs to generate a mask for the active
-            # part, because the mask for the prior part will be generated by
-            # the chunked prefill scheduler
-            max_query_len = attention_mask.shape[-1]
-            causal_mask = attn_utils.create_block_diagonal_attn_mask(
-                query_lens, query_lens, max_query_len, max_query_len, is_prior=False,
-            )
-            num_query, num_key = causal_mask.shape
-            return causal_mask.reshape(1, 1, num_query, num_key)
-        else:
-            # TKG usecase
-            batch_size = query_lens.shape[0]
-            computed_context_lens = key_lens - query_lens
-
-            kv_cache_len = attention_mask.shape[1]  # (batch_size, kv_cache_len)
-            arange_mask = torch.arange(kv_cache_len, device=attention_mask.device)
-            arange_mask = arange_mask.expand(batch_size, kv_cache_len)
-            causal_mask = arange_mask < computed_context_lens
-            causal_mask = causal_mask[:, None, None, :]
-            return causal_mask
 
     def _create_spec_attn_mask(self, attention_mask):
         return (
@@ -402,10 +358,6 @@ class NeuronBaseModel(nn.Module):
         position_ids=None,
         **kwargs,
     ):
-        if self.is_chunked_prefill:
-            return self._create_chunked_prefill_attn_mask(
-                attention_mask, is_for_context_encoding, **kwargs
-            )
 
         # When we have mixed attention, we pass models both a global and local mask.
         # This function always generates a global mask.
@@ -419,34 +371,6 @@ class NeuronBaseModel(nn.Module):
                 return self._create_windowed_attn_mask_spec_decode(self.sliding_window, position_ids)
             else:
                 return self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
-
-        if self.neuron_config.attn_block_tkg_nki_kernel_enabled and self.is_prefix_caching:
-            assert not is_for_context_encoding
-            assert position_ids is not None, (
-                "position_ids is required by gen_cache_mask_for_attention_tkg_kernel "
-                "to infer current cache length."
-            )
-            grid = (nc(self.neuron_config.logical_nc_config),)
-            cache_len = position_ids
-            # Eagle draft's context/cache length is 1 shorter than target,
-            # we have already deducted the position_ids for draft at this point.
-            # But for Block KV, the first token of the first cache block is dummy for Eagle draft,
-            # so the cache length is still the same between draft and target.  So add back 1 here.
-            if self.neuron_config.is_block_kv_layout and self.neuron_config.is_eagle_draft:
-                cache_len += 1
-            tkg_kernel_mask = gen_cache_mask_for_attention_tkg_kernel[grid](
-                cache_len=cache_len,
-                num_heads=(self.num_attention_heads + self.tp_degree - 1) // self.tp_degree,
-                S_tkg=self.speculation_length if is_for_speculation else 1,
-                S_ctx=self.n_positions,
-                blk_len=(
-                    self.neuron_config.pa_block_size if self.neuron_config.is_block_kv_layout else 0
-                ),
-            )
-            if self.neuron_config.is_eagle_draft:
-                # First eagle head position masked out.
-                tkg_kernel_mask[:, :, :, 0] = False
-            return tkg_kernel_mask
         if is_for_speculation:
             return self._create_spec_attn_mask(attention_mask)
         return self._create_simple_attn_mask(attention_mask)
@@ -756,6 +680,7 @@ class NeuronBaseModel(nn.Module):
         rotary_position_id=None,
         vision_embeddings=None,
         vision_mask=None,
+        deepstack_vision_embeds=None,
     ):
         # Optional argument cannot be set to None in NXDI now as NxD does not support
         # kwargs. Now we are working around by passing an empty tensor.
@@ -767,6 +692,10 @@ class NeuronBaseModel(nn.Module):
         # We are forced to pass in a value for optional params
         # Passing in none does not work as it breaks torchscripting.
         # Once kwargs support is in, we can remove this workaround.
+        #
+        # Note: When adding new optional arguments to the forward() method,
+        # update the placeholder tensor count in both ModelWrapper.input_generator()
+        # and _get_model_outputs().
         prev_hidden = self.set_none_if_empty(prev_hidden)
         adapter_ids = self.set_none_if_empty(adapter_ids)
         accepted_indices = self.set_none_if_empty(accepted_indices)
@@ -786,6 +715,7 @@ class NeuronBaseModel(nn.Module):
         rotary_position_id = self.set_none_if_empty(rotary_position_id)
         vision_embeddings = self.set_none_if_empty(vision_embeddings)
         vision_mask = self.set_none_if_empty(vision_mask)
+        deepstack_vision_embeds = self.set_none_if_empty(deepstack_vision_embeds)
         local_attn_mask = None
 
         if self.neuron_config.is_medusa:
@@ -850,33 +780,24 @@ class NeuronBaseModel(nn.Module):
         )
 
         # Prepare attention mask(s)
-        if self.is_chunked_prefill:
-            attn_mask = self.create_attn_mask(
-                attention_mask,
-                is_for_context_encoding,
-                is_for_speculation,
-                query_lens=num_queries,
-                key_lens=num_queries + computed_context_lens,
-            )
-        else:
-            attn_mask = self.create_attn_mask(
-                attention_mask,
-                is_for_context_encoding,
-                is_for_speculation,
-                position_ids=position_ids,
-            )
-            if self.attention_chunk_size:
-                if is_for_context_encoding:
-                    local_attn_mask = self._create_chunked_attn_mask_cte(attention_mask, self.attention_chunk_size)
-                else:
-                    local_attn_mask = self._create_chunked_attn_mask_tkg(attention_mask, self.attention_chunk_size, position_ids)
-            elif self.sliding_window:
-                if is_for_context_encoding:
-                    local_attn_mask = self._create_windowed_attn_mask_cte(attention_mask, self.sliding_window)
-                elif self.neuron_config.enable_fused_speculation:
-                    local_attn_mask = self._create_windowed_attn_mask_spec_decode(self.sliding_window, position_ids)
-                else:
-                    local_attn_mask = self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
+        attn_mask = self.create_attn_mask(
+            attention_mask,
+            is_for_context_encoding,
+            is_for_speculation,
+            position_ids=position_ids,
+        )
+        if self.attention_chunk_size:
+            if is_for_context_encoding:
+                local_attn_mask = self._create_chunked_attn_mask_cte(attention_mask, self.attention_chunk_size)
+            else:
+                local_attn_mask = self._create_chunked_attn_mask_tkg(attention_mask, self.attention_chunk_size, position_ids)
+        elif self.sliding_window:
+            if is_for_context_encoding:
+                local_attn_mask = self._create_windowed_attn_mask_cte(attention_mask, self.sliding_window)
+            elif self.neuron_config.enable_fused_speculation:
+                local_attn_mask = self._create_windowed_attn_mask_spec_decode(self.sliding_window, position_ids)
+            else:
+                local_attn_mask = self._create_windowed_attn_mask_tkg(attention_mask, self.sliding_window, position_ids)
 
         active_mask = None
         if self.is_prefix_caching:
@@ -992,8 +913,10 @@ class NeuronBaseModel(nn.Module):
                     active_block_table=active_block_table,
                     kv_active_mask=active_mask_2d,
                     update_cache=True,
+                    rotary_position_ids=rotary_position_id,
                     vision_embeddings=vision_embeddings,
                     vision_mask=vision_mask,
+                    deepstack_vision_embeds=deepstack_vision_embeds,
                     local_attn_mask=local_attn_mask,
                     windowed_context_encoding_window_idx=window_idx,
                     is_valid_window_kv=is_valid_window_kv
@@ -1029,8 +952,10 @@ class NeuronBaseModel(nn.Module):
                 active_block_table=active_block_table,
                 kv_active_mask=active_mask_2d,
                 update_cache=True,
+                rotary_position_ids=rotary_position_id,
                 vision_embeddings=vision_embeddings,
                 vision_mask=vision_mask,
+                deepstack_vision_embeds=deepstack_vision_embeds,
                 local_attn_mask=local_attn_mask,
                 padding_mask=padding_mask,
             )
@@ -1041,20 +966,11 @@ class NeuronBaseModel(nn.Module):
                 index = torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device)
                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
                 hidden_states = torch.gather(hidden_states, dim=1, index=index)
-            elif self.is_chunked_prefill:
-                if is_for_context_encoding:
-                    # chunked prefill will return cp_config.max_num_seqs, not
-                    # just the last one
-                    index = neuron_cumsum(num_queries.reshape(1, -1).float()).int() - 1
-                    index = index.reshape(1, -1, 1)
-                    index = index.expand(batch_size, -1, self.hidden_size)
-                    hidden_states = torch.gather(hidden_states, dim=1, index=index)
             else:
                 if not (
                     position_ids.shape[-1] == self.speculation_length or position_ids.shape[-1] == 1
                 ):
                     if not is_for_windowed_context_encoding:
-                        # context encoding
                         index = torch.max(position_ids, dim=1, keepdim=True).indices
                         index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
                         hidden_states = torch.gather(hidden_states, dim=1, index=index)
@@ -1098,6 +1014,7 @@ class NeuronBaseModel(nn.Module):
                 res = res + attention_mask[0] * 0
 
         outputs = [res]
+
         if self.neuron_config.output_logits:
             logits = _gather_along_dim(
                 logits,
@@ -1105,6 +1022,12 @@ class NeuronBaseModel(nn.Module):
                 process_group=get_tp_group(self.config),
             )
             outputs += [logits]
+
+        # Add captured tensors if tensor capture is enabled
+        if self.neuron_config.tensor_capture_config:
+            captured_tensors = self._get_captured_tensors(outputs[0].device)
+            outputs += captured_tensors
+
         outputs += updated_kv_cache
 
         if self.neuron_config.enable_eagle_speculation:
@@ -1237,18 +1160,23 @@ class NeuronBaseModel(nn.Module):
         res = logits
         # perform sampling on Neuron to get tokens
         # FIXME, logits[:, -1, :] is not correct for speculation model, this is a tempory fix.
-        if (is_for_speculation or self.neuron_config.is_eagle_draft) and not self.neuron_config.on_device_sampling_config.do_sample:
-            res = nxd_argmax(tensor=logits, dim=2, gather_dim=2, keepdim=False)
+        if (
+            is_for_speculation or self.neuron_config.is_eagle_draft
+        ) and not self.neuron_config.on_device_sampling_config.do_sample:
+            res = nxd_argmax(
+                tensor=logits,
+                dim=2,
+                gather_dim=2,
+                keepdim=False,
+                disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
+            )
             res = res.to(torch.int32)
         elif (
             is_for_context_encoding
             or not self.neuron_config.enable_eagle_speculation
             or not self.neuron_config.on_device_sampling_config.do_sample
         ):
-            if is_for_context_encoding and self.is_chunked_prefill:
-                sampling_inputs = logits[0, :, :]
-            else:
-                sampling_inputs = logits[:, -1, :]
+            sampling_inputs = logits[:, -1, :]
             res = self.sampler(
                 sampling_inputs, sampling_params, rank_id=self.rank_util.get_rank()
             )
@@ -1271,6 +1199,20 @@ class NeuronBaseModel(nn.Module):
         raise NotImplementedError("encode_vision_to_input is not implemented. "
                                   "Implement it in the child of NeuronBaseModel")
 
+    def deepstack_process_xla(
+        self,
+        hidden_states: torch.Tensor,
+        visual_embeds: torch.Tensor,
+        vision_mask_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        If deepstack_vision_embeds & vision_mask is supplied in the forward, this hook
+        is invoked. This function takes in a vision embedding and add to the hidden_states
+        at vision positions. This is a new feature in Qwen3 VL.
+        """
+        raise NotImplementedError("deepstack_process_xla is not implemented. "
+                                  "Implement it in the child of NeuronBaseModel")
+
     def get_model_output(
         self,
         input_ids: torch.LongTensor = None,
@@ -1288,6 +1230,7 @@ class NeuronBaseModel(nn.Module):
         is_for_context_encoding: bool = False,
         vision_embeddings: Optional[torch.FloatTensor] = None,
         vision_mask: Optional[torch.BoolTensor] = None,
+        deepstack_vision_embeds: Optional[List[torch.FloatTensor]] = None,
         local_attn_mask: Optional[torch.Tensor] = None,
         windowed_context_encoding_window_idx: int = -1,
         padding_mask: Optional[torch.Tensor] = None,
@@ -1379,8 +1322,7 @@ class NeuronBaseModel(nn.Module):
         active_block_table = None if 'active_block_table' not in kwargs else kwargs['active_block_table']
         empty_active_block_table = True if active_block_table is None else len(active_block_table.shape) == 1
         may_have_prefix = self.is_prefix_caching and is_for_context_encoding and not empty_active_block_table
-        is_for_chunked_prefill = self.is_block_kv_layout and self.neuron_config.is_chunked_prefill
-        if may_have_prefix or is_for_chunked_prefill or not is_for_context_encoding or windowed_context_encoding_window_idx >= 1:
+        if may_have_prefix or not is_for_context_encoding or windowed_context_encoding_window_idx >= 1:
             if not self.config.neuron_config.layer_boundary_markers:
                 past_key_values = self.kv_mgr.get_cache(
                     seq_ids=seq_ids,
@@ -1428,6 +1370,22 @@ class NeuronBaseModel(nn.Module):
             )
 
             hidden_states = layer_outputs[0]
+            # Add visual features to the hidden states of first several layers
+            if is_for_context_encoding and deepstack_vision_embeds is not None and idx in range(len(deepstack_vision_embeds)):
+                # Slice deepstack_vision_embeds to match text input hidden_states's sequence length
+                target_seq_len = hidden_states.shape[1]
+                if self.sequence_parallel_enabled:
+                    # Multiply target_seq_len by TP to slice the full sequence
+                    target_seq_len *= self.neuron_config.tp_degree
+
+                sliced_deepstack_vision_embeds = deepstack_vision_embeds[idx][:, :target_seq_len, :]
+                logging.debug(f"\n in Neuron layer idx {idx} performing deepstack_process_xla {deepstack_vision_embeds[idx].shape}")
+                hidden_states = self.deepstack_process_xla(
+                    hidden_states,
+                    sliced_deepstack_vision_embeds,
+                    vision_mask,
+                )
+
             kv = layer_outputs[1]
             if update_kv_per_layer:
                 next_decoder_cache += kv
@@ -1540,36 +1498,20 @@ class NeuronBaseModel(nn.Module):
             - Handles both vocab_parallel and non-vocab_parallel cases
         """
         if self.sequence_parallel_enabled:
-            if self.neuron_config.tile_cc:
-                tp_size = self.neuron_config.tp_degree
-                shape = list(inputs_embeds.shape)
-                partition_dim = self.sequence_dimension
-                assert shape[partition_dim] % tp_size == 0
-                shape[partition_dim] //= tp_size
-                if self.neuron_config.vocab_parallel:
-                    tiled_cc_op, compute_op, cc_factor = (_traced_tiled_rs, xm.REDUCE_SUM, 1)
-                else:
-                    tiled_cc_op, compute_op, cc_factor = (_traced_spmd_tiled_rs, xm.REDUCE_MAX, self.neuron_config.cc_pipeline_tiling_factor)
-                # Create in the shape used by consumer QKV/MLP kernel.
-                hidden_states = torch.empty(shape, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-                tiled_cc_op[(CCPipeline(cc_factor),)](
-                    inputs_embeds, hidden_states, cc_dim=partition_dim,
-                    tp_rank=tp_size, op=compute_op)
+            shift_target_hidden = self.is_prefix_caching and len(active_block_table.shape) > 1
+            if self.neuron_config.is_eagle_draft and (
+                seq_length < self.neuron_config.weight_gather_seq_len_threshold
+                or shift_target_hidden
+            ):
+                hidden_states = inputs_embeds
             else:
-                shift_target_hidden = self.is_prefix_caching and len(active_block_table.shape) > 1
-                if self.neuron_config.is_eagle_draft and (
-                    seq_length < self.neuron_config.weight_gather_seq_len_threshold
-                    or shift_target_hidden
-                ):
-                    hidden_states = inputs_embeds
-                else:
-                    # TODO: Replace this with rankid + scatter call once supported
-                    hidden_states = _reduce_scatter_along_dim(
-                        inputs_embeds,
-                        self.sequence_dimension,
-                        xm.REDUCE_SUM if self.neuron_config.vocab_parallel else xm.REDUCE_MAX,
-                        process_group=get_tp_group(self.config),
-                    )
+                # TODO: Replace this with rankid + scatter call once supported
+                hidden_states = _reduce_scatter_along_dim(
+                    inputs_embeds,
+                    self.sequence_dimension,
+                    xm.REDUCE_SUM if self.neuron_config.vocab_parallel else xm.REDUCE_MAX,
+                    process_group=get_tp_group(self.config),
+                )
         else:
             hidden_states = inputs_embeds
         return hidden_states
@@ -1676,10 +1618,12 @@ class NeuronFusedSpecModel(nn.Module):
                 self.rolling_buffer_hidden_size,
                 dtype=config.neuron_config.torch_dtype,
                 apply_seq_ids_mask=self.neuron_config.apply_seq_ids_mask,
+                use_kernel=self.neuron_config.eagle_rolling_buffer_kernel_enabled
             )
 
         config.fused_spec_config.draft_config.neuron_config.use_draft_group = True
         config.fused_spec_config.draft_config.neuron_config.quantized_mlp_kernel_enabled = False
+
         if self.draft_model_cls:
             self.draft_model = self.draft_model_cls._model_cls(config.fused_spec_config.draft_config)
         else:
@@ -1690,13 +1634,20 @@ class NeuronFusedSpecModel(nn.Module):
         draft_config = copy.deepcopy(config.fused_spec_config.draft_config.neuron_config)
         draft_config.on_device_sampling_config.do_sample = False
         draft_config.on_device_sampling_config.dynamic = False
-        self.draft_sampler = Sampler(draft_config)
-        self.target_sampler = Sampler(config.neuron_config)
+
+        draft_model_lm_head_tp_degree, target_model_lm_head_tp_degree = None, None
+        if hasattr(self.draft_model, "lm_head") and hasattr(self.draft_model.lm_head, "tensor_parallel_group"):
+            draft_model_lm_head_tp_degree = self.draft_model.lm_head.tensor_parallel_group.size()
+        if hasattr(self.target_model, "lm_head") and hasattr(self.target_model.lm_head, "tensor_parallel_group"):
+            target_model_lm_head_tp_degree = self.target_model.lm_head.tensor_parallel_group.size()
+        self.draft_sampler = create_sampler(draft_config, draft_model_lm_head_tp_degree)
+        self.target_sampler = create_sampler(config.neuron_config, target_model_lm_head_tp_degree)
+
         self.greedy = not config.neuron_config.on_device_sampling_config.do_sample
 
         # async related
         self.async_mode = self.neuron_config.async_mode
-        self.acceptance_padding_token = 0
+        self.acceptance_padding_token = -1
 
         # Prefix caching check
         self.is_prefix_caching = config.neuron_config.is_prefix_caching
@@ -2376,7 +2327,11 @@ class NeuronFusedSpecModel(nn.Module):
         else:
             target_output_logits = outputs[0]
             target_tokens = nxd_argmax(
-                tensor=target_output_logits, dim=2, gather_dim=2, keepdim=False
+                tensor=target_output_logits,
+                dim=2,
+                gather_dim=2,
+                keepdim=False,
+                disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
             )
             target_tokens = target_tokens.to(torch.int32)
 
@@ -3096,6 +3051,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         )
         self.model_wrapper = self.get_model_wrapper_cls()
 
+        if self.neuron_config.is_chunked_prefill:
+            raise NotImplementedError("Chunked Prefill is not available in NxDI for now")
+
         if self.neuron_config.enable_fused_speculation:
             self._model_cls = NeuronFusedSpecModel
             self.enable_context_encoding()
@@ -3106,29 +3064,13 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 self.enable_speculation()
             elif self.neuron_config.medusa_speculation_length > 0:
                 self.enable_medusa_speculation()
-            elif self._should_enable_tkg():
+            else:
                 self.enable_token_generation()
 
         for model in self.models:
             assert (
                 model.neuron_config.is_prefill_stage is not None
             ), f"{model.tag} doesn't indicate whether it is part of the prefill or generation step."
-
-    def _should_enable_tkg(self):
-        """
-        Check if a token generation model should be enabled or not
-
-        There are two cases:
-            1. chunked prefill disabled: a token generation model should be
-                enabled in this case
-            2. chunked prefill enabled: check chunked prefill config to see
-                if it should be enabled or not
-        """
-        if not self.neuron_config.is_chunked_prefill:
-            return True
-
-        chunked_prefill_config = self.neuron_config.chunked_prefill_config
-        return chunked_prefill_config.tkg_model_enabled
 
     def get_model_wrapper_cls(self):
         return ModelWrapper
@@ -3150,6 +3092,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         # Explicitly turn off sequence parallel for token generation
         new_config.neuron_config.sequence_parallel_enabled = False
         new_config.fused_spec_config.draft_config.neuron_config.sequence_parallel_enabled = False
+        priority_model_idx = None if new_config.neuron_config.is_full_model_shuffled else 0
 
         self.fused_spec_model = self.model_wrapper(
             config=new_config,
@@ -3157,7 +3100,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             # call
             tag=FUSED_SPECULATION_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
-            priority_model_idx=0,  # to turn on weight layout optimization
+            priority_model_idx=priority_model_idx,  # to turn on weight layout optimization
         )
         self.models.append(self.fused_spec_model)
 
@@ -3168,19 +3111,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             new_config.fused_spec_config.draft_config.neuron_config.batch_size = (
                 self.neuron_config.ctx_batch_size
             )
+            new_config.fused_spec_config.draft_config.neuron_config.is_prefill_stage = True
         new_config.neuron_config.n_active_tokens = self.neuron_config.max_context_length
         new_config.neuron_config.bucket_n_active_tokens = True
         new_config.neuron_config.is_prefill_stage = True
 
         new_config.neuron_config.buckets = autobucketing.generate_buckets_for_cte(new_config)
-
-        # Check if it should perform weight layout optimization based on CTE
-        # By default, it should be based on TKG for best ITL.
-        wlo_based_on_cte = False
-        if self.neuron_config.is_chunked_prefill:
-            # With chunked prefill, there could be cases where TKG is not
-            # enabled.
-            wlo_based_on_cte = not self.neuron_config.chunked_prefill_config.tkg_model_enabled
 
         self.context_encoding_model = self.model_wrapper(
             config=new_config,
@@ -3188,17 +3124,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             tag=CONTEXT_ENCODING_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
             model_init_kwargs=model_init_kwargs,
-            priority_model_idx=0 if wlo_based_on_cte else None,
         )
         self.models.append(self.context_encoding_model)
 
     def enable_token_generation(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
         new_config = copy.deepcopy(self.config)
-        if self.neuron_config.is_chunked_prefill:
-            tkg_batch_size = self.neuron_config.chunked_prefill_config.max_num_seqs
-        else:
-            tkg_batch_size = self.neuron_config.tkg_batch_size
-        new_config.neuron_config.batch_size = tkg_batch_size
+        new_config.neuron_config.batch_size = self.neuron_config.tkg_batch_size
         new_config.neuron_config.n_active_tokens = 1
         new_config.neuron_config.bucket_n_active_tokens = False
         new_config.neuron_config.sequence_parallel_enabled = False
@@ -3276,8 +3207,6 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             return self.medusa_speculation_model
         elif self.neuron_config.speculation_length > 0:
             return self.speculation_model
-        elif self.neuron_config.is_chunked_prefill:
-            return self.context_encoding_model
         else:
             return self.token_generation_model
 
@@ -3299,10 +3228,12 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                           return_dict: Optional[bool] = None,
                           llava_args: Optional[List] = [],
                           input_capture_hook: Optional[Callable] = None,
+                          tensor_capture_hook: Optional[Callable] = None,
                           slot_mapping: Optional[torch.LongTensor] = None,
                           block_table: Optional[torch.LongTensor] = None,
                           full_context_lens: Optional[torch.LongTensor] = None,
-                          computed_context_lens: Optional[torch.LongTensor] = None,):
+                          computed_context_lens: Optional[torch.LongTensor] = None,
+                          rotary_position_ids: Optional[torch.LongTensor] = None,):
 
         if self.async_mode and not self.neuron_config.enable_fused_speculation:
             # derive future cpu inputs from current cpu inputs
@@ -3317,8 +3248,18 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             )
             self.next_cpu_inputs = {
                 "attention_mask": next_attention_mask,
-                "position_ids": next_position_ids,
+                "position_ids": next_position_ids
             }
+
+            # Add rotary_position_ids to future cpu inputs if given
+            if rotary_position_ids is not None:
+                if position_ids.shape[1] == input_ids.shape[1]:
+                    next_rotary_position_ids = torch.amax(rotary_position_ids, -1, keepdim=True)
+                else:
+                    next_rotary_position_ids = rotary_position_ids
+
+                next_rotary_position_ids = next_rotary_position_ids + 1
+                self.next_cpu_inputs["rotary_position_ids"] = next_rotary_position_ids
 
             if self.neuron_config.is_prefix_caching:
                 prefix_caching_next_inputs = self._prepare_prefix_caching_next_inputs(block_table,
@@ -3389,6 +3330,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         return_dict: Optional[bool] = None,
         llava_args: Optional[List] = [],
         input_capture_hook: Optional[Callable] = None,
+        tensor_capture_hook: Optional[Callable] = None,
         slot_mapping: Optional[torch.LongTensor] = None,
         block_table: Optional[torch.LongTensor] = None,
         full_context_lens: Optional[torch.LongTensor] = None,
@@ -3431,6 +3373,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             return_dict=return_dict,
             llava_args=llava_args,
             input_capture_hook=input_capture_hook,
+            tensor_capture_hook=tensor_capture_hook,
             slot_mapping=slot_mapping,
             block_table=block_table,
             full_context_lens=full_context_lens,
@@ -3499,25 +3442,19 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         if not generation_model.is_neuron():
             self._copy_past_key_values(outputs)
 
-        # process outputs
-        if self.on_device_sampling and self.neuron_config.output_logits and not \
-                (self.neuron_config.enable_fused_speculation or self.neuron_config.is_medusa):
-            logits_or_next_tokens = outputs[:2]
-            constructed_outputs = self._construct_output_with_tokens_and_logits(next_tokens=logits_or_next_tokens[0], logits=logits_or_next_tokens[1])
-        else:
-            if is_run_on_neuron:
-                # When run on neuron, KV cache remains on device
-                logits_or_next_tokens = outputs
-            else:
-                # When run on cpu, KV cache is returned which has to be ignored
-                logits_or_next_tokens, *_ = outputs
-            constructed_outputs = self._construct_output(logits_or_next_tokens)
+        # Get processed and constructed outputs
+        constructed_outputs = self._get_constructed_outputs(outputs, is_run_on_neuron)
+
+        # Apply tensor_capture_hook if provided and tensors are captured
+        if tensor_capture_hook and constructed_outputs.captured_tensors:
+            # Apply the hook if captured tensors are found
+            tensor_capture_hook(self, constructed_outputs.captured_tensors)
 
         if logging.root.isEnabledFor(logging.DEBUG):
             logging.debug("---output---")
             logging.debug(
                 f"{'tokens' if self.on_device_sampling else 'logits'} = %s, ",
-                logits_or_next_tokens,
+                constructed_outputs.logits,
             )
 
         return constructed_outputs
@@ -3554,10 +3491,6 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         assert (
             position_ids is not None
         ), "need to call forward with position_ids if attention_mask is not provided"
-        if self.neuron_config.is_chunked_prefill:
-            return self._infer_attention_mask_for_chunked_prefill(
-                full_context_lens, computed_context_lens
-            )
 
         batch_size, seq_len = position_ids.shape
         if position_ids.shape[-1] != 1:
@@ -3568,46 +3501,6 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             position_ids_to_compare = position_ids.expand(batch_size, seq_len) - 1
         mask = torch.arange(seq_len).view(1, -1).expand(batch_size, seq_len)
         attention_mask = (position_ids_to_compare >= mask).to(dtype=position_ids.dtype)
-        return attention_mask
-
-    def _infer_attention_mask_for_chunked_prefill(
-        self,
-        full_context_lens: Optional[torch.LongTensor] = None,
-        computed_context_lens: Optional[torch.LongTensor] = None,
-    ):
-        """
-        Compute a positional attention mask based on full_context_lens and
-        computed_context_lens, and this is for chunked prefill only.
-
-        Args:
-            full_context_lens: length of computed context and new input ids,
-                with a shape of (batch_size, )
-            computed_context_lens: length of computed context, with a
-                shape of (batch_size, )
-
-        Return:
-            attention_mask: positional attention mask. If it is for CTE,
-                it will have a shape of (1, len_input_ids); if it is for TKG,
-                it will have a shape of (batch_size, max_seq_len_in_batch)
-        """
-        assert self.neuron_config.is_chunked_prefill
-        cp_config = self.neuron_config.chunked_prefill_config
-
-        query_lens = full_context_lens - computed_context_lens
-        dtype = query_lens.dtype
-
-        use_cte = torch.any(query_lens > 1) or not cp_config.tkg_model_enabled
-        if use_cte:
-            # batch size is 1 because it concatenates all seqs along seq dim
-            attention_mask = torch.ones((1, query_lens.sum()), dtype=dtype)
-        else:
-            # similar logics as for TKG, but it relies on computed_context_lens
-            batch_size = computed_context_lens.shape[0]
-            max_seq_len = torch.max(computed_context_lens)
-            pos_ids_to_compare = computed_context_lens.reshape(batch_size, 1)
-            pos_ids_to_compare = pos_ids_to_compare.expand(batch_size, max_seq_len) - 1
-            mask = torch.arange(max_seq_len).view(1, -1).expand(batch_size, max_seq_len)
-            attention_mask = (pos_ids_to_compare >= mask).to(dtype)
         return attention_mask
 
     def _log_input(
@@ -3689,7 +3582,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     seq_ids,
                     sampling_params,
                     torch.empty(0),
-                    torch.empty(0),
+                    adapter_ids,
                     slot_mapping,
                     block_table,
                     num_queries,
@@ -3709,7 +3602,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     seq_ids,
                     sampling_params,
                     torch.empty(0),
-                    torch.empty(0),
+                    adapter_ids,
                     slot_mapping,
                     block_table,
                     num_queries,
@@ -3724,7 +3617,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     seq_ids,
                     sampling_params,
                     torch.empty(0),
-                    torch.empty(0),
+                    adapter_ids,
                     torch.empty(0),
                     torch.empty(0),
                     torch.empty(0),
@@ -3736,18 +3629,6 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     *llava_args,
                 )
             is_run_on_neuron = self.base_model.is_neuron()
-        elif self.neuron_config.is_chunked_prefill:
-            outputs, is_run_on_neuron = self._get_model_outputs_for_chunked_prefill(
-                input_ids,
-                attention_mask,
-                position_ids,
-                seq_ids,
-                sampling_params,
-                slot_mapping,
-                block_table,
-                full_context_lens,
-                computed_context_lens,
-            )
         elif self._is_prefill(position_ids):
             if self.neuron_config.is_medusa:
                 medusa_args = self._prepare_inputs()
@@ -3762,7 +3643,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     *medusa_args,
                 )
             elif self.neuron_config.tensor_replacement_config:
-                empties = [torch.empty(0) for i in range(17)]
+                empties = [torch.empty(0) for i in range(18)]
                 outputs = self.context_encoding_model(
                     input_ids,
                     attention_mask,
@@ -3825,7 +3706,7 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:
             if self.neuron_config.tensor_replacement_config:
-                empties = [torch.empty(0) for i in range(17)]
+                empties = [torch.empty(0) for i in range(18)]
                 outputs = self.token_generation_model(
                     input_ids,
                     attention_mask,
@@ -3850,116 +3731,6 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     *llava_args,
                 )
             is_run_on_neuron = self.token_generation_model.is_neuron()
-
-        return outputs, is_run_on_neuron
-
-    def _get_model_outputs_for_chunked_prefill(
-        self,
-        input_ids,
-        attention_mask,
-        position_ids,
-        seq_ids,
-        sampling_params,
-        slot_mapping,
-        block_table,
-        full_context_lens,
-        computed_context_lens,
-    ):
-        cp_config = self.neuron_config.chunked_prefill_config
-        query_lens = full_context_lens - computed_context_lens
-        actual_num_seqs = query_lens.shape[0]
-
-        use_cte = torch.any(query_lens > 1) or not cp_config.tkg_model_enabled
-        if use_cte:
-            model = self.context_encoding_model
-
-            # Expect active and ordered block table for each seq after this step
-            active_block_table = kvcache_utils.get_active_block_table(
-                block_table=block_table,
-                context_lens=computed_context_lens,
-                block_size=self.neuron_config.pa_block_size,
-            )
-
-            pa_scheduler = GridTileScheduler(
-                query_lens,
-                computed_context_lens,
-                tile_size_q=cp_config.kernel_q_tile_size,
-                tile_size_kv=cp_config.kernel_kv_tile_size,
-                block_size=self.neuron_config.pa_block_size,
-            )
-            schedule = pa_scheduler.compute_schedule()
-            tile_q_indices = schedule.get_tile_q_indices()
-            tile_block_tables = schedule.build_tile_block_tables(
-                active_block_table,
-                skip_value=self.neuron_config.pa_num_blocks * 1000,
-            )
-            tile_masks = schedule.build_tile_masks()
-
-            # Once tile_block_tables is generated, CTE doesn't need
-            # active_block_table because it loads all the kv cache blocks and
-            # selects them based on tile_block_tables
-            active_block_table = torch.empty(0)
-        else:
-            model = self.token_generation_model
-            max_num_seqs = cp_config.max_num_seqs
-
-            # Reshape inputs to batching format (batch_size, seq_len)
-            input_ids = input_ids.reshape(-1, 1)
-            # skip attention_mask as it is already in batching format
-            position_ids = position_ids.reshape(-1, 1)
-            seq_ids = seq_ids.expand(max_num_seqs)
-            sampling_params = sampling_params.expand(max_num_seqs, 3)
-            slot_mapping = slot_mapping.reshape(-1, 1)
-            active_block_table = block_table
-            query_lens = query_lens.reshape(-1, 1)
-            computed_context_lens = computed_context_lens.reshape(-1, 1)
-
-            # Need to ensure CTE and TKG has same number of inputs due to
-            # tracing limitation.
-            tile_q_indices = torch.empty(0)
-            tile_block_tables = torch.empty(0)
-            tile_masks = torch.empty(0)
-
-        outputs = model(
-            input_ids,
-            attention_mask,
-            position_ids,
-            seq_ids,
-            sampling_params,
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            slot_mapping,
-            active_block_table,
-            query_lens,
-            computed_context_lens,
-            tile_q_indices,
-            tile_block_tables,
-            tile_masks,
-        )
-        is_run_on_neuron = model.is_neuron()
-
-        if not use_cte and not self.on_device_sampling:
-            # Reshape back to concatenated format
-            if is_run_on_neuron:
-                outputs = outputs.transpose(0, 1)
-            else:
-                logits_or_tokens, kv_cache = outputs
-                logits_or_tokens = logits_or_tokens.transpose(0, 1)
-                outputs = logits_or_tokens, kv_cache
-            return outputs, is_run_on_neuron
-
-        if self.on_device_sampling:
-            # Remove padding from on-device-sampling
-            if is_run_on_neuron:
-                outputs = outputs[:actual_num_seqs]
-            else:
-                logits_or_tokens, kv_cache = outputs
-                logits_or_tokens = logits_or_tokens[:actual_num_seqs]
-                outputs = logits_or_tokens, kv_cache
 
         return outputs, is_run_on_neuron
 
@@ -4023,6 +3794,30 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     new_past_key_value
                 )
 
+    def _get_constructed_outputs(self, outputs, is_run_on_neuron):
+        # Process outputs
+        if self.on_device_sampling and self.neuron_config.output_logits and not \
+                (self.neuron_config.enable_fused_speculation or self.neuron_config.is_medusa):
+            logits_or_next_tokens = outputs[:2]
+            constructed_outputs = self._construct_output_with_tokens_and_logits(next_tokens=logits_or_next_tokens[0], logits=logits_or_next_tokens[1])
+            captured_tensors_offset = self._get_captured_tensors_offset()
+            if captured_tensors_offset > 0:
+                constructed_outputs.captured_tensors = outputs[2: 2 + captured_tensors_offset]
+        else:
+            if is_run_on_neuron:
+                # When run on neuron, KV cache remains on device
+                logits_or_next_tokens = outputs
+            else:
+                # When run on cpu, KV cache is returned which has to be ignored
+                logits_or_next_tokens, *_ = outputs
+            constructed_outputs = self._construct_output(logits_or_next_tokens)
+        return constructed_outputs
+
+    def _get_captured_tensors_offset(self):
+        if self.neuron_config.tensor_capture_config:
+            return self.neuron_config.tensor_capture_config.get_offset()
+        return 0
+
     def _construct_output_with_tokens_and_logits(self, next_tokens, logits, hidden_states=[]):
         OutputParams = CausalLMOutputWithPast(
             logits=logits,
@@ -4030,6 +3825,8 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             attentions=None,
         )
         OutputParams.tokens = next_tokens
+        # Initialize captured_tensors attribute
+        OutputParams.captured_tensors = None
         return OutputParams
 
     def _construct_output(self, logits_or_next_tokens):
@@ -4058,6 +3855,9 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             OutputParams.async_should_stop = self.async_should_stop
         else:
             OutputParams.tokens = next_tokens
+
+        # Initialize captured_tensors attribute
+        OutputParams.captured_tensors = None
 
         return OutputParams
 
