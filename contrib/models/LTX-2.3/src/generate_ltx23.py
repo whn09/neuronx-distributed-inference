@@ -50,6 +50,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import gc
 import json
 import logging
@@ -112,6 +113,83 @@ APP_BACKBONE_AUDIO_SEQ = (
 )
 APP_HALFRES_COMPILED_DIR = None
 GEMMA3_MODEL_PATH = None
+
+
+class PhaseTimer:
+    """Accumulate wall-clock time and call counts per named phase.
+
+    Used to break a single inference run into per-module timings (text
+    encode, transformer denoise, video/audio decode) without touching the
+    pipeline internals. Mirrors the helper used in Wan2.2-TI2V-5B.
+    """
+
+    def __init__(self):
+        self.totals = {}
+        self.calls = {}
+
+    def reset(self):
+        self.totals.clear()
+        self.calls.clear()
+
+    def add(self, name, elapsed):
+        self.totals[name] = self.totals.get(name, 0.0) + elapsed
+        self.calls[name] = self.calls.get(name, 0) + 1
+
+    @contextlib.contextmanager
+    def scope(self, name):
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            self.add(name, time.time() - t0)
+
+    def wrap(self, name, fn):
+        """Return a callable that times each invocation of ``fn`` under ``name``."""
+
+        def _timed(*args, **kwargs):
+            t0 = time.time()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                self.add(name, time.time() - t0)
+
+        return _timed
+
+    def report(self, total, header="=== Phase breakdown ==="):
+        logger.info("\n%s", header)
+        if not self.totals:
+            logger.info("  (no phases recorded)")
+            return
+        order = [
+            "text_encode",
+            "image_encode",
+            "transformer_warmup",
+            "transformer_forward",
+            "video_decode",
+            "audio_decode",
+        ]
+        ordered = [n for n in order if n in self.totals] + [
+            n for n in self.totals if n not in order
+        ]
+        width = max(len(n) for n in ordered)
+        sum_phases = 0.0
+        for name in ordered:
+            t = self.totals[name]
+            c = self.calls[name]
+            pct = (t / total * 100.0) if total > 0 else 0.0
+            avg_ms = (t / c * 1000.0) if c else 0.0
+            logger.info(
+                "  %-*s  %7.2fs  (%5.1f%%)  calls=%4d  avg=%7.1fms",
+                width, name, t, pct, c, avg_ms,
+            )
+            sum_phases += t
+        unaccounted = total - sum_phases
+        unaccounted_pct = (unaccounted / total * 100.0) if total > 0 else 0.0
+        logger.info(
+            "  %-*s  %7.2fs  (%5.1f%%)",
+            width, "(unaccounted)", unaccounted, unaccounted_pct,
+        )
+        logger.info("  %-*s  %7.2fs", width, "total", total)
 
 
 def encode_image(image_path, model_path, height, width, dtype=torch.bfloat16):
@@ -1003,6 +1081,9 @@ def encode_text_with_app(
 
 def generate(args):
     """Main generation pipeline."""
+    phase_timer = PhaseTimer()
+    t_total_start = time.time()
+
     config = load_config(args.model_path)
     tc = config["transformer"]
     logger.info(
@@ -1036,14 +1117,15 @@ def generate(args):
             num_frames=args.num_frames,
         )
         t0 = time.time()
-        video_context, audio_context, context_mask = encode_text_with_app(
-            app=app,
-            compiled_dir=args.app_compiled_dir,
-            tokenizer_path=args.gemma_path,
-            prompt=args.prompt,
-            text_seq=args.text_seq,
-            embeddings_processor=cpu["embeddings_processor"],
-        )
+        with phase_timer.scope("text_encode"):
+            video_context, audio_context, context_mask = encode_text_with_app(
+                app=app,
+                compiled_dir=args.app_compiled_dir,
+                tokenizer_path=args.gemma_path,
+                prompt=args.prompt,
+                text_seq=args.text_seq,
+                embeddings_processor=cpu["embeddings_processor"],
+            )
         logger.info("Text encoded via Application in %.1fs", time.time() - t0)
         logger.info(
             "  video_context: %s, audio_context: %s",
@@ -1076,13 +1158,14 @@ def generate(args):
         logger.info("  Warmup done in %.1fs", time.time() - t0)
 
         t0 = time.time()
-        video_context, audio_context, context_mask = encode_text_neuron(
-            neuron_gemma3,
-            args.gemma_path,
-            args.prompt,
-            args.text_seq,
-            cpu["embeddings_processor"],
-        )
+        with phase_timer.scope("text_encode"):
+            video_context, audio_context, context_mask = encode_text_neuron(
+                neuron_gemma3,
+                args.gemma_path,
+                args.prompt,
+                args.text_seq,
+                cpu["embeddings_processor"],
+            )
         logger.info("Text encoded on Neuron in %.1fs", time.time() - t0)
         logger.info(
             "  video_context: %s, audio_context: %s",
@@ -1130,19 +1213,20 @@ def generate(args):
         # Encode prompt
         logger.info("Encoding prompt: '%s'", args.prompt)
         t0 = time.time()
-        with torch.no_grad():
-            hidden_states, attention_mask = text_encoder.encode(args.prompt)
+        with phase_timer.scope("text_encode"):
+            with torch.no_grad():
+                hidden_states, attention_mask = text_encoder.encode(args.prompt)
 
-        # Run embeddings processor (handles additive mask conversion internally)
-        result = cpu["embeddings_processor"].process_hidden_states(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-        )
-        video_context = result.video_encoding
-        audio_context = result.audio_encoding
-        context_mask = (
-            result.attention_mask
-        )  # keep as int64 for proper additive mask conversion
+            # Run embeddings processor (handles additive mask conversion internally)
+            result = cpu["embeddings_processor"].process_hidden_states(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+            )
+            video_context = result.video_encoding
+            audio_context = result.audio_encoding
+            context_mask = (
+                result.attention_mask
+            )  # keep as int64 for proper additive mask conversion
         logger.info("Text encoded in %.1fs", time.time() - t0)
         logger.info(
             "  video_context: %s, audio_context: %s",
@@ -1421,8 +1505,9 @@ def generate(args):
                 attention_mask=None,
             )
             t0 = time.time()
-            with torch.no_grad():
-                video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
+            with phase_timer.scope("transformer_forward"):
+                with torch.no_grad():
+                    video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
             step_time = time.time() - t0
             s1_total_time += step_time
             dt = sigma_next - sigma
@@ -1488,6 +1573,10 @@ def generate(args):
             logger.info(
                 "  Run Phase 2 with --load-s1-latent %s --s2-tp-degree <N>",
                 args.save_s1_latent,
+            )
+            phase_timer.report(
+                time.time() - t_total_start,
+                header="=== Phase breakdown (Phase 1 only) ===",
             )
             return
 
@@ -1668,8 +1757,9 @@ def generate(args):
                 attention_mask=None,
             )
             t0 = time.time()
-            with torch.no_grad():
-                video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
+            with phase_timer.scope("transformer_forward"):
+                with torch.no_grad():
+                    video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
             step_time = time.time() - t0
             s2_total_time += step_time
             dt = sigma_next - sigma
@@ -1724,20 +1814,21 @@ def generate(args):
         os.makedirs(args.output_dir, exist_ok=True)
         logger.info("  Decoding video...")
         t0 = time.time()
-        try:
-            from ltx_core.model.video_vae.video_vae import decode_video
+        with phase_timer.scope("video_decode"):
+            try:
+                from ltx_core.model.video_vae.video_vae import decode_video
 
-            video_chunks = []
-            with torch.no_grad():
-                for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
-                    video_chunks.append(chunk)
-        except ImportError:
-            # ltx-core >= 1.1: decode_video is a method on VideoDecoder instance
-            video_chunks = []
-            with torch.no_grad():
-                for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
-                    video_chunks.append(chunk)
-        video_frames = torch.cat(video_chunks, dim=0)
+                video_chunks = []
+                with torch.no_grad():
+                    for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
+                        video_chunks.append(chunk)
+            except ImportError:
+                # ltx-core >= 1.1: decode_video is a method on VideoDecoder instance
+                video_chunks = []
+                with torch.no_grad():
+                    for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
+                        video_chunks.append(chunk)
+            video_frames = torch.cat(video_chunks, dim=0)
         logger.info(
             "  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0
         )
@@ -1792,12 +1883,13 @@ def generate(args):
         t0 = time.time()
         from ltx_core.model.audio_vae.audio_vae import decode_audio
 
-        with torch.no_grad():
-            audio_result = decode_audio(
-                audio_latent_spatial.float(),
-                cpu["audio_decoder"].float(),
-                cpu["vocoder"],
-            )
+        with phase_timer.scope("audio_decode"):
+            with torch.no_grad():
+                audio_result = decode_audio(
+                    audio_latent_spatial.float(),
+                    cpu["audio_decoder"].float(),
+                    cpu["vocoder"],
+                )
         logger.info(
             "  Audio decoded: waveform %s, sr=%d in %.1fs",
             audio_result.waveform.shape,
@@ -1824,6 +1916,10 @@ def generate(args):
             )
             logger.info("  Saved audio tensor: %s", wav_path)
 
+        phase_timer.report(
+            time.time() - t_total_start,
+            header="=== Phase breakdown (two-stage E2E) ===",
+        )
         logger.info("\n=== Done! Two-stage output saved to %s ===", args.output_dir)
         return
 
@@ -1992,8 +2088,9 @@ def generate(args):
         attention_mask=None,
     )
     t0 = time.time()
-    with torch.no_grad():
-        _ = wrapper(warmup_video_mod, warmup_audio_mod)
+    with phase_timer.scope("transformer_warmup"):
+        with torch.no_grad():
+            _ = wrapper(warmup_video_mod, warmup_audio_mod)
     logger.info("  DiT backbone warmup done in %.1fs", time.time() - t0)
     del warmup_video_mod, warmup_audio_mod
 
@@ -2051,8 +2148,9 @@ def generate(args):
         )
 
         t0 = time.time()
-        with torch.no_grad():
-            video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
+        with phase_timer.scope("transformer_forward"):
+            with torch.no_grad():
+                video_velocity, audio_velocity = wrapper(video_mod, audio_mod)
         step_time = time.time() - t0
         total_time += step_time
 
@@ -2119,20 +2217,21 @@ def generate(args):
 
     logger.info("  Decoding video...")
     t0 = time.time()
-    try:
-        from ltx_core.model.video_vae.video_vae import decode_video
+    with phase_timer.scope("video_decode"):
+        try:
+            from ltx_core.model.video_vae.video_vae import decode_video
 
-        video_chunks = []
-        with torch.no_grad():
-            for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
-                video_chunks.append(chunk)
-    except ImportError:
-        # ltx-core >= 1.1: decode_video is a method on VideoDecoder instance
-        video_chunks = []
-        with torch.no_grad():
-            for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
-                video_chunks.append(chunk)
-    video_frames = torch.cat(video_chunks, dim=0)  # (F, H, W, 3) float in [0, 1] (ltx-core 1.1.3)
+            video_chunks = []
+            with torch.no_grad():
+                for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
+                    video_chunks.append(chunk)
+        except ImportError:
+            # ltx-core >= 1.1: decode_video is a method on VideoDecoder instance
+            video_chunks = []
+            with torch.no_grad():
+                for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
+                    video_chunks.append(chunk)
+        video_frames = torch.cat(video_chunks, dim=0)  # (F, H, W, 3) float in [0, 1] (ltx-core 1.1.3)
     logger.info("  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0)
 
     # ltx-core 1.1.3 VideoDecoder.decode_video yields float in [0, 1].
@@ -2184,10 +2283,11 @@ def generate(args):
     t0 = time.time()
     from ltx_core.model.audio_vae.audio_vae import decode_audio
 
-    with torch.no_grad():
-        audio_result = decode_audio(
-            audio_latent_spatial.float(), cpu["audio_decoder"].float(), cpu["vocoder"]
-        )
+    with phase_timer.scope("audio_decode"):
+        with torch.no_grad():
+            audio_result = decode_audio(
+                audio_latent_spatial.float(), cpu["audio_decoder"].float(), cpu["vocoder"]
+            )
     logger.info(
         "  Audio decoded: waveform %s, sr=%d in %.1fs",
         audio_result.waveform.shape,
@@ -2224,6 +2324,10 @@ def generate(args):
         os.path.join(args.output_dir, "latents.pt"),
     )
 
+    phase_timer.report(
+        time.time() - t_total_start,
+        header="=== Phase breakdown (E2E) ===",
+    )
     logger.info("\n=== Done! Output saved to %s ===", args.output_dir)
 
 
