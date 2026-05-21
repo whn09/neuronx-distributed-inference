@@ -1742,6 +1742,16 @@ def generate(args):
             "  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0
         )
 
+        # ltx-core 1.1.3 VideoDecoder.decode_video yields float in [0, 1]
+        # (the older module-level decode_video returned uint8). Convert to
+        # uint8 explicitly; .numpy() on bf16 raises and direct .to(uint8) on
+        # [0, 1] floats truncates to all-black.
+        if video_frames.dtype != torch.uint8:
+            if video_frames.is_floating_point():
+                video_frames = (video_frames.float().clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+            else:
+                video_frames = video_frames.to(torch.uint8)
+
         from PIL import Image
 
         for i in range(video_frames.shape[0]):
@@ -2122,8 +2132,16 @@ def generate(args):
         with torch.no_grad():
             for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
                 video_chunks.append(chunk)
-    video_frames = torch.cat(video_chunks, dim=0)  # (F, H, W, 3) uint8
+    video_frames = torch.cat(video_chunks, dim=0)  # (F, H, W, 3) float in [0, 1] (ltx-core 1.1.3)
     logger.info("  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0)
+
+    # ltx-core 1.1.3 VideoDecoder.decode_video yields float in [0, 1].
+    # Convert to uint8 (bf16.numpy() raises; direct .to(uint8) on [0,1] truncates to 0).
+    if video_frames.dtype != torch.uint8:
+        if video_frames.is_floating_point():
+            video_frames = (video_frames.float().clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        else:
+            video_frames = video_frames.to(torch.uint8)
 
     # Save video frames
     from PIL import Image

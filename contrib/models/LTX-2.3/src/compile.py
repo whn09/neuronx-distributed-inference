@@ -39,6 +39,7 @@ import os
 import shutil
 import sys
 import time
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -366,6 +367,30 @@ def compile_transformer(args):
 # ============================================================================
 
 
+def _gemma3_get_model_fn(tp_degree=4):
+    # Module-scope so parallel_model_trace can pickle it for subprocess workers.
+    from modeling_gemma3_encoder import Gemma3TextEncoderModel
+
+    model = Gemma3TextEncoderModel(
+        vocab_size=262208,
+        hidden_size=3840,
+        num_hidden_layers=48,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        head_dim=256,
+        intermediate_size=15360,
+        rms_norm_eps=1e-6,
+        rope_theta=1_000_000.0,
+        max_position_embeddings=131072,
+        query_pre_attn_scalar=256,
+        pad_token_id=0,
+        dtype=torch.bfloat16,
+    )
+    model = model.to(dtype=torch.bfloat16)
+    model.eval()
+    return model, None
+
+
 def compile_encoder(args):
     """Compile the Gemma3 12B text encoder for Neuron TP=4."""
     import torch_neuronx
@@ -381,27 +406,7 @@ def compile_encoder(args):
 
     os.makedirs(compile_dir, exist_ok=True)
 
-    def get_model_fn(tp_degree=tp_degree):
-        from modeling_gemma3_encoder import Gemma3TextEncoderModel
-
-        model = Gemma3TextEncoderModel(
-            vocab_size=262208,
-            hidden_size=3840,
-            num_hidden_layers=48,
-            num_attention_heads=16,
-            num_key_value_heads=8,
-            head_dim=256,
-            intermediate_size=15360,
-            rms_norm_eps=1e-6,
-            rope_theta=1_000_000.0,
-            max_position_embeddings=131072,
-            query_pre_attn_scalar=256,
-            pad_token_id=0,
-            dtype=torch.bfloat16,
-        )
-        model = model.to(dtype=torch.bfloat16)
-        model.eval()
-        return model, None
+    get_model_fn = partial(_gemma3_get_model_fn, tp_degree=tp_degree)
 
     input_ids = torch.zeros(1, seq_len, dtype=torch.int64)
     attention_mask = torch.ones(1, seq_len, dtype=torch.int64)
