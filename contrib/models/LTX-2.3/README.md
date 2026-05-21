@@ -1,383 +1,279 @@
 # Contrib Model: LTX-2.3
 
-LTX-2.3 22B parameter DiT audio-video diffusion transformer running on AWS Trainium 2 via NxD Inference. Generates synchronized video + audio from text prompts, with optional image-to-video conditioning.
+NeuronX adaptation of [`Lightricks/LTX-2.3`](https://huggingface.co/Lightricks/LTX-2.3) for AWS Trainium 2 inference. LTX-2.3 is a 22B-parameter DiT (diffusion transformer) that generates synchronized video + audio from a text prompt, with optional image-to-video conditioning. Runs on top of the native [`ltx-core`](https://github.com/Lightricks/LTX-2) framework — not Diffusers.
 
 ## Model Information
 
-- **HuggingFace ID:** [`Lightricks/LTX-2.3`](https://huggingface.co/Lightricks/LTX-2.3)
-- **Model Type:** DiT (Diffusion Transformer) for joint audio-video generation (text-to-video and image-to-video)
-- **Parameters:** 22B (BF16) — 48 transformer blocks, 32 heads, 4096 video dim, 2048 audio dim
-- **Architecture:** Bidirectional audio-video cross-attention, gated attention, QK-RMSNorm, split RoPE, flow matching
+- **HuggingFace ID:** `Lightricks/LTX-2.3` (model file: `ltx-2.3-22b-distilled.safetensors`, 8-step distilled, 43 GB)
+- **Model Type:** DiT for joint audio-video generation (text-to-video and image-to-video)
+- **Architecture:** 48 transformer blocks, 32 heads, 4096 video dim, 2048 audio dim, bidirectional A/V cross-attention, gated attention, QK-RMSNorm, split RoPE, flow matching
 - **License:** See HuggingFace model card
-- **Framework:** Native [`ltx-core`](https://github.com/Lightricks/LTX-2) (not Diffusers)
-
-## Validation Results
-
-**Validated:** 2026-03-09
-**Instance:** trn2.3xlarge (TP=4, LNC=2, 4 logical NeuronCores)
-**SDK:** Neuron SDK 2.28, PyTorch 2.9, Deep Learning AMI Neuron (Ubuntu 24.04) 20260227
-
-### Accuracy Validation
-
-| Component | Metric | Value | Notes |
-|-----------|--------|-------|-------|
-| Single forward pass (video) | Cosine similarity | 0.999947 | sigma=1.0, noise input |
-| Single forward pass (audio) | Cosine similarity | 0.999867 | sigma=1.0, noise input |
-| 8-step denoised latent (real text) | Cosine similarity | 0.972 | Same Gemma 3 text, same seed |
-
-All accuracy numbers measured against CPU reference (unsharded BF16, native ltx-core model).
-
-### Benchmark Results
-
-| Stage | Time | Notes |
-|-------|------|-------|
-| CPU component loading | 24.9s | LTXModel, VideoDecoder, AudioDecoder, Vocoder, EmbeddingsProcessor |
-| Gemma3 encoder loading (4 ranks) | 362s | Pre-sharded weights, NEFF rehydration (cold start) |
-| Text encoding — Neuron Gemma3 (warm) | 0.6s | Encoder forward pass only (644ms), with tensorizer-optimized compiler flags |
-| Text encoding — Neuron Gemma3 (E2E warm) | ~1.3s | Including tokenization + post-processing |
-| Text encoding — Neuron Gemma3 (warmup) | 16.3s | First forward pass on NeuronCores |
-| Text encoding — CPU fallback | ~162s | Without Neuron compilation |
-| Gemma3 unload | 2.6s | Explicit NRT resource cleanup |
-| Neuron backbone weight loading | 70s | Pre-sharded weights, 4×9.3 GB rank files |
-| Neuron backbone NEFF loading | 84s | Compiled model loaded onto 4 NeuronCores |
-| **Denoising step (warm, steps 2-8)** | **0.3s** | **Steady-state per-step latency** |
-| Denoising step (cold, step 1) | 174.6s | Includes Neuron device initialization |
-| DiT warmup (1st inference) | 138.5s | Forces NRT to load NEFF onto cores |
-| Total denoising (8 steps) | 176.9s | 22.1s/step average (dominated by cold start) |
-| Video decode (CPU) | 7.2s | 25 frames @ 384×512 |
-| Video decode (CPU, upscaled) | 33.3s | 49 frames @ 768×1024 |
-| Audio decode (CPU) | 2.5s | Stereo WAV, 48kHz |
-| Spatial upscaler (CPU) | 0.7s | 498M params, (1,128,4,12,16) → (1,128,4,24,32) |
-| Temporal upscaler (CPU) | 0.4s | 131M params, (1,128,4,24,32) → (1,128,7,24,32) |
-
-Note: Gemma3 and DiT backbone share the same 4 NeuronCores and are loaded sequentially. The cold start latency (NEFF rehydration) is a one-time cost when the compiled model is first loaded onto a fresh instance. Subsequent generations reuse the loaded model.
-
-### Per-Step Performance Detail
-
-Warm denoising steps (2-8) at 384×512, 25 frames, with all CPU optimizations applied:
-
-| Component | Time | % of Step |
-|-----------|------|-----------|
-| CPU Preprocess | 33.1 ms | 11.9% |
-| Neuron Backbone | 244.1 ms | 87.4% |
-| Euler Step | 2.1 ms | 0.7% |
-| **Total per step** | **279.3 ms** | 100% |
-
-Two CPU preprocessing optimizations are applied:
-
-1. **AdaLN deduplication**: Computes the timestep embedding MLP once per unique sigma value instead of per-token (768 tokens in T2V mode). Reduces AdaLN time from 54ms to 7ms.
-2. **Step-invariant caching**: RoPE embeddings, context projection (caption_projection Linear), and attention masks are constant across denoising steps. Computed once on step 1 and reused for steps 2-8. Saves ~57ms on the first optimization pass (context projection dominates at ~55ms), with combined CPU preprocessing reduced from 96.5ms (baseline) to 39.0ms (60% reduction).
-
-Overall per-step improvement vs unoptimized baseline: 330ms to 279.3ms (15.4% reduction).
-
-### Two-Stage Pipeline Benchmarks
-
-| Stage | Time | Notes |
-|-------|------|-------|
-| Stage 1 backbone loading (4 ranks) | 83.6s | Pre-sharded weights from full-res sharding |
-| Stage 1 warmup (1st inference) | 107.9s | Forces NRT to load half-res NEFF |
-| **S1 denoising step (warm, steps 2-8)** | **0.3s** | **192×256 latent, VIDEO_SEQ=192** |
-| S1 denoising step (cold, step 1) | 142.1s | Includes Neuron device initialization |
-| S1 total (8 steps) | 143.9s | 18.0s/step average |
-| Spatial upscaler loading (CPU) | 8.1s | 498M params |
-| Spatial upsample (CPU) | 0.3s | (1,128,4,6,8) → (1,128,4,12,16) |
-| Stage 2 backbone loading (4 ranks) | 17.2s | Same pre-sharded weights, cached |
-| Stage 2 warmup (1st inference) | 110.6s | Forces NRT to load full-res NEFF |
-| **S2 denoising step (warm, steps 2-3)** | **0.3s** | **384×512 latent, VIDEO_SEQ=768** |
-| S2 denoising step (cold, step 1) | 143.0s | Includes Neuron device initialization |
-| S2 total (3 steps) | 143.7s | 47.9s/step average |
-| **Combined denoising (S1+S2)** | **287.6s** | **2.7s actual compute after warmup** |
-
-Two-stage mode generates at half resolution (192×256) with 8 denoising steps, spatially upscales x2, then refines at full resolution (384×512) with 3 additional steps. The same backbone weights are used for both stages — only the compiled shapes differ.
-
-### trn2.48xlarge Full Benchmark (Two-Phase Pipeline)
-
-**Validated:** 2026-03-16
-**Instance:** trn2.48xlarge (TP=4/16, LNC=2, 32 logical NeuronCores)
-**SDK:** Neuron SDK 2.27, PyTorch 2.9, Deep Learning AMI Neuron (Ubuntu 24.04) 20260126
-**Resolution:** 512×768 → 1024×1536, 121 frames, Image-to-Video
-
-Two-phase execution is required because the NRT communicator cannot change TP degree mid-process:
-- **Phase 1** (TP=4): Gemma3 text encoding + S1 denoising (8 steps at 512×768)
-- **Phase 2** (TP=16): Spatial upsample → S2 denoising (3 steps at 1024×1536) → Neuron VAE decode
-
-| Component | Time | Notes |
-|-----------|------|-------|
-| **S1 denoising (8 steps, 512×768)** | **14.4s** | **1.8s/step, TP=4** |
-| **S2 denoising (3 steps, 1024×1536)** | **21.7s** | **7.2s/step, TP=16** |
-| **Combined denoising** | **36.0s** | S1 + S2 |
-| **VAE decode (Neuron, tiled)** | **23.5s** | 33 tiles @ 610ms/tile (TP=4), 3.4s first-tile warmup |
-| VAE decode (CPU, reference) | 78.7s | 3.3x slower than Neuron |
-| Audio decode (CPU) | 2.2s | Stereo WAV |
-| Spatial upsample (CPU) | 1.8s | 498M params |
-| Compilation (total) | ~33 min | Encoder 68s + S1 133s + S2 338s + VAE 570s |
-
-**VAE Decoder**: The LTX-2.3 video decoder is compiled at TP=4 with 4×16 latent tiles (128×512 pixels). After Phase 2 unloads the TP=16 S2 backbone, the TP=4 VAE loads onto the freed NeuronCores (4.6s load time). Tiled decode uses overlap blending (overlap_h=1 latent) for seamless spatial reconstruction at arbitrary resolutions.
-
-### Component Distribution
-
-| Component | Location | Notes |
-|-----------|----------|-------|
-| DiT transformer (48 blocks) | **Neuron** (TP=4) | ~11 GB/rank HBM |
-| Gemma 3 12B text encoder | **Neuron** (TP=4) or CPU | Shares NeuronCores with DiT, sequential execution |
-| VideoDecoder | CPU | Per-channel statistics normalization |
-| AudioDecoder + Vocoder | CPU | Float32 for vocoder accuracy |
-| Spatial/Temporal upscalers | CPU | Sub-second each |
-| EmbeddingsProcessor | CPU | Connectors + feature extraction |
-
-Both the DiT backbone and Gemma3 encoder are compiled for TP=4 and share the same 4 NeuronCores. They execute sequentially: Gemma3 loads, encodes text, and unloads; then the DiT backbone loads and runs the 8-step denoising loop. CPU fallback for Gemma3 is available but ~25x slower.
-
-## Usage
-
-### Prerequisites
-
-```bash
-# On trn2.3xlarge with Deep Learning AMI Neuron (Ubuntu 24.04) 20260410
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
-
-# Install ltx-core
-pip install git+https://github.com/Lightricks/LTX-2.git#subdirectory=packages/ltx-core
-
-# Download model weights
-huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-22b-distilled.safetensors \
-  --local-dir /home/ubuntu/models/LTX-2.3/
-
-# Download Gemma 3 12B text encoder
-huggingface-cli download google/gemma-3-12b-it \
-  --local-dir /home/ubuntu/models/gemma-3-12b
-
-# Download upscaler weights (for --upscale, spatial x2 + temporal x2)
-huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
-  --local-dir /home/ubuntu/models/LTX-2.3/upscalers/
-huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-temporal-upscaler-x2-1.0.safetensors \
-  --local-dir /home/ubuntu/models/LTX-2.3/upscalers/
-```
-
-### Step 1: Compile the DiT Backbone
-
-```bash
-# Full-resolution backbone (384x512, VIDEO_SEQ=768)
-NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
-  torchrun --nproc_per_node=4 src/compile.py transformer
-```
-
-Compilation takes approximately 60 seconds. The compiled model is saved to `compiler_workdir_tp4_lnc2_v2/tp_0.pt` (8.7 GB).
-
-For two-stage mode, also compile the half-resolution backbone:
-
-```bash
-# Half-resolution backbone (192x256, VIDEO_SEQ=192) — for two-stage mode
-NEURON_FUSE_SOFTMAX=1 NEURON_CUSTOM_SILU=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
-  torchrun --nproc_per_node=4 src/compile.py transformer --halfres
-```
-
-This compiles the same architecture at the half-res latent shape (4×6×8 instead of 4×12×16). Output: `compiler_workdir_tp4_lnc2_halfres/tp_0.pt` (~8.7 GB).
-
-### Step 2: Pre-shard Backbone Weights
-
-Pre-sharding avoids loading the full 41 GB safetensors file during generation:
-
-```bash
-python3 src/shard_weights.py backbone \
-  --model-path /home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
-  --output-dir /home/ubuntu/backbone_sharded
-```
-
-This produces 4 rank files (~9.3 GB each) that are loaded directly during generation.
-
-### Step 3: Compile and Shard Gemma3 Encoder (Recommended)
-
-Compiling Gemma3 for Neuron eliminates the ~162s CPU text encoding bottleneck:
-
-```bash
-# Compile the encoder graph
-NEURON_FUSE_SOFTMAX=1 NEURON_RT_STOCHASTIC_ROUNDING_EN=0 \
-  python3 src/compile.py encoder \
-    --compile-dir /home/ubuntu/gemma3_encoder_compiled
-
-# Pre-shard weights for fast loading (~5.9 GB per rank)
-python3 src/shard_weights.py encoder \
-  --gemma-path /home/ubuntu/models/gemma-3-12b \
-  --output-dir /home/ubuntu/gemma3_encoder_sharded
-```
-
-The Gemma3 encoder uses tensorizer-optimized compiler flags (`--enable-ccop-compute-overlap`, `--cc-pipeline-tiling-factor=1`, `--vectorize-strided-dma`, `--enable-scalar-dge-vectorization`) that achieve 3.1x faster inference (644ms vs 2000ms) compared to the original precision flags.
-
-### Step 4: Generate Video + Audio
-
-```bash
-# With Neuron-compiled Gemma3 (recommended, fastest)
-python3 src/generate_ltx23.py \
-  --neuron-gemma \
-  --gemma-path /home/ubuntu/models/gemma-3-12b \
-  --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
-  --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
-  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
-  --prompt "A golden retriever puppy runs across a sunny green meadow"
-
-# With upscaling (384x512 @ 25 frames -> 768x1024 @ 49 frames)
-python3 src/generate_ltx23.py \
-  --neuron-gemma \
-  --gemma-path /home/ubuntu/models/gemma-3-12b \
-  --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
-  --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
-  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
-  --prompt "A golden retriever puppy runs across a sunny green meadow" \
-  --upscale
-
-# With CPU Gemma3 (slower, no compilation needed)
-python3 src/generate_ltx23.py \
-  --gemma-path /home/ubuntu/models/gemma-3-12b \
-  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
-  --prompt "A golden retriever puppy runs across a sunny green meadow"
-
-# Quick test with random embeddings (no Gemma needed)
-python3 src/generate_ltx23.py --no-text-encoder
-```
-
-#### Image-to-Video Generation
-
-Add `--image` to condition the video on an input photograph. Frame 0 is encoded from the image and preserved throughout denoising; subsequent frames are generated to match the prompt while maintaining visual consistency with the input.
-
-```bash
-# Image-to-video with Neuron Gemma3
-python3 src/generate_ltx23.py \
-  --neuron-gemma \
-  --gemma-path /home/ubuntu/models/gemma-3-12b \
-  --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
-  --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
-  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
-  --prompt "The woman turns and smiles warmly at the camera" \
-  --image /path/to/photo.png
-```
-
-The image encoder uses the ltx-core `VideoEncoder` loaded from the same safetensors checkpoint (no additional downloads needed). No recompilation of the DiT backbone is required — the same compiled model handles both T2V and I2V since the tensor shapes are identical.
-
-#### Two-Stage Generation (Refinement Denoising)
-
-Two-stage mode follows the LTX-2.3 `DistilledPipeline` reference: generate at half resolution (192×256) with 8 steps, spatially upsample x2, then refine at full resolution (384×512) with 3 additional denoising steps. This produces sharper output than single-stage generation. Requires the half-res backbone compilation from Step 1.
-
-```bash
-# Two-stage with Neuron Gemma3
-python3 src/generate_ltx23.py \
-  --neuron-gemma \
-  --gemma-path /home/ubuntu/models/gemma-3-12b \
-  --gemma-compiled-dir /home/ubuntu/gemma3_encoder_compiled \
-  --gemma-sharded-dir /home/ubuntu/gemma3_encoder_sharded \
-  --backbone-sharded-dir /home/ubuntu/backbone_sharded \
-  --prompt "A golden retriever puppy runs across a sunny green meadow" \
-  --two-stage \
-  --halfres-compiled-dir /home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_halfres
-```
-
-The pipeline sequence: Gemma3 encode → unload → half-res DiT (8 steps) → unload → spatial upsample x2 → full-res DiT (3 refinement steps) → unload → VAE decode. The same pre-sharded backbone weights are used for both stages (the model weights are identical; only the compiled shapes differ). The spatial upscaler weights are downloaded as part of the prerequisites.
-
-Output: PNG frames, MP4 video (if ffmpeg available), WAV audio.
-
-## Compatibility Matrix
-
-| Instance/Version | SDK 2.27 | SDK 2.28 | SDK 2.29 |
-|------------------|----------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | — | VALIDATED | VALIDATED |
-| trn2.48xlarge (TP=4/16, LNC=2) | VALIDATED | — | — |
-
-### SDK 2.29 Notes
-
-- **Venv**: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate` (different path from 2.28)
-- **torchaudio**: Install CPU variant separately: `pip install torchaudio==2.9.1+cpu --index-url https://download.pytorch.org/whl/cpu --no-deps` (the default DLAMI torchaudio has CUDA dependencies that won't load on Neuron)
-- **Performance**: Denoising step latency unchanged (0.3s/step warm, identical to SDK 2.28)
-- **Compilation**: 67.7s for full-res backbone (vs ~60s on 2.28, within variance)
-- **ltx-core**: v1.1.2 compatible (API change: `decode_video` moved to `VideoDecoder.decode_video()` method)
-
-## Example Checkpoints
-
-* [`Lightricks/LTX-2.3`](https://huggingface.co/Lightricks/LTX-2.3) — `ltx-2.3-22b-distilled.safetensors` (8-step distilled, 43 GB)
-* [`google/gemma-3-12b-it`](https://huggingface.co/google/gemma-3-12b-it) — Text encoder (23 GB)
-
-## Testing Instructions
-
-```bash
-# Ensure model is downloaded and backbone is compiled (see Usage above), then:
-cd contrib/models/LTX-2.3
-
-MODEL_PATH=/home/ubuntu/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
-COMPILED_MODEL_PATH=/home/ubuntu/ltx23_neuron/compiler_workdir_tp4_lnc2_v2 \
-  pytest test/integration/test_model.py -v -s
-```
-
-Tests validate:
-- Model loads successfully with weight injection
-- Forward pass produces valid (non-NaN) output
-- Cosine similarity >= 0.999 vs CPU reference
-- Per-step latency measurement
+- **Framework:** Native `ltx-core` (not Diffusers)
 
 ## Architecture Details
 
-### Backbone Signature
+| Component | Model | Parameters | Neuron Parallelism |
+|-----------|-------|-----------:|-------------------|
+| Text Encoder | Gemma 3 12B | ~12 B | TP=4, parallel_model_trace |
+| Transformer | DiT (audio+video, 48 blocks) | ~22 B | TP=4 |
+| Video VAE Decoder | LTX 3D Conv decoder | ~330 M | TP=4 tiled (1×16 latent, H≤64 SRAM limit) |
+| Audio VAE + Vocoder | Conv1d / HiFi-GAN | ~50 M | CPU |
+| Spatial / Temporal upscalers (optional) | Conv3D | 498 M / 131 M | CPU |
 
-The compiled backbone takes 24 flat tensors (for XLA tracing compatibility):
+Key parameters:
 
-| Index | Shape | Description |
-|-------|-------|-------------|
-| 0 | (1, 768, 4096) | Video hidden states |
-| 1 | (1, 26, 2048) | Audio hidden states |
-| 2-3 | (1, 256, 4096/2048) | Text encoder context (video/audio) |
-| 4-5 | (1, seq, 9*dim) | AdaLN timestep embeddings |
-| 6-7 | (1, seq, dim) | Embedded timesteps |
-| 8-11 | (1, 1, ...) | Cross-attention AdaLN scale/shift/gate |
-| 12-19 | (1, heads, seq, dim/2) | RoPE cos/sin (self-attn + cross-attn) |
-| 20-21 | (1, 256) | Encoder attention masks (additive) |
-| 22-23 | (1, 1, ...) | Prompt timestep embeddings |
+- **Denoising steps**: 8 (distilled checkpoint), flow-matching Euler integrator, distilled sigma schedule.
+- **Default resolution**: 384×512 / 25 frames (single-stage). Two-stage mode generates at 192×256 / 8 steps then refines at 384×512 / 3 steps after a CPU 2× spatial upsample.
+- **Encoder–DiT scheduling**: Gemma 3 (TP=4) and DiT (TP=4) share the same 4 NeuronCores and run sequentially — Gemma 3 loads, encodes, unloads, then DiT loads and runs the denoise loop. Loading both at once thrashes (144s+ for the first denoise step instead of 0.3s).
 
-### TP Sharding Pattern
+## Performance
 
-- **ColumnParallel**: Q, K, V projections, FFN gate/up projections, gate_logits
-- **RowParallel**: Attention output projection, FFN down projection
-- **DistributedRMSNorm**: QK-norm (q_norm, k_norm) with all-reduce for global variance
-- **SPMDRank**: Per-rank RoPE slicing via `torch.index_select`
+Numbers from a single trn2.3xlarge run, SDK 2.28, 384×512 / 25 frames / 8 steps, single-stage T2V with Neuron-compiled Gemma 3:
 
-### Compiler Flags
+| Phase | Time | Notes |
+|---|---:|---|
+| `text_encode` (Neuron Gemma 3, warm) | ~1.3 s | Tokenize + forward + post-process; cold first call adds ~16 s NEFF warmup |
+| `transformer_warmup` (DiT, 1 call) | 138.5 s | First NEFF load onto cores |
+| `transformer_forward` step 1 (cold) | 174.6 s | Neuron device initialization |
+| `transformer_forward` steps 2–8 (warm) | **0.3 s / step** | Steady-state |
+| Total denoising (8 steps) | 176.9 s | Dominated by step-1 cold start |
+| `video_decode` (CPU VAE) | 7.2 s | 25 frames @ 384×512 |
+| `video_decode` (Neuron tiled VAE, TP=4) | 23.5 s @ 1024×1536 / 121 f | 33 tiles × 610 ms; 3.3× faster than CPU VAE at that resolution |
+| `audio_decode` (CPU) | 2.5 s | Stereo 48 kHz WAV |
 
-**DiT backbone:**
+Per-step warm DiT detail (384×512, with the AdaLN dedup + step-invariant caching CPU optimizations enabled):
+
+| Component | Time | % of step |
+|---|---:|---:|
+| CPU preprocess | 33.1 ms | 11.9 % |
+| Neuron backbone forward | 244.1 ms | 87.4 % |
+| Euler step | 2.1 ms | 0.7 % |
+| **Total per step** | **279.3 ms** | 100 % |
+
+Two CPU preprocessing optimizations close the gap to the Neuron forward:
+
+1. **AdaLN deduplication** — when all tokens share the same sigma (T2V), the AdaLN MLP is computed once instead of per-token (768 tokens). Saves ~47 ms / step.
+2. **Step-invariant caching** — RoPE embeddings, context projection, and attention masks are constant across denoising steps; computed once on step 1 and reused. Saves ~57 ms / step (context projection alone is ~55 ms).
+
+Overall per-step improvement vs unoptimized baseline: 330 ms → 279 ms (15.4 % reduction).
+
+### Phase-timer output
+
+Every `generate_ltx23.py` run emits a `=== Phase breakdown ===` summary at exit, populated by `PhaseTimer` (mirrors the helper used in `contrib/models/Wan2.2-TI2V-5B/src/run_wan2.2_ti2v.py`). Sample:
+
 ```
---model-type=transformer -O1 --auto-cast matmult --lnc 2
---tensorizer-options='--enable-ccop-compute-overlap'
---enable-fast-loading-neuron-binaries
+=== Phase breakdown (E2E) ===
+  text_encode           1.30s  (  0.7%)  calls=  1  avg= 1304.2ms
+  transformer_warmup  138.50s  ( 70.3%)  calls=  1  avg=138502.6ms
+  transformer_forward  37.50s  ( 19.0%)  calls=  8  avg= 4687.8ms
+  video_decode          7.20s  (  3.7%)  calls=  1  avg= 7195.4ms
+  audio_decode          2.50s  (  1.3%)  calls=  1  avg= 2501.3ms
+  (unaccounted)         9.97s  (  5.0%)
+  total               197.00s
 ```
 
-**Optional DiT flag** — adding `--vectorize-strided-dma` to the DiT tensorizer options gives a 1.9% backbone speedup (244.1ms → 239.4ms per step) but reduces single-pass cosine similarity from 0.9999 to 0.996 due to reordered BF16 accumulations. Not enabled by default. Other tensorizer flags tested: `--cc-pipeline-tiling-factor` hurts DiT performance at all values tested (1/2/4/8), and `--enable-scalar-dge-vectorization` is neutral.
+Phases are recorded for both single-stage and two-stage paths (and on the Phase-1-only `--save-s1-latent` early-return path).
 
-**Gemma3 encoder** (tensorizer-optimized, 3.1x faster than original):
-```
---model-type=transformer -O1 --auto-cast=none --lnc=2
---tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=1
-  --vectorize-strided-dma --enable-scalar-dge-vectorization'
+### Resolution sweep
+
+A multi-resolution wall-clock sweep (512×384, 720×480, 1280×704 at 25 / 121 frames) is **TODO**. Each row needs a fresh DiT + VAE compile (~30 min) plus an 8-step inference (~3 min cold), so the table will be filled in by a follow-up PR.
+
+## Prerequisites
+
+- **Instance:** trn2.3xlarge (4 NeuronCores) for default 384×512 / 25 f. trn2.48xlarge (32 NeuronCores) is required for the trn2.48xlarge two-phase pipeline (TP=4 → TP=16).
+- **Virtual env:** `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` (PyTorch 2.9, neuronx-cc ≥ 2.22, neuronx-distributed ≥ 0.16).
+- **NVMe:** Mount RAID at `/opt/dlami/nvme/` (the master compile.sh assumes outputs land under that path).
+- **System packages:** `sudo apt install -y ffmpeg` (the DLAMI does not bundle it).
+
+## Usage
+
+### 1. Setup
+
+```bash
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+pip install git+https://github.com/Lightricks/LTX-2.git#subdirectory=packages/ltx-core
+
+# torchaudio: install the CPU variant explicitly (DLAMI's torchaudio depends
+# on libcudart.so.13 and won't load on Neuron). Required on SDK ≥ 2.27.
+pip install --no-deps --index-url https://download.pytorch.org/whl/cpu torchaudio==2.9.1+cpu
+
+sudo apt install -y ffmpeg
 ```
 
-Environment: `NEURON_FUSE_SOFTMAX=1`, `NEURON_CUSTOM_SILU=1`, `NEURON_RT_STOCHASTIC_ROUNDING_EN=0`
+### 2. Download Model
+
+```bash
+huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-22b-distilled.safetensors \
+  --local-dir /opt/dlami/nvme/models/LTX-2.3/
+
+huggingface-cli download google/gemma-3-12b-it \
+  --local-dir /opt/dlami/nvme/models/gemma-3-12b-it
+
+# Optional: upscalers for --upscale (spatial x2 + temporal x2)
+huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
+  --local-dir /opt/dlami/nvme/models/LTX-2.3/upscalers/
+huggingface-cli download Lightricks/LTX-2.3 ltx-2.3-temporal-upscaler-x2-1.0.safetensors \
+  --local-dir /opt/dlami/nvme/models/LTX-2.3/upscalers/
+```
+
+### 3. Compile All Components
+
+```bash
+# Defaults: 384x512, 25 frames, TP=4, all components (encoder + DiT + VAE)
+MODEL_PATH=/opt/dlami/nvme/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+GEMMA_PATH=/opt/dlami/nvme/models/gemma-3-12b-it \
+  bash src/compile.sh
+
+# Custom resolution
+HEIGHT=480 WIDTH=720 NUM_FRAMES=121 \
+MODEL_PATH=... GEMMA_PATH=... \
+  bash src/compile.sh
+
+# Build only one component (re-runs are idempotent — already-populated dirs are skipped)
+COMPONENT=encoder bash src/compile.sh
+
+# Also compile the half-res DiT for two-stage mode
+HALFRES=1 bash src/compile.sh
+
+# Custom output directory
+bash src/compile.sh /path/to/output /path/to/compiler_workdir
+```
+
+`compile.sh` wraps the existing `compile.py {encoder, transformer, vae}` subcommands so every artifact needed by `generate_ltx23.py` is produced from one entry point. Total compile time: ~5 min for the encoder, ~1 min for the DiT, ~10 min for the VAE.
+
+### 4. Pre-shard backbone weights (one-time)
+
+Pre-sharding avoids re-loading the 41 GB safetensors at every generation:
+
+```bash
+python3 src/shard_weights.py backbone \
+  --model-path /opt/dlami/nvme/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+  --output-dir /opt/dlami/nvme/models/LTX-2.3/backbone_sharded
+
+python3 src/shard_weights.py encoder \
+  --gemma-path /opt/dlami/nvme/models/gemma-3-12b-it \
+  --output-dir /opt/dlami/nvme/models/gemma-3-12b-it_sharded
+```
+
+### 5. Run Inference
+
+```bash
+# Text-to-Video (T2V) with Neuron-compiled Gemma 3 (recommended path)
+python3 src/generate_ltx23.py \
+  --neuron-gemma \
+  --model-path /opt/dlami/nvme/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+  --gemma-path /opt/dlami/nvme/models/gemma-3-12b-it \
+  --gemma-compiled-dir /opt/dlami/nvme/compiled_models_ltx23/gemma3_encoder \
+  --gemma-sharded-dir /opt/dlami/nvme/models/gemma-3-12b-it_sharded \
+  --backbone-sharded-dir /opt/dlami/nvme/models/LTX-2.3/backbone_sharded \
+  --compile-dir /opt/dlami/nvme/compiled_models_ltx23/backbone \
+  --prompt "A golden retriever puppy runs across a sunny green meadow" \
+  --output-dir ./out
+
+# Image-to-Video (I2V) — same compiled backbone, just add --image
+python3 src/generate_ltx23.py \
+  --neuron-gemma \
+  --model-path /opt/dlami/nvme/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+  --gemma-path /opt/dlami/nvme/models/gemma-3-12b-it \
+  --gemma-compiled-dir /opt/dlami/nvme/compiled_models_ltx23/gemma3_encoder \
+  --gemma-sharded-dir /opt/dlami/nvme/models/gemma-3-12b-it_sharded \
+  --backbone-sharded-dir /opt/dlami/nvme/models/LTX-2.3/backbone_sharded \
+  --compile-dir /opt/dlami/nvme/compiled_models_ltx23/backbone \
+  --prompt "The woman turns and smiles warmly at the camera" \
+  --image /path/to/photo.png \
+  --output-dir ./out
+
+# Two-stage generation (requires HALFRES=1 compile)
+python3 src/generate_ltx23.py --two-stage \
+  --halfres-compiled-dir /opt/dlami/nvme/compiled_models_ltx23/backbone_halfres \
+  --spatial-upscaler-path /opt/dlami/nvme/models/LTX-2.3/upscalers/ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
+  ... (same args as above)
+
+# Quick smoke test with random embeddings (skips Gemma 3 entirely)
+python3 src/generate_ltx23.py --no-text-encoder
+```
+
+Output: PNG frames + `output.mp4` (via ffmpeg) + `output.wav` + `latents.pt` in `--output-dir`.
+
+## Compatibility Matrix
+
+| Instance / SDK | 2.24 | 2.27 | 2.28 | 2.29 |
+|---|:-:|:-:|:-:|:-:|
+| trn2.3xlarge (TP=4) | E2E tested | — | Validated | Validated |
+| trn2.48xlarge (TP=4 / TP=16) | — | Validated | — | — |
+
+Notes:
+- **SDK 2.24 (E2E test, this branch)**: pipeline runs end-to-end at 384×512 / 25 frames; warm step latency ~0.3 s matches earlier SDK validations.
+- **SDK 2.29**: torchaudio must be reinstalled as the CPU variant (see step 1). `decode_video` moved to `VideoDecoder.decode_video()` in ltx-core 1.1; the runner handles both the old free function and the new method.
+
+## Testing
+
+```bash
+cd contrib/models/LTX-2.3
+
+MODEL_PATH=/opt/dlami/nvme/models/LTX-2.3/ltx-2.3-22b-distilled.safetensors \
+COMPILED_MODEL_PATH=/opt/dlami/nvme/compiled_models_ltx23/backbone \
+  pytest test/integration/test_model.py -v -s
+```
+
+Tests check that the model loads, a forward pass produces non-NaN output, cosine similarity ≥ 0.999 vs CPU reference, and per-step warm latency holds.
+
+Accuracy validation (single forward pass at sigma = 1.0, noise input):
+
+| Component | Cosine similarity | vs CPU reference |
+|---|---:|---|
+| Video forward pass | 0.999947 | unsharded BF16, native ltx-core |
+| Audio forward pass | 0.999867 | same |
+| 8-step denoised latent (real text) | 0.972 | normal BF16 TP accumulation drift |
+
+## Key Implementation Notes
+
+1. **Sequential Gemma 3 / DiT execution**: both compile for TP=4 onto the same 4 NeuronCores. The runner explicitly unloads Gemma 3 (NRT resource cleanup) before loading the DiT — co-residency thrashes (144 s+ for the first denoise step instead of 0.3 s).
+2. **AdaLN deduplication (T2V)**: when every token shares the same sigma, the AdaLN MLP is computed once and broadcast, not per-token. Saves ~47 ms / step.
+3. **Step-invariant caching**: RoPE, context projection, and additive attention masks are constant across the 8 denoising steps; computed once on step 1, reused for steps 2–8 (~57 ms / step).
+4. **Tiled VAE decode (TP=4)**: the LTX-2.3 video decoder hits the Neuron SBUF limit at H>64 latent. The TP-sharded decoder is compiled at 1×16 latent (128×512 pixels post-VAE) and tiled with overlap blending (overlap_h=1 latent) for arbitrary output resolutions. 3.3× faster than CPU VAE at 1024×1536.
+5. **DistributedRMSNorm bypass**: QK-norm uses the local-only RMSNorm path (compiler bug with the global all-reduce flavor) — same workaround as Wan2.2-TI2V.
+6. **Distilled sigma schedule**: the 8-step distilled checkpoint requires the exact sigma list from `ltx_pipelines/utils/constants.py` (`DISTILLED_SIGMA_VALUES`). The runner asserts `len(sigmas) == num_steps + 1` so a wrong schedule fails fast.
+7. **PhaseTimer output**: see the “Phase-timer output” section above. The single sample per phase makes regressions in any boundary (text encode, DiT, VAE decode) jump out without hand-grepping the log.
 
 ## Known Issues
 
-- **Cold start latency**: The DiT warmup pass takes ~139s and the first denoising step takes ~175s due to Neuron device initialization. Subsequent steps run at ~0.3s each. Gemma3 encoder NEFF rehydration adds ~362s on first load (one-time per instance).
-- **CPU text encoding fallback**: Without Neuron-compiled Gemma3, text encoding takes ~162s on CPU. Use `--neuron-gemma` for 0.6s warm text encoding (~270x faster).
-- **Two-stage cold start**: Two-stage mode loads two separate Neuron backbones sequentially (half-res and full-res), each with its own NEFF warmup. Total cold start overhead is ~2x single-stage.
-- **BF16 TP accumulation**: The 0.972 cosine similarity over 8 denoising steps (vs CPU) is due to normal BF16 rounding across TP=4 ranks. Single forward pass accuracy is 0.9999.
-- **No EFA**: The trn2.3xlarge single-instance setup does not use EFA for inter-node communication. NCCL/OFI warnings about EFA can be safely ignored.
-- **CPU video decode bottleneck**: At 384×512 (25 frames), the CPU video decoder takes ~4.7s — over half of warm E2E time. At higher resolutions (1024×1536, 121 frames), CPU decode takes 78.7s. The TP=4 tiled Neuron VAE decoder reduces this to 23.5s (3.3x speedup). Use `--vae-compiled-dir` in `run_phase2.py` to enable Neuron decode. The tiled approach compiles the decoder at 4×16 latent (128×512 pixels) — H×W ≤ 64 is the SRAM limit — and decodes via overlapping spatial tiles with linear blending.
+- **Cold start latency**: DiT warmup ~139 s + step-1 cold ~175 s on a fresh instance (Neuron device init). Steps 2-N are ~0.3 s. Gemma 3 NEFF rehydration adds ~362 s on first load (one-time per instance).
+- **CPU video decode at small resolutions**: at 384×512 / 25 frames the CPU video decoder takes ~7 s — over half of warm-state E2E. The Neuron tiled VAE decoder (`--vae-compiled-dir`) collapses this at higher resolutions but isn't a win at 384×512 (overhead beats the savings).
+- **Two-stage cold start**: each stage loads its own NEFF; total cold-start overhead is ~2× single-stage.
+- **No EFA**: trn2.3xlarge does not use EFA; NCCL/OFI EFA warnings are benign.
+- **Frame conversion**: `VideoDecoder.decode_video()` returns float in [0, 1] in ltx-core ≥ 1.1 (not uint8 as the older free function did). The runner handles the conversion explicitly; without the cast `.numpy()` raises on bf16 and a naive `.to(torch.uint8)` truncates every pixel to 0.
 
-## Source Files
+## File Structure
 
-| File | Purpose |
-|------|---------|
-| `src/modeling_ltx23.py` | Core backbone: TP sharding, DistributedRMSNorm, SDPA replacement, TransformerArgs construction |
-| `src/modeling_gemma3_encoder.py` | Custom Gemma3 encoder-only model: returns all 49 hidden states stacked, no KV cache |
-| `src/pipeline.py` | NeuronTransformerWrapper: CPU preprocessing, backbone routing, mask handling, AdaLN deduplication, step-invariant caching |
-| `src/compile.py` | Unified compilation script: `compile.py transformer [--halfres]`, `compile.py encoder`, `compile.py vae` |
-| `src/shard_weights.py` | Unified weight sharding: `shard_weights.py backbone`, `shard_weights.py encoder` |
-| `src/load_with_weights.py` | DiT backbone weight sharding and injection utilities |
-| `src/generate_ltx23.py` | E2E generation pipeline (text encoding, single/two-stage denoising, VAE decode, upscaling, image-to-video) |
-| `src/run_phase2.py` | Phase 2 standalone script: spatial upsample + S2 denoising + Neuron/CPU VAE decode |
-| `src/modeling_vae_23.py` | TP-sharded LTX-2.3 VAE decoder (~560 lines), ColumnRowParallelConv3d, CausalConv3d |
-| `src/tiled_vae_decode_23.py` | Tiled decode with overlap blending for arbitrary resolutions |
-| `src/compile_benchmark.py` | Full benchmark compilation script for trn2.48xlarge (encoder + S1 + S2 backbone via Application path) |
-| `src/application.py` | NeuronLTX23Application compositor for NxDI Application path |
+```
+LTX-2.3/
+  README.md
+  src/
+    compile.sh                            # Master compile driver (this PR)
+    compile.py                            # encoder | transformer | vae subcommands
+    compile_benchmark.py                  # trn2.48xlarge two-phase compile harness
+    shard_weights.py                      # backbone | encoder weight pre-sharding
+    generate_ltx23.py                     # E2E runner (text encode → denoise → VAE → MP4 + WAV)
+    run_phase2.py                         # Phase 2 standalone (S2 denoise + Neuron VAE)
+    pipeline.py                           # NeuronTransformerWrapper + AdaLN dedup + step-cache
+    modeling_ltx23.py                     # Backbone TP sharding + DistributedRMSNorm
+    modeling_gemma3_encoder.py            # Encoder-only Gemma 3 model (returns 49 hidden states)
+    modeling_vae_23.py                    # TP-sharded VAE decoder
+    tiled_vae_decode_23.py                # Tile + overlap blending wrapper
+    application.py                        # NxDI Application compositor (run-mode helper)
+  test/
+    integration/
+      test_model.py                       # Forward-pass + cosine-similarity test
+```
+
+## Example Checkpoints
+
+* [`Lightricks/LTX-2.3`](https://huggingface.co/Lightricks/LTX-2.3) — `ltx-2.3-22b-distilled.safetensors`
+* [`google/gemma-3-12b-it`](https://huggingface.co/google/gemma-3-12b-it) — text encoder
+
+## Maintainer
+
+Henan Wan (whn09), forked from jimburtoft/contrib/ltx-2.3.
+
+**Last Updated:** 2026-05-21 (PhaseTimer + unified compile.sh)
