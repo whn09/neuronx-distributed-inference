@@ -32,10 +32,11 @@ Numbers from a single trn2.48xlarge run, SDK 2.28, single-stage T2V with Neuron-
 
 ### Warm-state per-run wall clock (after warmup-run)
 
-| Resolution | Frames | DiT step (warm) | Denoise (8 steps) | Video decode (CPU) | Audio decode (CPU) | Run total |
+| Resolution | Frames | DiT step (warm) | Denoise (8 steps) | Video decode | Audio decode (CPU) | Run total |
 |---|---:|---:|---:|---:|---:|---:|
-| 384×512 | 25 | 0.3 s | 2.4 s | 7.2 s | 2.5 s | ~12 s |
-| 384×512 | 81 | 0.6 s | **5.1 s** | **3.6 s** | **3.4 s** | **16.2 s** |
+| 384×512 | 25 | 0.3 s | 2.4 s | 7.2 s (CPU) | 2.5 s | ~12 s |
+| 384×512 | 81 | 0.6 s | 5.1 s | 3.6 s (CPU) | 3.4 s | 16.2 s |
+| 384×512 | 81 | 0.6 s | **5.2 s** | **1.6 s (Neuron)** | **3.6 s** | **12.8 s** |
 
 Cold-start overheads (one-time per process, recorded in the discarded warmup run):
 
@@ -45,7 +46,7 @@ Cold-start overheads (one-time per process, recorded in the discarded warmup run
 | `transformer_forward` step 1 (cold) | ~270–380 s | Neuron device init + step-invariant cache fill |
 | Gemma 3 NEFF rehydration | ~360 s | One-time per instance, persists across processes |
 
-`video_decode` on the Neuron tiled VAE (TP=4, see `tiled_vae_decode_23.py`) is **3.3× faster than CPU at 1024×1536 / 121 f** (23.5 s vs ~78 s) but loses to CPU at 384×512 (overhead beats the savings).
+`video_decode` on the Neuron tiled VAE (TP=4, see `tiled_vae_decode_23.py`) co-resides with the DiT on the same TP=4 logical cores — pass `--vae-compiled-dir` to opt in. Measured speedups vs the CPU path: **2.3× at 384×512 / 81 f** (1.6 s vs 3.6 s) and **3.3× at 1024×1536 / 121 f** (23.5 s vs ~78 s). At 384×512 / 25 f the CPU path still wins (overhead beats the savings).
 
 CPU-side optimizations applied in `pipeline.py` to keep the warm step short:
 
@@ -78,11 +79,12 @@ Phases are recorded for both single-stage and two-stage paths (and on the Phase-
 
 ### Resolution sweep
 
-| Resolution | Frames | latent_f × video_seq | DiT step (warm) | Run total (warm) |
-|---|---:|---|---:|---:|
-| 384×512 | 25 | 4 × 768 | 0.3 s | ~12 s |
-| 384×512 | 81 | 11 × 2112 | 0.6 s | 16.2 s |
-| 720×480, 1280×704 | 25 / 121 | — | — | TODO |
+| Resolution | Frames | latent_f × video_seq | DiT step (warm) | Run total (warm) | VAE path |
+|---|---:|---|---:|---:|---|
+| 384×512 | 25 | 4 × 768 | 0.3 s | ~12 s | CPU |
+| 384×512 | 81 | 11 × 2112 | 0.6 s | 16.2 s | CPU |
+| 384×512 | 81 | 11 × 2112 | 0.6 s | 12.8 s | Neuron tiled |
+| 720×480, 1280×704 | 25 / 121 | — | — | TODO | — |
 
 Each new row needs a fresh DiT compile (latent_f / video_seq are baked into the NEFF; see `--num-frames` on `compile.py transformer`) plus a re-shard. With the artifacts in place, a warm-run measurement is cheap (~16 s for 81 f).
 
@@ -178,9 +180,12 @@ python3 src/generate_ltx23.py \
   --gemma-sharded-dir /opt/dlami/nvme/models/gemma-3-12b-it_sharded \
   --backbone-sharded-dir /opt/dlami/nvme/models/LTX-2.3/backbone_sharded \
   --compile-dir /opt/dlami/nvme/compiled_models_ltx23/backbone \
+  --vae-compiled-dir /opt/dlami/nvme/compiled_models_ltx23/vae \
   --num-frames 81 \
   --prompt "A golden retriever puppy runs across a sunny green meadow" \
   --output-dir ./out
+# (--vae-compiled-dir is optional; without it video decode falls back to CPU.
+#  At 384×512 / 81 f the Neuron tiled VAE is ~2.3× faster — see perf table.)
 
 # Image-to-Video (I2V) — same compiled backbone, just add --image
 python3 src/generate_ltx23.py \
@@ -251,7 +256,7 @@ Accuracy validation (single forward pass at sigma = 1.0, noise input):
 ## Known Issues
 
 - **Cold start latency**: DiT warmup ~139 s + step-1 cold ~175 s on a fresh instance (Neuron device init). Steps 2-N are ~0.3 s. Gemma 3 NEFF rehydration adds ~362 s on first load (one-time per instance).
-- **CPU video decode at small resolutions**: at 384×512 / 25 frames the CPU video decoder takes ~7 s — over half of warm-state E2E. The Neuron tiled VAE decoder (`--vae-compiled-dir`) collapses this at higher resolutions but isn't a win at 384×512 (overhead beats the savings).
+- **CPU video decode at 25 frames**: at 384×512 / 25 f the CPU video decoder takes ~7 s — over half of warm-state E2E. The Neuron tiled VAE decoder (`--vae-compiled-dir`) wins at 81 f (1.6 s vs 3.6 s) and at high resolutions (3.3× at 1024×1536 / 121 f) but isn't a win at 384×512 / 25 f (overhead beats the savings).
 - **Two-stage cold start**: each stage loads its own NEFF; total cold-start overhead is ~2× single-stage.
 - **No EFA**: trn2.3xlarge does not use EFA; NCCL/OFI EFA warnings are benign.
 - **Frame conversion**: `VideoDecoder.decode_video()` returns float in [0, 1] in ltx-core ≥ 1.1 (not uint8 as the older free function did). The runner handles the conversion explicitly; without the cast `.numpy()` raises on bf16 and a naive `.to(torch.uint8)` truncates every pixel to 0.

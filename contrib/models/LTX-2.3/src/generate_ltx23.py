@@ -2089,6 +2089,35 @@ def generate(args):
     logger.info("  DiT backbone warmup done in %.1fs", time.time() - t0)
     del warmup_video_mod, warmup_audio_mod
 
+    # Optional: load Neuron tiled VAE alongside DiT (co-resident on TP=4 cores).
+    # VAE weights are tiny (~0.08 GB / core sharded), so HBM headroom is plentiful;
+    # keeping both loaded avoids per-run swap overhead and lets PhaseTimer record
+    # video_decode cleanly inside each run.
+    compiled_vae = None
+    vae_scaled_timestep = None
+    if args.vae_compiled_dir:
+        from tiled_vae_decode_23 import (
+            load_compiled_vae as _load_compiled_vae,
+            get_scaled_timestep as _get_scaled_timestep,
+        )
+
+        logger.info(
+            "\n=== Loading Neuron tiled VAE (co-resident with DiT) ==="
+        )
+        t0 = time.time()
+        compiled_vae = _load_compiled_vae(args.vae_compiled_dir)
+        logger.info("  Neuron VAE loaded in %.1fs", time.time() - t0)
+
+        vae_scaled_timestep = _get_scaled_timestep(
+            cpu["video_decoder"], batch_size=1
+        )
+        if vae_scaled_timestep is None:
+            # Compiled NEFF always expects 2 inputs; if timestep_conditioning was
+            # constant-folded out at trace time, supply the canonical default.
+            vae_scaled_timestep = torch.tensor(
+                [0.05 * 1000.0], dtype=torch.float32
+            )
+
     # Sigma schedule — use distilled values for the distilled model
     # The distilled model was trained with these exact sigma values
     sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, dtype=torch.float32)
@@ -2259,38 +2288,66 @@ def generate(args):
         video_latent_4d = video_latent_spatial[0]
         logger.info("  Video latent for VAE: %s", video_latent_4d.shape)
 
-        # Video decode
+        # Video decode (Neuron tiled VAE if --vae-compiled-dir, else CPU).
         os.makedirs(run_output_dir, exist_ok=True)
 
-        logger.info("  Decoding video...")
+        logger.info(
+            "  Decoding video (%s)...",
+            "Neuron tiled" if compiled_vae is not None else "CPU",
+        )
         t0 = time.time()
         with phase_timer.scope("video_decode"):
-            try:
-                from ltx_core.model.video_vae.video_vae import decode_video
+            if compiled_vae is not None:
+                from tiled_vae_decode_23 import (
+                    preprocess_latent as _preprocess_latent,
+                    tiled_decode as _tiled_decode,
+                )
 
-                video_chunks = []
-                with torch.no_grad():
-                    for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
-                        video_chunks.append(chunk)
-            except ImportError:
-                video_chunks = []
-                with torch.no_grad():
-                    for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
-                        video_chunks.append(chunk)
-            video_frames = torch.cat(video_chunks, dim=0)
+                preprocessed = _preprocess_latent(
+                    video_latent_spatial, cpu["video_decoder"], seed=args.seed
+                )
+                video_output = _tiled_decode(
+                    preprocessed,
+                    compiled_vae,
+                    scaled_timestep=vae_scaled_timestep,
+                    tile_latent_h=4,
+                    tile_latent_w=16,
+                    overlap_latent_h=1,
+                    overlap_latent_w=0,
+                    verbose=False,
+                )
+                # video_output: [1, 3, T_out, H, W] in [0, 1] -> [T_out, H, W, 3]
+                video_output = video_output.clamp(0, 1)
+                video_frames = (
+                    video_output[0].permute(1, 2, 3, 0) * 255.0
+                ).to(torch.uint8)
+                del preprocessed, video_output
+            else:
+                try:
+                    from ltx_core.model.video_vae.video_vae import decode_video
+
+                    video_chunks = []
+                    with torch.no_grad():
+                        for chunk in decode_video(video_latent_4d, cpu["video_decoder"]):
+                            video_chunks.append(chunk)
+                except ImportError:
+                    video_chunks = []
+                    with torch.no_grad():
+                        for chunk in cpu["video_decoder"].decode_video(video_latent_4d):
+                            video_chunks.append(chunk)
+                video_frames = torch.cat(video_chunks, dim=0)
+
+                # ltx-core 1.1.3 VideoDecoder.decode_video yields float in [0, 1].
+                if video_frames.dtype != torch.uint8:
+                    if video_frames.is_floating_point():
+                        video_frames = (
+                            video_frames.float().clamp(0.0, 1.0) * 255.0
+                        ).to(torch.uint8)
+                    else:
+                        video_frames = video_frames.to(torch.uint8)
         logger.info(
             "  Video decoded: %s in %.1fs", video_frames.shape, time.time() - t0
         )
-
-        # ltx-core 1.1.3 VideoDecoder.decode_video yields float in [0, 1].
-        # Convert to uint8 (bf16.numpy() raises; direct .to(uint8) on [0,1] truncates to 0).
-        if video_frames.dtype != torch.uint8:
-            if video_frames.is_floating_point():
-                video_frames = (
-                    video_frames.float().clamp(0.0, 1.0) * 255.0
-                ).to(torch.uint8)
-            else:
-                video_frames = video_frames.to(torch.uint8)
 
         # Save video frames
         from PIL import Image
@@ -2495,6 +2552,12 @@ def main():
         "--temporal-upscaler-path",
         default=None,
         help="Path to temporal upscaler x2 safetensors",
+    )
+    parser.add_argument(
+        "--vae-compiled-dir",
+        default=None,
+        help="Directory with compiled Neuron tiled VAE decoder (from compile.py vae). "
+        "When set, video decode runs on Neuron co-resident with DiT instead of CPU.",
     )
     parser.add_argument(
         "--image",
