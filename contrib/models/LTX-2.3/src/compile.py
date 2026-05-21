@@ -93,7 +93,7 @@ def load_config_from_safetensors(model_path):
 
 
 def precompute_inputs(
-    config, video_seq, latent_h, latent_w, text_seq=256, audio_seq=26
+    config, video_seq, latent_h, latent_w, text_seq=256, audio_seq=26, latent_f=4
 ):
     """Build example inputs using the native ltx-core preprocessing."""
     from modeling_ltx23 import replace_sdpa_with_bmm
@@ -123,7 +123,7 @@ def precompute_inputs(
     torch.manual_seed(123)
 
     video_shape = VideoLatentShape(
-        batch=batch, channels=128, frames=4, height=latent_h, width=latent_w
+        batch=batch, channels=128, frames=latent_f, height=latent_h, width=latent_w
     )
     v_patchifier = VideoLatentPatchifier(patch_size=1)
     v_scale = SpatioTemporalScaleFactors.default()
@@ -277,13 +277,19 @@ def compile_transformer(args):
     if args.halfres:
         latent_h = 6  # 192 / 32
         latent_w = 8  # 256 / 32
-        video_seq = 192  # 4 * 6 * 8
+        latent_f = 4  # 25-frame default for two-stage S1
+        video_seq = latent_f * latent_h * latent_w
         res_label = "half-res (192x256)"
     else:
         latent_h = args.latent_h
         latent_w = args.latent_w
-        video_seq = 4 * latent_h * latent_w
-        res_label = f"full-res ({latent_h * 32}x{latent_w * 32})"
+        # Match generate_ltx23.py / pipeline.py: latent_f = (num_frames - 1) // 8 + 1
+        latent_f = (args.num_frames - 1) // 8 + 1
+        video_seq = latent_f * latent_h * latent_w
+        res_label = (
+            f"full-res ({latent_h * 32}x{latent_w * 32}, {args.num_frames} frames, "
+            f"latent_f={latent_f}, video_seq={video_seq})"
+        )
 
     compile_dir = args.compile_dir
 
@@ -313,7 +319,9 @@ def compile_transformer(args):
             f"\n[2/4] Precomputing inputs ({num_layers} blocks, video_seq={video_seq})...",
             flush=True,
         )
-        example_inputs = precompute_inputs(full_config, video_seq, latent_h, latent_w)
+        example_inputs = precompute_inputs(
+            full_config, video_seq, latent_h, latent_w, latent_f=latent_f
+        )
         print(f"  Got {len(example_inputs)} inputs", flush=True)
 
         print("\n[3/4] Building TP-sharded model (rank 0)...", flush=True)
@@ -574,6 +582,15 @@ Examples:
     )
     p_trans.add_argument(
         "--latent-w", type=int, default=16, help="Latent width (default: 16 for 512px)"
+    )
+    p_trans.add_argument(
+        "--num-frames",
+        type=int,
+        default=25,
+        help=(
+            "Number of pixel frames (default: 25 → latent_f=4, video_seq=768 at 384x512). "
+            "latent_f = (num_frames - 1) // 8 + 1. Ignored when --halfres."
+        ),
     )
     p_trans.add_argument(
         "--tp-degree", type=int, default=4, help="TP degree (default: 4)"

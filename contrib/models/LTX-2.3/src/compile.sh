@@ -99,6 +99,7 @@ if want transformer; then
             torchrun --nproc_per_node="${TP_DEGREE}" "${SCRIPT_DIR}/compile.py" transformer \
                 --latent-h "${LATENT_H}" \
                 --latent-w "${LATENT_W}" \
+                --num-frames "${NUM_FRAMES}" \
                 --tp-degree "${TP_DEGREE}" \
                 --model-path "${MODEL_PATH}" \
                 --compile-dir "${DIT_DIR}"
