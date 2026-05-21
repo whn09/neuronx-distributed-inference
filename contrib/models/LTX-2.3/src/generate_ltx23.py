@@ -2316,8 +2316,11 @@ def generate(args):
                     overlap_latent_w=0,
                     verbose=False,
                 )
-                # video_output: [1, 3, T_out, H, W] in [0, 1] -> [T_out, H, W, 3]
-                video_output = video_output.clamp(0, 1)
+                # Raw VideoDecoder.forward() output is in [-1, 1] (matches the
+                # to_rgb transform used by VideoDecoder.decode_video). Shift to
+                # [0, 1] then scale to uint8. Skipping the +1/2 step is what
+                # produced the black/quilted artefacts in the first integration.
+                video_output = (video_output.add(1.0).mul_(0.5)).clamp_(0.0, 1.0)
                 video_frames = (
                     video_output[0].permute(1, 2, 3, 0) * 255.0
                 ).to(torch.uint8)

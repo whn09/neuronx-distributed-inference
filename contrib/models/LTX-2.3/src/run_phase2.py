@@ -472,8 +472,10 @@ def main():
         decode_time = time.time() - t0
         logger.info("  Neuron VAE decode: %.1fs", decode_time)
 
-        # Convert to uint8 frames: [1, 3, T_out, H, W] -> [T_out, H, W, 3]
-        video_output = video_output.clamp(0, 1)
+        # Raw VideoDecoder.forward() output is in [-1, 1] (matches to_rgb in
+        # VideoDecoder.decode_video). Shift to [0, 1] before uint8 quantization;
+        # without this the negative half is clamped to 0 -> dark/quilted frames.
+        video_output = (video_output.add(1.0).mul_(0.5)).clamp_(0.0, 1.0)
         video_frames = (video_output[0].permute(1, 2, 3, 0) * 255).to(torch.uint8)
         logger.info("  Video frames: %s", video_frames.shape)
 
