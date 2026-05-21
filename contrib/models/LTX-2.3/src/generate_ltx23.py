@@ -1072,9 +1072,9 @@ def encode_text_with_app(
         attention_mask=attention_mask,
     )
 
-    # Unload encoder to free NeuronCores for backbone
-    app.unload_text_encoder()
-    logger.info("  Gemma3 encoder unloaded")
+    # Keep encoder resident — the backbone and encoder share the same TP=4
+    # cores and HBM headroom is sufficient for both. Per-request unload would
+    # add several seconds of NRT teardown/init when serving.
 
     return result.video_encoding, result.audio_encoding, result.attention_mask
 
@@ -1094,13 +1094,15 @@ def generate(args):
     logger.info("\n=== Building CPU components ===")
     cpu = build_cpu_components(config, args.model_path)
 
-    # When using Neuron Gemma3, we must load/run/unload Gemma3 BEFORE loading
-    # the DiT backbone, since both share the same 4 NeuronCores. Loading both
-    # simultaneously causes memory contention and extreme swap thrashing
-    # (144s+ for the first denoising step instead of 0.3s).
-    #
-    # Sequence: CPU components -> Gemma3 on Neuron -> encode -> unload Gemma3
-    #           -> DiT on Neuron -> denoise -> decode
+    # Co-resident Gemma3 + DiT layout (TP=4 on the same 4 logical cores).
+    # An earlier integration unloaded Gemma3 before loading DiT after seeing
+    # 144s on first denoise step — that turned out to be NRT init / NEFF
+    # rehydration behaviour rather than HBM contention. Per-core HBM math at
+    # the current footprint (DiT BF16 ~10–12 GB, Gemma 12B BF16 ~6 GB, VAE
+    # ~0.08 GB) leaves ~5 GB headroom on each 24 GB logical core, so we keep
+    # all three NEFFs resident. This is the configuration we will deploy as
+    # a service: per-request unload/reload would re-amortize NEFF page-in
+    # on every call.
 
     # Get context embeddings
     dtype = torch.bfloat16
@@ -1173,10 +1175,8 @@ def generate(args):
             audio_context.shape,
         )
 
-        # Free Gemma3 Neuron model — must fully release NeuronCores
-        # before loading the DiT backbone which shares the same 4 cores
-        unload_neuron_model(neuron_gemma3, "Gemma3 encoder")
-        del neuron_gemma3
+        # Keep Gemma3 resident on the cores alongside the DiT backbone — see
+        # the comment block in generate() for the rationale.
     else:
         logger.info("\n=== Running text encoder ===")
         # Load Gemma 3 12B

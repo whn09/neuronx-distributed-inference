@@ -24,7 +24,7 @@ Key parameters:
 
 - **Denoising steps**: 8 (distilled checkpoint), flow-matching Euler integrator, distilled sigma schedule.
 - **Default resolution**: 384×512 / 25 frames (single-stage). Two-stage mode generates at 192×256 / 8 steps then refines at 384×512 / 3 steps after a CPU 2× spatial upsample.
-- **Encoder–DiT scheduling**: Gemma 3 (TP=4) and DiT (TP=4) share the same 4 NeuronCores and run sequentially — Gemma 3 loads, encodes, unloads, then DiT loads and runs the denoise loop. Loading both at once thrashes (144s+ for the first denoise step instead of 0.3s).
+- **Encoder–DiT–VAE co-residency**: Gemma 3 (TP=4), the DiT (TP=4), and the tiled VAE decoder (TP=4) all share the same 4 NeuronCores and stay resident across requests. An earlier integration unloaded Gemma 3 before loading the DiT after a 144 s first-step regression on a previous SDK; that turned out to be NEFF rehydration / NRT init, not HBM contention, and at the current per-core footprint (DiT BF16 ~10–12 GB, Gemma 12B BF16 ~6 GB, VAE ~0.08 GB on each 24 GB logical core) all three NEFFs fit. Per-request unload/reload would re-amortize NEFF page-in on every serving call, so the runner now keeps everything resident.
 
 ## Performance
 
@@ -245,7 +245,7 @@ Accuracy validation (single forward pass at sigma = 1.0, noise input):
 
 ## Key Implementation Notes
 
-1. **Sequential Gemma 3 / DiT execution**: both compile for TP=4 onto the same 4 NeuronCores. The runner explicitly unloads Gemma 3 (NRT resource cleanup) before loading the DiT — co-residency thrashes (144 s+ for the first denoise step instead of 0.3 s).
+1. **Co-resident Gemma 3 / DiT / VAE**: all three components compile for TP=4 onto the same 4 NeuronCores and stay loaded across runs. An earlier sequential variant unloaded Gemma 3 before loading the DiT after a 144 s first-step regression; root cause was NEFF rehydration on a previous SDK, not HBM contention, and the current per-core HBM headroom comfortably holds all three NEFFs. Keeping them resident is required for the eventual long-running service so each request only pays NEFF page-in once.
 2. **AdaLN deduplication (T2V)**: when every token shares the same sigma, the AdaLN MLP is computed once and broadcast, not per-token. Saves ~47 ms / step.
 3. **Step-invariant caching**: RoPE, context projection, and additive attention masks are constant across the 8 denoising steps; computed once on step 1, reused for steps 2–8 (~57 ms / step).
 4. **Tiled VAE decode (TP=4)**: the LTX-2.3 video decoder hits the Neuron SBUF limit at H>64 latent. The TP-sharded decoder is compiled at 1×16 latent (128×512 pixels post-VAE) and tiled with overlap blending (overlap_h=1 latent) for arbitrary output resolutions. 3.3× faster than CPU VAE at 1024×1536.
@@ -293,4 +293,4 @@ LTX-2.3/
 
 Henan Wan (whn09), forked from jimburtoft/contrib/ltx-2.3.
 
-**Last Updated:** 2026-05-21 (warmup-run + 81-frame baseline)
+**Last Updated:** 2026-05-21 (encoder + DiT + VAE co-residency)
