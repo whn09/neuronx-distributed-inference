@@ -6,6 +6,7 @@ COMPILED_ARTIFACTS=""
 MAX_MODEL_LEN="512"
 SEQ_LEN="512"
 CTE_BUCKET="512"
+CTE_BUCKETS_CSV=""
 TP_DEGREE="4"
 LNC="2"
 MAX_NUM_SEQS="1"
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
     --seq-len) SEQ_LEN="$2"; shift 2 ;;
     --cte-bucket) CTE_BUCKET="$2"; shift 2 ;;
+    --context-encoding-buckets) CTE_BUCKETS_CSV="$2"; shift 2 ;;
     --tensor-parallel-size) TP_DEGREE="$2"; shift 2 ;;
     --logical-nc-config) LNC="$2"; shift 2 ;;
     --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
@@ -66,6 +68,12 @@ ADDITIONAL_CONFIG="$(
   python3 - <<PY
 import json
 enable_chunked = "${ENABLE_CHUNKED_PREFILL}" == "1"
+buckets_csv = "${CTE_BUCKETS_CSV}"
+if buckets_csv:
+    cte_buckets = sorted({int(x) for x in buckets_csv.split(",") if x.strip()})
+else:
+    cte_buckets = [int("${CTE_BUCKET}")]
+max_ctx = max(cte_buckets)
 neuron_config = {
     "tp_degree": int("${TP_DEGREE}"),
     "batch_size": int("${MAX_NUM_SEQS}"),
@@ -73,10 +81,10 @@ neuron_config = {
     "tkg_batch_size": int("${MAX_NUM_SEQS}"),
     "seq_len": int("${SEQ_LEN}"),
     "max_length": int("${SEQ_LEN}"),
-    "max_context_length": int("${CTE_BUCKET}"),
-    "context_encoding_buckets": [int("${CTE_BUCKET}")],
+    "max_context_length": max_ctx,
+    "context_encoding_buckets": cte_buckets,
     "token_generation_buckets": [int("${SEQ_LEN}")],
-    "enable_bucketing": False,
+    "enable_bucketing": len(cte_buckets) > 1,
     "logical_nc_config": int("${LNC}"),
     "torch_dtype": "bfloat16",
     "save_sharded_checkpoint": True,
@@ -92,7 +100,7 @@ if enable_chunked:
         },
     })
 print(json.dumps({
-    "max_prompt_length": int("${CTE_BUCKET}"),
+    "max_prompt_length": max_ctx,
     "override_neuron_config": neuron_config,
 }))
 PY

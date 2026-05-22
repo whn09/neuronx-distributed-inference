@@ -162,6 +162,15 @@ def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
     print("MANUAL_FP8_MLP_WEIGHT_COUNT", quantized_count, flush=True)
 
 
+def _parse_buckets(args: argparse.Namespace) -> list[int]:
+    if args.context_encoding_buckets:
+        raw = [int(x) for x in args.context_encoding_buckets.split(",") if x.strip()]
+        if not raw:
+            raise ValueError("--context-encoding-buckets must list at least one int")
+        return sorted(set(raw))
+    return [args.cte_bucket]
+
+
 def _build_config(args: argparse.Namespace):
     from neuronx_distributed_inference.models.config import (  # noqa: WPS433
         NeuronConfig,
@@ -174,15 +183,19 @@ def _build_config(args: argparse.Namespace):
     num_layers = int(config_dict["num_hidden_layers"])
     modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
 
+    buckets = _parse_buckets(args)
+    max_ctx = max(buckets)
+    enable_bucketing = len(buckets) > 1
+
     neuron_config = NeuronConfig(
         tp_degree=args.tp_degree,
         batch_size=1,
         ctx_batch_size=1,
         tkg_batch_size=1,
         seq_len=args.seq_len,
-        max_context_length=args.cte_bucket,
+        max_context_length=max_ctx,
         max_length=args.seq_len,
-        context_encoding_buckets=[args.cte_bucket],
+        context_encoding_buckets=buckets,
         torch_dtype=torch.bfloat16,
         on_device_sampling_config=OnDeviceSamplingConfig(
             do_sample=False,
@@ -190,7 +203,7 @@ def _build_config(args: argparse.Namespace):
             top_p=1.0,
             temperature=1.0,
         ),
-        enable_bucketing=False,
+        enable_bucketing=enable_bucketing,
         logical_nc_config=args.logical_nc_config,
         save_sharded_checkpoint=True,
         quantized=True,
@@ -221,6 +234,15 @@ def main() -> int:
     parser.add_argument("--quantized-checkpoints-path", required=True)
     parser.add_argument("--seq-len", type=int, default=65536)
     parser.add_argument("--cte-bucket", type=int, default=512)
+    parser.add_argument(
+        "--context-encoding-buckets",
+        default=None,
+        help=(
+            "Comma-separated list of CTE bucket sizes "
+            "(e.g. '1024,2048,4096,8192'). When set, --cte-bucket is ignored "
+            "and bucketing is enabled."
+        ),
+    )
     parser.add_argument("--tp-degree", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
     parser.add_argument("--force-quantize", action="store_true")
@@ -246,13 +268,14 @@ def main() -> int:
     print("COMPILED_PATH", str(compiled_path), flush=True)
     print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
     print("MODULES_TO_NOT_CONVERT_COUNT", len(modules_to_not_convert), flush=True)
+    buckets = _parse_buckets(args)
     print(
         "CONTEXT_TRACE_SHAPE",
         json.dumps(
             {
                 "seq_len": args.seq_len,
-                "max_context_length": args.cte_bucket,
-                "context_encoding_buckets": [args.cte_bucket],
+                "max_context_length": max(buckets),
+                "context_encoding_buckets": buckets,
             },
             sort_keys=True,
         ),
