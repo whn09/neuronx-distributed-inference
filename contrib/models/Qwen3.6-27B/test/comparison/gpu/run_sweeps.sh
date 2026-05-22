@@ -10,7 +10,9 @@
 #   OUTDIR            Directory for raw JSON + log output.
 #
 # Optional env vars:
-#   RANGE_RATIO       --random-range-ratio, default 0.1.
+#   RANGE_RATIO       --random-range-ratio, default 0 (exact ISL). Raise only
+#                     if your serving config can absorb ISL*(1+RANGE_RATIO)
+#                     without overshooting compiled buckets.
 #   PREFILL_ISLS      Space-separated, default "8192 16384 32768 65536 131072 262143".
 #   DECODE_CONC       Space-separated, default "1 2 4 8 16 32 64".
 #   PREFILL_TTFT_LIMIT_S   Stop prefill sweep when median TTFT exceeds this (default 120).
@@ -23,7 +25,7 @@ set -uo pipefail
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
-RANGE_RATIO="${RANGE_RATIO:-0.1}"
+RANGE_RATIO="${RANGE_RATIO:-0}"
 PREFILL_ISLS="${PREFILL_ISLS:-8192 16384 32768 65536 131072 262143}"
 DECODE_CONC="${DECODE_CONC:-1 2 4 8 16 32 64}"
 PREFILL_TTFT_LIMIT_S="${PREFILL_TTFT_LIMIT_S:-120}"

@@ -50,7 +50,7 @@ vllm bench serve \
   --dataset-name random \
   --random-input-len ${ISL} \
   --random-output-len ${OSL} \
-  --random-range-ratio ${RANGE_RATIO}   # default 0.1, i.e. ±10% length
+  --random-range-ratio ${RANGE_RATIO}   # default 0, i.e. exact ISL
   --num-prompts ${P} \
   --max-concurrency ${C} \
   --ignore-eos                          # force exact OSL

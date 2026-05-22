@@ -189,9 +189,9 @@ def _build_config(args: argparse.Namespace):
 
     neuron_config = NeuronConfig(
         tp_degree=args.tp_degree,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
+        batch_size=args.batch_size,
+        ctx_batch_size=args.batch_size,
+        tkg_batch_size=args.batch_size,
         seq_len=args.seq_len,
         max_context_length=max_ctx,
         max_length=args.seq_len,
@@ -245,6 +245,18 @@ def main() -> int:
     )
     parser.add_argument("--tp-degree", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Compiled (max) batch size. Sets batch_size, ctx_batch_size, and "
+            "tkg_batch_size to the same value because Qwen3.6's "
+            "perform_qwen_chunked_prefill assumes ctx and tkg share the same "
+            "batch dim (it indexes the full kv-cache during prefill). The "
+            "vLLM server must be started with --max-num-seqs <= this value."
+        ),
+    )
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")

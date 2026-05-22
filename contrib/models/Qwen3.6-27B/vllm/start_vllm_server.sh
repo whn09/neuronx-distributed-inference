@@ -77,7 +77,7 @@ max_ctx = max(cte_buckets)
 neuron_config = {
     "tp_degree": int("${TP_DEGREE}"),
     "batch_size": int("${MAX_NUM_SEQS}"),
-    "ctx_batch_size": 1,
+    "ctx_batch_size": int("${MAX_NUM_SEQS}"),
     "tkg_batch_size": int("${MAX_NUM_SEQS}"),
     "seq_len": int("${SEQ_LEN}"),
     "max_length": int("${SEQ_LEN}"),

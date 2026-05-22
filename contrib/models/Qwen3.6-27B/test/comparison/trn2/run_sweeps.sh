@@ -10,10 +10,21 @@
 #   OUTDIR            Directory for raw JSON + log output.
 #
 # Optional env vars:
-#   HOST=127.0.0.1 PORT=8000 RANGE_RATIO=0.1
-#   PREFILL_ISLS="8192 16384 32768 65536 131072 262143"
+#   HOST=127.0.0.1 PORT=8000 RANGE_RATIO=0
+#   PREFILL_ISLS="8191 16383 32767 65535 131071 262143"
 #   DECODE_CONC="1 2 4 8 16 32 64"
 #   PREFILL_TTFT_LIMIT_S=120  DECODE_TTFT_LIMIT_S=10
+#
+# RANGE_RATIO defaults to 0 (exact ISL); set to >0 only if your largest
+# compiled CTE bucket comfortably covers ISL*(1+RANGE_RATIO) — otherwise
+# prompts will overshoot the largest bucket and prefill will fail.
+#
+# PREFILL_ISLS notes: NxDI's first_fit bucket selection uses strict less-than
+# (`required_len < bucket`) — see neuronx_distributed_inference/models/
+# model_wrapper.py:_get_seq_bucket. So ISL exactly equal to a compiled bucket
+# boundary falls through to the next-larger bucket. We default to `bucket - 1`
+# so each ISL actually exercises the bucket of the same name. The largest
+# value (262143) follows the same pattern, matching the upstream default.
 #
 # Auto-stop conditions match the GPU harness:
 #   * prefill stops when median TTFT > PREFILL_TTFT_LIMIT_S;
@@ -26,8 +37,8 @@ set -uo pipefail
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
-RANGE_RATIO="${RANGE_RATIO:-0.1}"
-PREFILL_ISLS="${PREFILL_ISLS:-8192 16384 32768 65536 131072 262143}"
+RANGE_RATIO="${RANGE_RATIO:-0}"
+PREFILL_ISLS="${PREFILL_ISLS:-8191 16383 32767 65535 131071 262143}"
 DECODE_CONC="${DECODE_CONC:-1 2 4 8 16 32 64}"
 PREFILL_TTFT_LIMIT_S="${PREFILL_TTFT_LIMIT_S:-120}"
 DECODE_TTFT_LIMIT_S="${DECODE_TTFT_LIMIT_S:-10}"
