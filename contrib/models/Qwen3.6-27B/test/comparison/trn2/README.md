@@ -89,3 +89,35 @@ recompile with different bucket boundaries, update `PREFILL_ISLS` accordingly
 
 The output JSON files share the exact same schema as the GPU side, so cross-
 side plotting is a simple `pandas.read_json` on both directories.
+
+## 4. Unattended driver (`drive_b1.sh`)
+
+For overnight reproductions there is an end-to-end driver that compiles,
+launches the server, waits for `/v1/models`, runs the sweep, then stops the
+server. It uses two helpers in this directory: `run_compile_b1.sh` and
+`start_vllm_b1.sh`.
+
+```bash
+PRECISION=fp8 \
+REPO=/opt/dlami/nvme/qwen36_test/repo \
+COMPILER_VENV=/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference \
+SERVER_VENV=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16 \
+MODEL_PATH=/opt/dlami/nvme/qwen36_test/models/Qwen3.6-27B \
+COMPILED_PATH=/opt/dlami/nvme/qwen36_test/artifacts/fp8_multi_8k_b1 \
+QUANTIZED_CKPT_PATH=/opt/dlami/nvme/qwen36_test/quantized/Qwen3.6-27B-fp8-mlp \
+PORT=8101 \
+OUTDIR=/opt/dlami/nvme/qwen36_test/sweeps/trn2_fp8_b1 \
+nohup ./drive_b1.sh > /opt/dlami/nvme/qwen36_test/drive_fp8_b1.log 2>&1 &
+```
+
+Set `PRECISION=bf16` and drop `QUANTIZED_CKPT_PATH` to drive the BF16 path on
+a different port (e.g. 8100), so both can run sequentially without colliding.
+
+### `PRECISION=fp8` is **MLP weight-only**
+
+`qwen36_27b_compile_fp8.py` only quantizes the MLP `gate_proj/up_proj/
+down_proj` weights to FP8 (e4m3, per-channel). Attention QKV/O, DeltaNet,
+embeddings, lm_head, KV cache, and activations all stay BF16, and
+`quantized_mlp_kernel_enabled=False` means the FP8 weights are dequantized to
+BF16 at compute time. Treat FP8 numbers as a memory-footprint experiment, not
+a compute-throughput speedup.
