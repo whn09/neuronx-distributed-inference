@@ -76,8 +76,6 @@ from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask,
     _make_lower_mask_diag,
     _make_identity,
-    _make_blkdiag_mask,
-    _make_row_masks,
 )
 
 from neuronx_distributed_inference.models.config import (
@@ -578,7 +576,7 @@ class NeuronGatedDeltaNet(nn.Module):
         return output, last_recurrent_state
 
     def _fused_chunked_forward(
-        self, query, key, value, g, beta, output_final_state=False
+        self, query, key, value, g, beta, output_final_state=False, initial_state=None
     ):
         """Fused single-kernel chunked forward for CTE — SSD-style.
 
@@ -591,6 +589,10 @@ class NeuronGatedDeltaNet(nn.Module):
           2. State in SBUF across all chunks (biggest perf win)
           3. In-kernel cumsum (avoids PyTorch cumsum overhead)
           4. tensor_scalar for broadcasts (no explicit loops)
+
+        ``initial_state`` lets the hybrid-cache prefill path resume from a
+        prior recurrent state. Pass None for fresh prefill (the kernel still
+        receives a zero tensor — see below).
         """
         chunk_size = 128
 
@@ -634,14 +636,18 @@ class NeuronGatedDeltaNet(nn.Module):
         lower_mask_diag = torch.tensor(
             _make_lower_mask_diag(), dtype=torch.float32, device=device
         )
-        # v17: batched 8-block forward-substitution Neumann needs the
-        # block-diagonal mask + per-block row masks.
-        blkdiag_mask = torch.tensor(
-            _make_blkdiag_mask(), dtype=torch.float32, device=device
-        )
-        row_masks = torch.tensor(
-            _make_row_masks(), dtype=torch.float32, device=device
-        )
+
+        # Per-(B,H) initial recurrent state. The kernel always reads from
+        # HBM, so flatten the input cache (or a fresh zero tensor) to
+        # (BH, k_dim, v_dim).
+        if initial_state is None:
+            initial_state_flat = torch.zeros(
+                BH, k_dim, v_dim, dtype=torch.float32, device=device
+            )
+        else:
+            initial_state_flat = (
+                initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+            )
 
         all_outputs = []
         all_states = []
@@ -655,8 +661,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 lower_mask,  # (128, 128)
                 identity_mat,  # (128, 128)
                 lower_mask_diag,  # (128, 128)
-                row_masks,  # (8, 128, 1)
-                blkdiag_mask,  # (128, 128)
+                initial_state_flat[bh],  # (128, 128)
             )
             all_outputs.append(out_bh)
             all_states.append(state_bh)
@@ -1082,15 +1087,31 @@ class NeuronGatedDeltaNet(nn.Module):
                     )
                     initial_state = initial_state * (1.0 - reset_mask[:, :, None, None])
                 if self.use_qwen_hybrid_chunked_prefill_nki:
-                    output, final_state = self._nki_chunked_forward(
-                        query,
-                        key,
-                        value,
-                        g,
-                        beta,
-                        output_final_state=True,
-                        initial_state=initial_state,
+                    # Set DELTANET_HYBRID_CHUNKED_PER_CHUNK=1 to fall back to
+                    # the legacy per-chunk kernel (B*H*num_chunks launches).
+                    use_per_chunk_legacy = (
+                        os.environ.get("DELTANET_HYBRID_CHUNKED_PER_CHUNK") == "1"
                     )
+                    if use_per_chunk_legacy:
+                        output, final_state = self._nki_chunked_forward(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            output_final_state=True,
+                            initial_state=initial_state,
+                        )
+                    else:
+                        output, final_state = self._fused_chunked_forward(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            output_final_state=True,
+                            initial_state=initial_state,
+                        )
                 else:
                     output, final_state = self._chunk_forward(
                         query,
