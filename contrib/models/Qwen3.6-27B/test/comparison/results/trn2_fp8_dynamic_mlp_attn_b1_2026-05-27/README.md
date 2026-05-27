@@ -60,34 +60,41 @@ layers in this 64-layer config.
 | Decode TPOT (ms)                |           27.47 |                27.33 |   −0.5% |
 | Decode OTPS (tok/s)             |           32.37 |                32.51 |   +0.4% |
 
-Compared to the original weight-only FP8 baseline (`../trn2_fp8_b1_2026-05-26/`):
+Compared to the BF16 baseline (`../trn2_bf16_b1_2026-05-26/`) and the
+weight-only FP8 baseline (`../trn2_fp8_b1_2026-05-26/`):
 
-| Test                            |       weight-only |   dynamic-MLP+attn |   delta vs WO |
-|---------------------------------|------------------:|-------------------:|--------------:|
-| Prefill ISL=1023 TTFT (ms)      |            1835.3 |             1804.6 |         −1.7% |
-| Prefill ISL=2047 TTFT (ms)      |            3605.5 |             3555.1 |         −1.4% |
-| Prefill ISL=4095 TTFT (ms)      |            7166.4 |             7091.7 |         −1.0% |
-| Prefill ISL=8191 TTFT (ms)      |           14388.9 |            14299.4 |         −0.6% |
-| Decode TPOT (ms)                |             30.55 |              27.33 |        −10.5% |
-| Decode OTPS (tok/s)             |             29.39 |              32.51 |        +10.6% |
+| Test                            |  BF16 | weight-only FP8 | dynamic-MLP FP8 | dynamic-MLP+attn FP8 |
+|---------------------------------|------:|----------------:|----------------:|---------------------:|
+| Prefill ISL=1023 TTFT (ms)      |  1900 |          1835.3 |          1849.1 |               1804.6 |
+| Prefill ISL=8191 TTFT (ms)      | 14473 |         14388.9 |         14287.1 |              14299.4 |
+| Decode TPOT (ms)                | 33.01 |           30.55 |           27.47 |                27.33 |
+| Decode OTPS (tok/s)             | 27.39 |           29.39 |           32.37 |                32.51 |
 
 Reading honestly:
 
-- Most of the decode TPOT win was already realized by T1 (FP8-MLP); extending
-  FP8 to standard self-attention QKV/O on top is a wash at b=1 (−0.5%). At
-  this batch size, decode time per token is dominated by *DeltaNet* state
-  updates and KV-cache reads on the `linear_attention` layers — both still
-  BF16 — so converting the standard QKV/O on the 17 `full_attention` layers
-  does not move the needle.
-- Prefill is unchanged (within ±0.5%). The standard self-attention compute
-  *is* on the prefill critical path, but the wall-clock here is dominated by
-  the chunked DeltaNet prefill + RoPE + softmax that stay BF16, so swapping
-  4 of the 64-layer-wide projections for FP8 is invisible at these ISLs.
+- **vs T1 (dynamic-MLP):** wash at b=1 (decode TPOT −0.5%, prefill within
+  ±0.5%). At this batch size decode per-token is dominated by *DeltaNet*
+  state updates and KV-cache reads on the `linear_attention` layers —
+  still BF16 — so converting QKV/O on the 17 `full_attention` layers does
+  not move the wall clock.
+- **vs BF16:** decode keeps the ~18% throughput win that T1 already
+  unlocked (TPOT 33.0 → 27.3 ms, OTPS 27.4 → 32.5 tok/s). Prefill stays
+  noise-level vs BF16 because the chunked DeltaNet prefill + RoPE +
+  softmax dominate and remain BF16 in all FP8 tiers here.
 
-The outcome confirms the expected ordering — the highest-leverage scope for
-FP8 on Qwen3.6 at b=1 is the MLP path. T2 is a clean architectural win (no
-quality regression, no extra runtime overhead) but does not unlock further
-throughput beyond T1 in this configuration.
+**Where T2 still earns its keep: HBM.** Quantizing the 17 full_attention
+QKV/O projections to FP8 saves ~1.4 GB of weight memory on top of T1
+(17 layers × ~84 MB/layer at hidden=5120, q_proj 6144 + k_proj/v_proj/o_proj
+shapes, BF16→FP8 halves the per-tensor footprint). At b=1 this does not
+translate to throughput because we're not KV-cache-pressured, but it does
+free that headroom for larger batch / longer context configurations where
+the bottleneck shifts onto the standard-attention path.
+
+The outcome confirms the expected ordering for *throughput* at b=1 — the
+highest-leverage scope for FP8 on Qwen3.6 is the MLP path. T2 is a clean
+architectural extension (correctness gate passes, no extra runtime
+overhead) and a memory-footprint win; it just does not unlock further
+throughput in this single-batch configuration.
 
 ## Trade-off vs T1
 
