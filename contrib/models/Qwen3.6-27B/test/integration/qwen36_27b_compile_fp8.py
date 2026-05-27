@@ -86,7 +86,15 @@ def _modules_to_not_convert(num_layers: int, tier: str) -> list[str]:
                     f"{prefix}.{layer_idx}.post_attention_layernorm",
                 ]
             )
-            if tier != "dynamic_mlp_attn":
+            if tier == "dynamic_mlp_attn":
+                # Self-attention QKV/O become FP8, but output_gate_proj
+                # stays BF16: the doubled q_proj is pre-split before quant
+                # in this script, so the pre-quantized checkpoint carries
+                # output_gate_proj as BF16 with no weight_scale tensor; the
+                # runtime quant pass would otherwise replace this Linear and
+                # then fail to find a matching scale at load time.
+                modules.append(f"{prefix}.{layer_idx}.self_attn.output_gate_proj")
+            else:
                 modules.append(f"{prefix}.{layer_idx}.self_attn")
     return modules
 
@@ -124,6 +132,16 @@ def _is_self_attn_qkvo_weight(name: str) -> bool:
     )
 
 
+def _is_self_attn_q_proj_weight(name: str) -> bool:
+    parts = name.split(".")
+    return (
+        len(parts) >= 4
+        and parts[-3] == "self_attn"
+        and parts[-2] == "q_proj"
+        and parts[-1] == "weight"
+    )
+
+
 def _should_quantize_weight(name: str, tier: str) -> bool:
     if tier == "dynamic_mlp_attn":
         return _is_mlp_weight(name) or _is_self_attn_qkvo_weight(name)
@@ -134,6 +152,29 @@ def _scale_name(weight_name: str) -> str:
     return weight_name[: -len(".weight")] + ".weight_scale"
 
 
+def _output_gate_proj_name(q_proj_name: str) -> str:
+    return q_proj_name.rsplit(".", 2)[0] + ".output_gate_proj.weight"
+
+
+def _split_doubled_q_proj(
+    q_proj_w: torch.Tensor, num_heads: int, head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split HF Qwen3.6 doubled q_proj into (query, gate).
+
+    HF tensor shape: ``(num_heads * head_dim * 2, hidden)`` with the
+    interleaved layout ``[head0_query, head0_gate, head1_query, ...]``.
+    Returns two ``(num_heads * head_dim, hidden)`` tensors. Mirrors the
+    runtime split in ``modeling_qwen35.convert_qwen35_hf_to_neuron_state_dict``
+    so doing it pre-quantize keeps the FP8 weight scale aligned with the
+    final ``q_proj.weight`` shape.
+    """
+    hidden = q_proj_w.shape[1]
+    reshaped = q_proj_w.reshape(num_heads, head_dim * 2, hidden)
+    query_w = reshaped[:, :head_dim, :].reshape(num_heads * head_dim, hidden)
+    gate_w = reshaped[:, head_dim:, :].reshape(num_heads * head_dim, hidden)
+    return query_w.contiguous(), gate_w.contiguous()
+
+
 def _clear_quantized_checkpoint_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     for child in path.iterdir():
@@ -142,7 +183,11 @@ def _clear_quantized_checkpoint_dir(path: Path) -> None:
 
 
 def _save_fp8_state_dict(
-    model_path: Path, output_path: Path, tier: str = "weight_only_mlp"
+    model_path: Path,
+    output_path: Path,
+    tier: str = "weight_only_mlp",
+    num_attention_heads: int | None = None,
+    head_dim: int | None = None,
 ) -> None:
     """Create a sharded FP8 checkpoint directly from HF safetensors.
 
@@ -151,11 +196,28 @@ def _save_fp8_state_dict(
     execution: the checkpoint transform is a direct tensor rewrite. ``tier``
     controls which weights are converted to FP8; everything else is copied
     through unchanged.
+
+    For ``dynamic_mlp_attn`` we also pre-split the doubled
+    ``self_attn.q_proj.weight`` into the standard query half plus
+    ``output_gate_proj.weight`` BEFORE quantization. Doing the split first
+    keeps the FP8 weight scale aligned with the final ``q_proj`` shape that
+    NxDI sees at load time. ``output_gate_proj`` stays BF16: the runtime
+    converter in ``modeling_qwen35`` already plumbs it as a non-quantized
+    ColumnParallelLinear, and dynamic activation FP8 only buys us the
+    standard QKV/O projections.
     """
     from safetensors.torch import load_file, save_file  # noqa: WPS433
     from neuronx_distributed.quantization.quantization_utils import (  # noqa: WPS433
         quantize_fp8_per_channel,
     )
+
+    pre_split_q_proj = tier == "dynamic_mlp_attn"
+    if pre_split_q_proj:
+        if num_attention_heads is None or head_dim is None:
+            raise ValueError(
+                "dynamic_mlp_attn tier requires num_attention_heads and head_dim "
+                "for q_proj pre-split"
+            )
 
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
@@ -173,23 +235,38 @@ def _save_fp8_state_dict(
     output_weight_map: dict[str, str] = {}
     total_size = 0
     quantized_count = 0
+    q_proj_split_count = 0
+
+    def _quantize(name: str, tensor: torch.Tensor) -> None:
+        nonlocal total_size, quantized_count
+        weight, scale = quantize_fp8_per_channel(
+            tensor,
+            torch.float8_e4m3fn,
+            channel_axis=0,
+        )
+        output_shard[name] = weight
+        output_shard[_scale_name(name)] = scale
+        output_weight_map[_scale_name(name)] = filename
+        total_size += weight.numel() * weight.element_size()
+        total_size += scale.numel() * scale.element_size()
+        quantized_count += 1
 
     for filename in filenames:
         shard = load_file(str(model_path / filename))
         output_shard = {}
         for name, tensor in shard.items():
-            if _should_quantize_weight(name, tier):
-                weight, scale = quantize_fp8_per_channel(
-                    tensor,
-                    torch.float8_e4m3fn,
-                    channel_axis=0,
+            if pre_split_q_proj and _is_self_attn_q_proj_weight(name):
+                query_w, gate_w = _split_doubled_q_proj(
+                    tensor, num_attention_heads, head_dim
                 )
-                output_shard[name] = weight
-                output_shard[_scale_name(name)] = scale
-                output_weight_map[_scale_name(name)] = filename
-                total_size += weight.numel() * weight.element_size()
-                total_size += scale.numel() * scale.element_size()
-                quantized_count += 1
+                _quantize(name, query_w)
+                gate_name = _output_gate_proj_name(name)
+                output_shard[gate_name] = gate_w
+                output_weight_map[gate_name] = filename
+                total_size += gate_w.numel() * gate_w.element_size()
+                q_proj_split_count += 1
+            elif _should_quantize_weight(name, tier):
+                _quantize(name, tensor)
             else:
                 output_shard[name] = tensor
                 total_size += tensor.numel() * tensor.element_size()
@@ -213,7 +290,8 @@ def _save_fp8_state_dict(
             )
 
     print(
-        f"MANUAL_FP8_QUANT_COUNT tier={tier} count={quantized_count}",
+        f"MANUAL_FP8_QUANT_COUNT tier={tier} count={quantized_count} "
+        f"q_proj_split={q_proj_split_count}",
         flush=True,
     )
 
@@ -318,7 +396,7 @@ def _build_config(args: argparse.Namespace):
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
-    return inf_config, modules_to_not_convert
+    return inf_config, modules_to_not_convert, config_dict
 
 
 def main() -> int:
@@ -382,7 +460,7 @@ def main() -> int:
         _patch_scale_dequantize_for_3d_activations()
         print("PATCH_SCALE_DEQUANTIZE_APPLIED", flush=True)
 
-    inf_config, modules_to_not_convert = _build_config(args)
+    inf_config, modules_to_not_convert, config_dict = _build_config(args)
 
     print(f"FP8_TIER {args.quantization_tier}", flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
@@ -405,7 +483,19 @@ def main() -> int:
 
     if args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
         print(f"QUANTIZE_START tier={args.quantization_tier}", flush=True)
-        _save_fp8_state_dict(model_path, quantized_path, tier=args.quantization_tier)
+        num_attention_heads = int(config_dict["num_attention_heads"])
+        head_dim = int(
+            config_dict.get(
+                "head_dim", config_dict["hidden_size"] // num_attention_heads
+            )
+        )
+        _save_fp8_state_dict(
+            model_path,
+            quantized_path,
+            tier=args.quantization_tier,
+            num_attention_heads=num_attention_heads,
+            head_dim=head_dim,
+        )
         print("QUANTIZE_DONE", flush=True)
     else:
         print("QUANTIZE_SKIP existing checkpoint found", flush=True)

@@ -276,6 +276,47 @@ class TestQProjSplit(unittest.TestCase):
             )
 
 
+class TestQProjSplitIdempotent(unittest.TestCase):
+    """When a checkpoint already supplies ``output_gate_proj.weight`` (e.g. the
+    FP8 ``dynamic_mlp_attn`` compile path pre-splits q_proj before quantizing
+    so the FP8 weight scale matches the final ``q_proj`` shape), the converter
+    must NOT re-run the split. Otherwise the already-(query-only) tensor would
+    be sliced again and the gate would be discarded."""
+
+    def test_pre_split_q_proj_passes_through(self):
+        config = _make_mini_config(fused_qkv=False)
+        sd = _make_mini_state_dict(config)
+
+        for l in range(config.num_hidden_layers):
+            if config.layer_types[l] != "full_attention":
+                continue
+            q_key = f"layers.{l}.self_attn.q_proj.weight"
+            gate_key = f"layers.{l}.self_attn.output_gate_proj.weight"
+            num_heads = config.num_attention_heads
+            head_dim = config.head_dim
+            H = config.hidden_size
+            sentinel_q = torch.full(
+                (num_heads * head_dim, H), 7.0, dtype=torch.bfloat16
+            )
+            sentinel_gate = torch.full(
+                (num_heads * head_dim, H), 9.0, dtype=torch.bfloat16
+            )
+            sd[q_key] = sentinel_q.clone()
+            sd[gate_key] = sentinel_gate.clone()
+
+        result = convert_qwen35_hf_to_neuron_state_dict(sd, config)
+        for l in range(config.num_hidden_layers):
+            if config.layer_types[l] != "full_attention":
+                continue
+            q_key = f"layers.{l}.self_attn.q_proj.weight"
+            gate_key = f"layers.{l}.self_attn.output_gate_proj.weight"
+            if config.neuron_config.fused_qkv:
+                self.assertNotIn(q_key, result)
+            else:
+                self.assertTrue(torch.all(result[q_key] == 7.0))
+            self.assertTrue(torch.all(result[gate_key] == 9.0))
+
+
 class TestQKNormRename(unittest.TestCase):
     """Test q_norm -> q_layernorm and k_norm -> k_layernorm renaming."""
 

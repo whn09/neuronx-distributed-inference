@@ -2674,11 +2674,19 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
 
             # q_proj is doubled: (12288, 5120) = (num_heads * head_dim * 2, hidden)
             # INTERLEAVED: [head0_query(256) | head0_gate(256) | head1_query(256) | ...]
+            #
+            # Skip the split when the upstream checkpoint already supplies
+            # ``output_gate_proj.weight``. The FP8 ``dynamic_mlp_attn`` compile
+            # path pre-splits q_proj before quantizing so the FP8 weight scale
+            # matches the final ``q_proj`` shape; in that case ``q_proj`` is
+            # already the (query-only) half and re-running the split would
+            # truncate it further and lose the gate.
             q_proj_key = f"layers.{l}.self_attn.q_proj.weight"
-            if q_proj_key in neuron_state_dict:
+            gate_key = f"layers.{l}.self_attn.output_gate_proj.weight"
+            num_heads = config.num_attention_heads  # 24
+            head_dim = config.head_dim  # 256
+            if q_proj_key in neuron_state_dict and gate_key not in neuron_state_dict:
                 q_proj_w = neuron_state_dict.pop(q_proj_key)
-                num_heads = config.num_attention_heads  # 24
-                head_dim = config.head_dim  # 256
                 q_proj_w = q_proj_w.reshape(num_heads, head_dim * 2, config.hidden_size)
                 query_w = q_proj_w[:, :head_dim, :]  # (24, 256, 5120)
                 gate_w = q_proj_w[:, head_dim:, :]  # (24, 256, 5120)
@@ -2690,9 +2698,7 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                 )  # (6144, 5120)
 
                 neuron_state_dict[q_proj_key] = query_w
-                neuron_state_dict[f"layers.{l}.self_attn.output_gate_proj.weight"] = (
-                    gate_w
-                )
+                neuron_state_dict[gate_key] = gate_w
 
             # Fuse QKV
             if config.neuron_config.fused_qkv:
