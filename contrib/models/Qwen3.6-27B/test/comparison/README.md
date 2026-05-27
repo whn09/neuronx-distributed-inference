@@ -34,26 +34,36 @@ A100 has no native FP8 tensor cores, so its FP8 path is Marlin weight-only —
 not a fair comparison against Trn2's native FP8. The honest cross-platform
 comparison is BF16 vs BF16:
 
-| Platform                                   | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) |
-|--------------------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|
-| A100 (P4DE, TP=1, BF16)                    |                   500 |                  1974 |            35.14 |                28.3 |
-| Trn2 (trn2.3xlarge, TP=4, BF16, fused)     |                   479 |                  3046 |            33.01 |                27.4 |
-| **Trn2 / A100 ratio**                      |                **0.96x** |                **1.54x** |        **0.94x** |             **0.97x** |
+| Platform                                       | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) |
+|------------------------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|
+| A100 (P4DE, TP=1, BF16)                        |                   500 |                  1974 |            35.14 |                28.3 |
+| Trn2 (trn2.3xlarge, TP=4, BF16, decay-refactor)|                   466 |                  2938 |            33.01 |                27.4 |
+| **Trn2 / A100 ratio**                          |                **0.93x** |                **1.49x** |        **0.94x** |             **0.97x** |
 
-Trn2 numbers are the fused-hybrid prefill path (commit `3dff2a7`,
-`results/trn2_bf16_b1_fusedhybrid_2026-05-27/`). The earlier shipped
-chunked-NKI prefill path (`results/trn2_bf16_b1_2026-05-26/`) clocked
-1900 ms / 14473 ms at the same two ISLs — see the next section for
-the full sweep and why this changed.
+Trn2 numbers are the decay-refactor prefill path
+(`results/trn2_bf16_b1_decayrefactor_2026-05-27/`), which precomputes a
+shared lower-triangular decay matrix once per chunk in the fused
+DeltaNet NKI kernel and reuses it for both the Neumann correction and
+the `attn_intra` path. This drops `nc_transpose` count per chunk from
+25 to 15 and gives ~3% TTFT savings on top of the fused-hybrid path.
+
+Earlier baselines kept for reference:
+
+- `results/trn2_bf16_b1_fusedhybrid_2026-05-27/` — fused-hybrid prefill
+  (commit `3dff2a7`): 479 ms / 3046 ms at the two ISLs above
+- `results/trn2_bf16_b1_2026-05-26/` — shipped chunked-NKI baseline:
+  1900 ms / 14473 ms at the same two ISLs
+
+See the next section for the full sweep and why these changed.
 
 **Reading the comparison:**
 
 - **Decode is at parity** (Trn2 33.0 ms vs A100 35.1 ms TPOT, ~3% gap
   either way). Both are weight-bandwidth bound at b=1.
-- **Prefill at 1K is at parity** (Trn2 479 vs A100 500 ms). At 8K
-  Trn2 is ~1.5x slower, and the gap is from Trn2's near-linear
-  per-chunk scan vs A100's sublinear vLLM prefill — not from launch
-  overhead anymore.
+- **Prefill at 1K is faster on Trn2** (Trn2 466 vs A100 500 ms, 1.07x).
+  At 8K Trn2 is ~1.49x slower, and the remaining gap is from Trn2's
+  near-linear per-chunk DeltaNet scan vs A100's sublinear vLLM prefill
+  — not from launch overhead or transpose count anymore.
 
 #### Why the BF16 numbers changed vs the earlier sweep
 
@@ -78,18 +88,27 @@ kernel (8-block forward-substitution Neumann, tuned for Qwen3.5-2B).
 On Qwen3.6 dimensions v17 came in at 639 ms vs 443 ms for the original
 6-round Neumann fused kernel, so v17 was reverted in `3dff2a7`.
 
-#### Trn2 BF16 prefill: shipped vs fused-hybrid
+#### Trn2 BF16 prefill: shipped → fused-hybrid → decay-refactor
 
-| ISL  | Shipped chunked-NKI (ms) | Fused-hybrid (ms) | Speedup |
-|-----:|-------------------------:|------------------:|--------:|
-| 1023 |                     1900 |               479 |  3.97x  |
-| 2047 |                     3616 |               764 |  4.74x  |
-| 4095 |                     7132 |              1431 |  4.98x  |
-| 8191 |                    14473 |              3046 |  4.75x  |
+| ISL  | Shipped chunked-NKI (ms) | Fused-hybrid (ms) | Decay-refactor (ms) | Speedup vs shipped |
+|-----:|-------------------------:|------------------:|--------------------:|-------------------:|
+| 1023 |                     1900 |               479 |              465.64 |  4.08x             |
+| 2047 |                     3616 |               764 |              740.62 |  4.88x             |
+| 4095 |                     7132 |              1431 |             1382.23 |  5.16x             |
+| 8191 |                    14473 |              3046 |             2938.34 |  4.92x             |
 
-- `results/trn2_bf16_b1_fusedhybrid_2026-05-27/` (default code path)
-- `results/trn2_bf16_b1_2026-05-26/` (earlier shipped path, kept for
-  reference)
+The `Decay-refactor` column is the current default code path. On top of
+the fused-hybrid kernel, it precomputes a single shared
+lower-triangular decay matrix per chunk and reuses it for both the
+Neumann correction (`A`) and `attn_intra` paths. This drops
+`nc_transpose` count per chunk from 25 to 15 and gives ~3% TTFT savings
+across all ISLs.
+
+- `results/trn2_bf16_b1_decayrefactor_2026-05-27/` (default code path)
+- `results/trn2_bf16_b1_fusedhybrid_2026-05-27/` (previous default,
+  kept for reference)
+- `results/trn2_bf16_b1_2026-05-26/` (shipped chunked-NKI baseline,
+  kept for reference)
 - `results/p4de_bf16_b1_2026-05-26/`
 
 ### Trn2 FP8 sweep (Trn2-internal, b=1)

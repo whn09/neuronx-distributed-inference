@@ -313,60 +313,61 @@ def deltanet_fused_chunked_fwd(
         nisa.tensor_copy(dst=QK, src=QK_psum)
 
         # ============================================================
-        # Decay mask: QK_decay[i,j] = QK[i,j] * exp(gc[i]) * exp(-gc[j])
+        # Precompute decay factor (shared by QK_decay AND qk_decay paths):
+        #   decay_factor[i,j] = exp(gc[i]) * exp(-gc[j])
+        # Apply Lmask first to avoid scaling upper-triangle (which can be
+        # numerically large after exp/multiply and poison downstream matmuls).
         #
-        # Apply the strict causal mask before the split exp(gc) / exp(-gc)
-        # scaling. Upper-triangular entries are mathematically unused, but
-        # scaling them first can create very large finite values that poison
-        # later matmuls before the mask is applied.
+        #   tmp        = Lmask * exp_gc_p          (row-scale, mask before split)
+        #   tmp_T      = transpose(tmp)
+        #   tmp_T_col  = tmp_T * exp_neg_gc_p      (col-scale via row-broadcast on T)
+        #   decay_lo   = transpose(tmp_T_col)      (= Lmask[i,j] * exp(gc[i]) * exp(-gc[j]))
+        # decay_lo[i,j] is zero in the upper triangle by construction.
         # ============================================================
-        QK_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=QK_masked, data1=QK, data2=Lmask, op=nl.multiply)
-
-        # Row scaling: QK_row[i,:] = QK[i,:] * exp(gc[i])
-        # Then transpose, column scale, transpose back.
-        # Uses tensor_scalar with (P_MAX,1) operand for row scaling.
-        QK_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        decay_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
-            dst=QK_row,
-            data=QK_masked,
+            dst=decay_row,
+            data=Lmask,
             op0=nl.multiply,
             operand0=exp_gc_p,
             engine=nisa.vector_engine,
         )
 
-        # Transpose to scale columns (now rows in transposed view)
-        QK_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=QK_r_T_psum, data=QK_row)
-        QK_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=QK_r_T, src=QK_r_T_psum)
+        decay_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=decay_T_psum, data=decay_row)
+        decay_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=decay_T, src=decay_T_psum)
 
-        QK_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        decay_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
-            dst=QK_r_T_col,
-            data=QK_r_T,
+            dst=decay_T_col,
+            data=decay_T,
             op0=nl.multiply,
             operand0=exp_neg_gc_p,
             engine=nisa.vector_engine,
         )
 
-        # Transpose back
-        QK_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=QK_d_psum, data=QK_r_T_col)
-        QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=QK_decay, src=QK_d_psum)
+        decay_lo_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=decay_lo_psum, data=decay_T_col)
+        decay_lo = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=decay_lo, src=decay_lo_psum)
 
-        # A = -QK_decay * lower_mask
-        neg_QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        # decay_lo_d = decay_lo + I  (diagonal is exp(gc[i])*exp(-gc[i]) = 1)
+        # This is the lower-triangular-with-diag decay used by attn_intra.
+        decay_lo_d = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=decay_lo_d, data1=decay_lo, data2=eye, op=nl.add)
+
+        # A = -(QK * decay_lo)   (Lmask already folded into decay_lo)
+        QK_dec = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=QK_dec, data1=QK, data2=decay_lo, op=nl.multiply)
+        A_mat = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
-            dst=neg_QK_decay,
-            data=QK_decay,
+            dst=A_mat,
+            data=QK_dec,
             op0=nl.multiply,
             operand0=-1.0,
             engine=nisa.vector_engine,
         )
-        A_mat = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=A_mat, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
 
         # ============================================================
         # Neumann power-doubling: N = (I+A)(I+A^2)...(I+A^{64})
@@ -445,45 +446,12 @@ def deltanet_fused_chunked_fwd(
         qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=qk_raw, src=qk_psum)
 
-        # Mask before split scaling for the same reason as the A matrix above:
-        # upper-triangular decay factors are unused and can be numerically huge.
-        qk_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=qk_masked, data1=qk_raw, data2=Lmask_d, op=nl.multiply)
-
-        # Row-scale by exp(gc)
-        qk_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=qk_row,
-            data=qk_masked,
-            op0=nl.multiply,
-            operand0=exp_gc_p,
-            engine=nisa.vector_engine,
-        )
-
-        # Transpose, column-scale by exp(-gc), transpose back
-        qk_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=qk_r_T_psum, data=qk_row)
-        qk_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=qk_r_T, src=qk_r_T_psum)
-
-        qk_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=qk_r_T_col,
-            data=qk_r_T,
-            op0=nl.multiply,
-            operand0=exp_neg_gc_p,
-            engine=nisa.vector_engine,
-        )
-
-        qk_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=qk_d_psum, data=qk_r_T_col)
-        qk_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=qk_decay, src=qk_d_psum)
-
+        # attn_intra = qk_raw * decay_lo_d
+        #   = (q @ k^T) * exp(gc[i]) * exp(-gc[j]) * lower_mask_diag[i,j]
+        # decay_lo_d already folds the lower-with-diag mask, replacing the
+        # earlier double-transpose split scaling.
         attn_intra = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=attn_intra, data1=qk_decay, data2=Lmask_d, op=nl.multiply
-        )
+        nisa.tensor_tensor(dst=attn_intra, data1=qk_raw, data2=decay_lo_d, op=nl.multiply)
 
         # ============================================================
         # v_prime = k_cumdecay @ state   (state is in SBUF!)
