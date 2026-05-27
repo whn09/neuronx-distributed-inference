@@ -46,16 +46,49 @@ comparison is BF16 vs BF16:
   either way). Both are weight-bandwidth bound at b=1, and both are within
   the same ballpark on memory bandwidth per active weight.
 - **Prefill is much slower on Trn2**, and the gap *widens with ISL* (3.8x
-  at 1K → 7.3x at 8K). The cause is the chunked-prefill design used here:
-  Qwen3.6 prefill walks the full ISL through the model in 512-token CTE
-  chunks, so prefill scales ~linearly in ISL on Trn2 (1900 → 14473 ms is
-  a 7.6x increase for 8x more tokens). A100 with vLLM amortizes fixed
-  per-prefill cost much better and stays sublinear at these context
-  lengths (500 → 1974 ms is 3.9x for 8x tokens).
-- This is the largest known optimization opportunity for Qwen3.6 on
-  Trn2 and is *not* addressable by FP8 (the chunked DeltaNet prefill
-  path remains BF16 across all FP8 tiers below). Reducing prefill TTFT
-  needs work on the chunked-prefill kernel / scheduling itself.
+  at 1K → 7.3x at 8K). Trn2 prefill scales ~linearly in ISL
+  (1900 → 14473 ms is a 7.6x increase for 8x more tokens), while A100
+  with vLLM stays sublinear at these context lengths (500 → 1974 ms is
+  3.9x for 8x tokens).
+
+#### Why the prefill gap is much larger here than on Qwen2 / Qwen3
+
+This is the first model in the Qwen family where we see this pattern,
+and it is driven by the new **Gated DeltaNet** (linear recurrent
+attention) layers Qwen3.6 introduced — see `modeling_qwen35.py:9-20`:
+**47 of 64 layers are DeltaNet** (`linear_attention`), only 17 are
+standard self-attention (`full_attention`). Qwen2 / Qwen3 were 100%
+standard attention.
+
+The two prefill paths scale differently:
+
+- **Standard attention prefill** is O(N²) but highly parallel — one
+  large GEMM + softmax that saturates the Tensor Engine on Trn2 and the
+  flash-attn kernel on A100 about equally.
+- **DeltaNet prefill** is a chunk-wise serial *scan*
+  (`modeling_qwen35.py:466,484,705-748`): the ISL is split into
+  `chunk_size=128` blocks, ops within a block are parallel, **but the
+  recurrent hidden state passes serially from chunk to chunk**. ISL=8K
+  → 64 chunks × 47 DeltaNet layers of serial-state work; ISL=1K → 8
+  chunks. This is exactly why our Trn2 prefill scales linearly in ISL.
+
+The cross-platform delta on this path:
+
+- A100 runs DeltaNet via the FLA-style fused Triton kernels integrated
+  into vLLM (mature, low launch overhead, well-tuned `chunk_delta_h`).
+- Trn2 runs the contrib NKI kernels in `src/nki_kernels/`
+  (`nki_deltanet.py`, `nki_deltanet_chunked.py`,
+  `nki_deltanet_fused.py`). Per-chunk launch + per-chunk state-passing
+  overhead accumulates across 47 layers × N chunks.
+
+#### What this means for FP8
+
+FP8 does not close this gap — the chunked DeltaNet prefill path stays
+BF16 across all FP8 tiers in the sweep below (T1/T2 only convert MLP
+and standard self-attention QKV/O). To actually move TTFT on Qwen3.6,
+the leverage points are on the DeltaNet path itself: optimize the
+chunked NKI kernel (fuse more stages, overlap state-passing DMA), or
+raise `chunk_size` from 128 to reduce the number of serial chunks.
 
 - `results/trn2_bf16_b1_2026-05-26/`
 - `results/p4de_bf16_b1_2026-05-26/`
