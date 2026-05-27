@@ -128,10 +128,10 @@ def main() -> int:
         "--disable-hybrid-cache-manager",
         action="store_true",
         help=(
-            "Force use_hybrid_cache_manager=False. Together with "
-            "--disable-qwen-hybrid-chunked-prefill, routes DeltaNet prefill "
-            "through _fused_chunked_forward (the v17 kernel path) instead of "
-            "the hybrid-cache _nki_chunked_forward path. Debug/bench only."
+            "Force use_hybrid_cache_manager=False. Debug/bench only — the "
+            "shipped path now uses _fused_chunked_forward as the hybrid-cache "
+            "prefill kernel, and disabling hybrid cache simply bypasses cache "
+            "management while keeping the same fused kernel."
         ),
     )
     parser.add_argument(

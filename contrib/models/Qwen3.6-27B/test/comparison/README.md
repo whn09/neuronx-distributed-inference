@@ -34,63 +34,62 @@ A100 has no native FP8 tensor cores, so its FP8 path is Marlin weight-only —
 not a fair comparison against Trn2's native FP8. The honest cross-platform
 comparison is BF16 vs BF16:
 
-| Platform                         | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) |
-|----------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|
-| A100 (P4DE, TP=1, BF16)          |                   500 |                  1974 |            35.14 |                28.3 |
-| Trn2 (trn2.3xlarge, TP=4, BF16)  |                  1900 |                 14473 |            33.01 |                27.4 |
-| **Trn2 / A100 ratio**            |                **3.8x** |                **7.3x** |        **0.94x** |             **0.97x** |
+| Platform                                   | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) |
+|--------------------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|
+| A100 (P4DE, TP=1, BF16)                    |                   500 |                  1974 |            35.14 |                28.3 |
+| Trn2 (trn2.3xlarge, TP=4, BF16, fused)     |                   479 |                  3046 |            33.01 |                27.4 |
+| **Trn2 / A100 ratio**                      |                **0.96x** |                **1.54x** |        **0.94x** |             **0.97x** |
 
-**Reading the gap honestly:**
+Trn2 numbers are the fused-hybrid prefill path (commit `3dff2a7`,
+`results/trn2_bf16_b1_fusedhybrid_2026-05-27/`). The earlier shipped
+chunked-NKI prefill path (`results/trn2_bf16_b1_2026-05-26/`) clocked
+1900 ms / 14473 ms at the same two ISLs — see the next section for
+the full sweep and why this changed.
+
+**Reading the comparison:**
 
 - **Decode is at parity** (Trn2 33.0 ms vs A100 35.1 ms TPOT, ~3% gap
-  either way). Both are weight-bandwidth bound at b=1, and both are within
-  the same ballpark on memory bandwidth per active weight.
-- **Prefill is much slower on Trn2**, and the gap *widens with ISL* (3.8x
-  at 1K → 7.3x at 8K). Trn2 prefill scales ~linearly in ISL
-  (1900 → 14473 ms is a 7.6x increase for 8x more tokens), while A100
-  with vLLM stays sublinear at these context lengths (500 → 1974 ms is
-  3.9x for 8x tokens).
+  either way). Both are weight-bandwidth bound at b=1.
+- **Prefill at 1K is at parity** (Trn2 479 vs A100 500 ms). At 8K
+  Trn2 is ~1.5x slower, and the gap is from Trn2's near-linear
+  per-chunk scan vs A100's sublinear vLLM prefill — not from launch
+  overhead anymore.
 
-#### Why the prefill gap is much larger here than on Qwen2 / Qwen3
+#### Why the BF16 numbers changed vs the earlier sweep
 
-This is the first model in the Qwen family where we see this pattern,
-and it is driven by the new **Gated DeltaNet** (linear recurrent
-attention) layers Qwen3.6 introduced — see `modeling_qwen35.py:9-20`:
-**47 of 64 layers are DeltaNet** (`linear_attention`), only 17 are
-standard self-attention (`full_attention`). Qwen2 / Qwen3 were 100%
-standard attention.
+The chunked-prefill path on Qwen3.6 has 47 DeltaNet (`linear_attention`)
+layers out of 64. The shipped DeltaNet prefill kernel
+(`_nki_chunked_forward`) launches one NKI kernel per `(batch, head,
+chunk)` — at ISL=8K with `chunk_size=128` that is 64 launches × 47
+layers = 3008 launches, and that launch overhead dominated TTFT.
 
-The two prefill paths scale differently:
+The new path (`_fused_chunked_forward` from `nki_deltanet_fused.py`)
+launches **one kernel per (batch, head)** for the whole sequence and
+keeps the recurrent state in SBUF across all chunks. To make this
+usable under the hybrid cache manager — which seeds DeltaNet prefill
+with prior recurrent state — `3dff2a7` plumbs an `initial_state`
+argument through the kernel and routes the hybrid-cache prefill code
+path through the fused kernel by default. This drops launch count from
+~3000 to ~47 per layer-stack and gives the 4-5x speedup tabulated
+below.
 
-- **Standard attention prefill** is O(N²) but highly parallel — one
-  large GEMM + softmax that saturates the Tensor Engine on Trn2 and the
-  flash-attn kernel on A100 about equally.
-- **DeltaNet prefill** is a chunk-wise serial *scan*
-  (`modeling_qwen35.py:466,484,705-748`): the ISL is split into
-  `chunk_size=128` blocks, ops within a block are parallel, **but the
-  recurrent hidden state passes serially from chunk to chunk**. ISL=8K
-  → 64 chunks × 47 DeltaNet layers of serial-state work; ISL=1K → 8
-  chunks. This is exactly why our Trn2 prefill scales linearly in ISL.
+This was also the test case where we tried `jim`'s PR141 v17 fused
+kernel (8-block forward-substitution Neumann, tuned for Qwen3.5-2B).
+On Qwen3.6 dimensions v17 came in at 639 ms vs 443 ms for the original
+6-round Neumann fused kernel, so v17 was reverted in `3dff2a7`.
 
-The cross-platform delta on this path:
+#### Trn2 BF16 prefill: shipped vs fused-hybrid
 
-- A100 runs DeltaNet via the FLA-style fused Triton kernels integrated
-  into vLLM (mature, low launch overhead, well-tuned `chunk_delta_h`).
-- Trn2 runs the contrib NKI kernels in `src/nki_kernels/`
-  (`nki_deltanet.py`, `nki_deltanet_chunked.py`,
-  `nki_deltanet_fused.py`). Per-chunk launch + per-chunk state-passing
-  overhead accumulates across 47 layers × N chunks.
+| ISL  | Shipped chunked-NKI (ms) | Fused-hybrid (ms) | Speedup |
+|-----:|-------------------------:|------------------:|--------:|
+| 1023 |                     1900 |               479 |  3.97x  |
+| 2047 |                     3616 |               764 |  4.74x  |
+| 4095 |                     7132 |              1431 |  4.98x  |
+| 8191 |                    14473 |              3046 |  4.75x  |
 
-#### What this means for FP8
-
-FP8 does not close this gap — the chunked DeltaNet prefill path stays
-BF16 across all FP8 tiers in the sweep below (T1/T2 only convert MLP
-and standard self-attention QKV/O). To actually move TTFT on Qwen3.6,
-the leverage points are on the DeltaNet path itself: optimize the
-chunked NKI kernel (fuse more stages, overlap state-passing DMA), or
-raise `chunk_size` from 128 to reduce the number of serial chunks.
-
-- `results/trn2_bf16_b1_2026-05-26/`
+- `results/trn2_bf16_b1_fusedhybrid_2026-05-27/` (default code path)
+- `results/trn2_bf16_b1_2026-05-26/` (earlier shipped path, kept for
+  reference)
 - `results/p4de_bf16_b1_2026-05-26/`
 
 ### Trn2 FP8 sweep (Trn2-internal, b=1)
@@ -98,12 +97,20 @@ raise `chunk_size` from 128 to reduce the number of serial chunks.
 This sweep is Trn2-only — it characterizes the *scope* of FP8 quantization
 on Qwen3.6, not a cross-platform comparison.
 
-| Tier                            | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) | HBM scope                                     |
-|---------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|-----------------------------------------------|
-| BF16 (baseline)                 |                  1900 |                 14473 |            33.01 |                27.4 | all BF16                                      |
-| FP8 weight-only MLP             |                  1835 |                 14389 |            30.55 |                29.4 | MLP weights FP8, BF16 compute                 |
-| FP8 dynamic MLP                 |                  1849 |                 14287 |            27.47 |                32.4 | + MLP activations FP8 (real FP8×FP8)          |
-| FP8 dynamic MLP+attn            |                  1805 |                 14299 |            27.33 |                32.5 | + std-attn QKV/O FP8 on full_attention layers |
+> **Note:** the FP8 numbers below were collected on the older
+> chunked-NKI prefill path (pre-`3dff2a7`). The BF16 row is reproduced
+> here as the matching baseline so the deltas are apples-to-apples. The
+> *current* Trn2 BF16 prefill (fused-hybrid) is in the head-to-head
+> table above. FP8 has not been re-swept on the new path yet — it would
+> show the same ~5x prefill speedup since the FP8 paths don't touch the
+> DeltaNet kernel.
+
+| Tier                                   | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) | HBM scope                                     |
+|----------------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|-----------------------------------------------|
+| BF16 (chunked-NKI baseline)            |                  1900 |                 14473 |            33.01 |                27.4 | all BF16                                      |
+| FP8 weight-only MLP                    |                  1835 |                 14389 |            30.55 |                29.4 | MLP weights FP8, BF16 compute                 |
+| FP8 dynamic MLP                        |                  1849 |                 14287 |            27.47 |                32.4 | + MLP activations FP8 (real FP8×FP8)          |
+| FP8 dynamic MLP+attn                   |                  1805 |                 14299 |            27.33 |                32.5 | + std-attn QKV/O FP8 on full_attention layers |
 
 - `results/trn2_fp8_b1_2026-05-26/` (weight-only MLP)
 - `results/trn2_fp8_dynamic_mlp_b1_2026-05-27/` (T1)
@@ -112,10 +119,11 @@ on Qwen3.6, not a cross-platform comparison.
 **How to read the FP8 sweep:**
 
 - **Weight-only → dynamic MLP** captures the actual FP8 compute win at b=1
-  (decode TPOT −10%, OTPS +10%); prefill is unchanged because the chunked
-  DeltaNet prefill stays BF16.
+  (decode TPOT −10%, OTPS +10%); prefill barely moves because the
+  DeltaNet kernel itself is unchanged.
 - **Dynamic MLP → dynamic MLP+attn** is a wash on throughput (±0.5%) but
   buys ~1.4 GB of HBM headroom on the 17 full_attention layers; the value
   shows up at higher batch / longer context, not at b=1.
-- FP8 does *not* close the prefill gap to A100 — that is a chunked-prefill
-  scaling issue, not a precision issue. See the BF16 head-to-head above.
+- FP8 and the fused-hybrid prefill path are independent levers — FP8
+  helps decode bandwidth, the fused kernel helps prefill launch
+  overhead. Stacking the two would compose.
