@@ -372,6 +372,13 @@ def deltanet_fused_chunked_fwd(
         # ============================================================
         # Neumann power-doubling: N = (I+A)(I+A^2)...(I+A^{64})
         # 6 rounds → resolves rank up to 2^6 = 64 (sufficient for chunk=128)
+        #
+        # Maintain BOTH A_pow and A_pow_T across rounds. Each round costs
+        # one extra TE matmul but eliminates two VE transposes
+        # (transpose(A_pow) + transpose(I+A_pow)). Since IpA_T = I + A_pow_T
+        # holds with no transpose (eye is symmetric), I+A_pow only needs
+        # to be added, never transposed. The kernel is VE-bound at b=1, so
+        # trading 2 transposes for 1 matmul per round is a net win.
         # ============================================================
         P_acc = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=P_acc, data1=eye, data2=A_mat, op=nl.add)
@@ -379,25 +386,30 @@ def deltanet_fused_chunked_fwd(
         A_pow = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=A_pow, src=A_mat)
 
+        # Initial A_pow_T = transpose(A_mat). Needed once, then maintained
+        # algebraically alongside A_pow.
+        A_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=A_T_psum, data=A_mat)
+        A_pow_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=A_pow_T, src=A_T_psum)
+
         for _round in nl.sequential_range(6):
-            # A_pow = A_pow^2: transpose A_pow, then matmul
-            Ap_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_transpose(dst=Ap_T_psum, data=A_pow)
-            Ap_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=Ap_T, src=Ap_T_psum)
-
+            # NKI: nc_matmul(stationary=X, moving=Y) computes X^T @ Y.
+            #   A_pow_new   = A_pow @ A_pow         (X=A_pow_T, Y=A_pow)
+            #   A_pow_T_new = A_pow_T @ A_pow_T = (A_pow @ A_pow)^T (X=A_pow, Y=A_pow_T)
             Ap_sq_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=Ap_sq_psum, stationary=Ap_T, moving=A_pow)
+            nisa.nc_matmul(dst=Ap_sq_psum, stationary=A_pow_T, moving=A_pow)
+
+            Ap_sq_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=Ap_sq_T_psum, stationary=A_pow, moving=A_pow_T)
+
             nisa.tensor_copy(dst=A_pow, src=Ap_sq_psum)
+            nisa.tensor_copy(dst=A_pow_T, src=Ap_sq_T_psum)
 
-            # P_acc = (I + A_pow) @ P_acc: transpose IpA, then matmul
-            IpA = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=IpA, data1=eye, data2=A_pow, op=nl.add)
-
-            IpA_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_transpose(dst=IpA_T_psum, data=IpA)
+            # IpA_T = (I + A_pow)^T = I + A_pow_T (eye is symmetric).
+            # P_acc = (I+A_pow) @ P_acc  →  matmul(stationary=IpA_T, moving=P_acc).
             IpA_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=IpA_T, src=IpA_T_psum)
+            nisa.tensor_tensor(dst=IpA_T, data1=eye, data2=A_pow_T, op=nl.add)
 
             Pacc_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_matmul(dst=Pacc_psum, stationary=IpA_T, moving=P_acc)

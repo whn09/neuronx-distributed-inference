@@ -37,18 +37,22 @@ comparison is BF16 vs BF16:
 | Platform                                       | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) |
 |------------------------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|
 | A100 (P4DE, TP=1, BF16)                        |                   500 |                  1974 |            35.14 |                28.3 |
-| Trn2 (trn2.3xlarge, TP=4, BF16, decay-refactor)|                   466 |                  2938 |            33.01 |                27.4 |
-| **Trn2 / A100 ratio**                          |                **0.93x** |                **1.49x** |        **0.94x** |             **0.97x** |
+| Trn2 (trn2.3xlarge, TP=4, BF16, probe-H)       |                   446 |                  2763 |            33.01 |                27.4 |
+| **Trn2 / A100 ratio**                          |              **0.89x** |              **1.40x** |        **0.94x** |             **0.97x** |
 
-Trn2 numbers are the decay-refactor prefill path
-(`results/trn2_bf16_b1_decayrefactor_2026-05-27/`), which precomputes a
-shared lower-triangular decay matrix once per chunk in the fused
-DeltaNet NKI kernel and reuses it for both the Neumann correction and
-the `attn_intra` path. This drops `nc_transpose` count per chunk from
-25 to 15 and gives ~3% TTFT savings on top of the fused-hybrid path.
+Trn2 numbers are the probe-H prefill path
+(`results/trn2_bf16_b1_probeH_2026-05-27/`), which maintains both
+`A_pow` and `A_pow_T` across the Neumann power-doubling loop in the
+fused DeltaNet NKI kernel. This eliminates the per-round transposes
+of `A_pow` and `(I+A_pow)`, dropping `nc_transpose` count per chunk
+from 15 (post-decay-refactor) to 9 in exchange for one extra Tensor
+Engine matmul per round. Result: another ~6% TTFT savings on top of
+the decay-refactor path.
 
 Earlier baselines kept for reference:
 
+- `results/trn2_bf16_b1_decayrefactor_2026-05-27/` — decay-refactor
+  prefill: 466 ms / 2938 ms at the two ISLs above
 - `results/trn2_bf16_b1_fusedhybrid_2026-05-27/` — fused-hybrid prefill
   (commit `3dff2a7`): 479 ms / 3046 ms at the two ISLs above
 - `results/trn2_bf16_b1_2026-05-26/` — shipped chunked-NKI baseline:
@@ -60,8 +64,8 @@ See the next section for the full sweep and why these changed.
 
 - **Decode is at parity** (Trn2 33.0 ms vs A100 35.1 ms TPOT, ~3% gap
   either way). Both are weight-bandwidth bound at b=1.
-- **Prefill at 1K is faster on Trn2** (Trn2 466 vs A100 500 ms, 1.07x).
-  At 8K Trn2 is ~1.49x slower, and the remaining gap is from Trn2's
+- **Prefill at 1K is faster on Trn2** (Trn2 446 vs A100 500 ms, 1.12x).
+  At 8K Trn2 is ~1.40x slower, and the remaining gap is from Trn2's
   near-linear per-chunk DeltaNet scan vs A100's sublinear vLLM prefill
   — not from launch overhead or transpose count anymore.
 
@@ -88,25 +92,28 @@ kernel (8-block forward-substitution Neumann, tuned for Qwen3.5-2B).
 On Qwen3.6 dimensions v17 came in at 639 ms vs 443 ms for the original
 6-round Neumann fused kernel, so v17 was reverted in `3dff2a7`.
 
-#### Trn2 BF16 prefill: shipped → fused-hybrid → decay-refactor
+#### Trn2 BF16 prefill: shipped → fused-hybrid → decay-refactor → probe-H
 
-| ISL  | Shipped chunked-NKI (ms) | Fused-hybrid (ms) | Decay-refactor (ms) | Speedup vs shipped |
-|-----:|-------------------------:|------------------:|--------------------:|-------------------:|
-| 1023 |                     1900 |               479 |              465.64 |  4.08x             |
-| 2047 |                     3616 |               764 |              740.62 |  4.88x             |
-| 4095 |                     7132 |              1431 |             1382.23 |  5.16x             |
-| 8191 |                    14473 |              3046 |             2938.34 |  4.92x             |
+| ISL  | Shipped chunked-NKI (ms) | Fused-hybrid (ms) | Decay-refactor (ms) | Probe-H (ms) | Speedup vs shipped |
+|-----:|-------------------------:|------------------:|--------------------:|-------------:|-------------------:|
+| 1023 |                     1900 |               479 |              465.64 |       445.63 |              4.26x |
+| 2047 |                     3616 |               764 |              740.62 |       695.73 |              5.20x |
+| 4095 |                     7132 |              1431 |             1382.23 |      1289.86 |              5.53x |
+| 8191 |                    14473 |              3046 |             2938.34 |      2762.92 |              5.24x |
 
-The `Decay-refactor` column is the current default code path. On top of
-the fused-hybrid kernel, it precomputes a single shared
-lower-triangular decay matrix per chunk and reuses it for both the
-Neumann correction (`A`) and `attn_intra` paths. This drops
-`nc_transpose` count per chunk from 25 to 15 and gives ~3% TTFT savings
-across all ISLs.
+The `Probe-H` column is the current default code path. On top of the
+decay-refactor kernel, it maintains both `A_pow` and `A_pow_T` across
+the 6-round Neumann power-doubling loop. This eliminates the per-round
+transposes of `A_pow` and `(I+A_pow)` (since `IpA_T = I + A_pow_T`
+holds with no transpose) in exchange for one extra Tensor Engine
+matmul per round. `nc_transpose` count per chunk drops from 15 to 9
+(−40% on top of the prior decay-refactor cut), giving another ~6% TTFT
+savings across all ISLs.
 
-- `results/trn2_bf16_b1_decayrefactor_2026-05-27/` (default code path)
-- `results/trn2_bf16_b1_fusedhybrid_2026-05-27/` (previous default,
+- `results/trn2_bf16_b1_probeH_2026-05-27/` (default code path)
+- `results/trn2_bf16_b1_decayrefactor_2026-05-27/` (previous default,
   kept for reference)
+- `results/trn2_bf16_b1_fusedhybrid_2026-05-27/` (kept for reference)
 - `results/trn2_bf16_b1_2026-05-26/` (shipped chunked-NKI baseline,
   kept for reference)
 - `results/p4de_bf16_b1_2026-05-26/`
@@ -119,9 +126,9 @@ on Qwen3.6, not a cross-platform comparison.
 > **Note:** the FP8 numbers below were collected on the older
 > chunked-NKI prefill path (pre-`3dff2a7`). The BF16 row is reproduced
 > here as the matching baseline so the deltas are apples-to-apples. The
-> *current* Trn2 BF16 prefill (fused-hybrid) is in the head-to-head
-> table above. FP8 has not been re-swept on the new path yet — it would
-> show the same ~5x prefill speedup since the FP8 paths don't touch the
+> *current* Trn2 BF16 prefill (probe-H) is in the head-to-head table
+> above. FP8 has not been re-swept on the new path yet — it would show
+> the same ~5x prefill speedup since the FP8 paths don't touch the
 > DeltaNet kernel.
 
 | Tier                                   | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) | HBM scope                                     |
