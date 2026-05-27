@@ -18,6 +18,8 @@
 #   CACHE_DIR=${WORK_ROOT}_cache                    (NEURON_COMPILE_CACHE_URL)
 #   TMPDIR_OVERRIDE=${WORK_ROOT}_tmp                (TMPDIR)
 #   QUANTIZED_CKPT_PATH                             (FP8 only; required for FP8)
+#   FP8_TIER=weight_only_mlp                        (FP8 only; weight_only_mlp |
+#                                                    dynamic_mlp | dynamic_mlp_attn)
 set -euo pipefail
 
 : "${PRECISION:?PRECISION must be bf16 or fp8}"
@@ -55,10 +57,12 @@ case "${PRECISION}" in
     ;;
   fp8)
     : "${QUANTIZED_CKPT_PATH:?QUANTIZED_CKPT_PATH required for PRECISION=fp8}"
+    FP8_TIER="${FP8_TIER:-weight_only_mlp}"
     exec python3 contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
       --model-path "${MODEL_PATH}" \
       --compiled-path "${COMPILED_PATH}" \
       --quantized-checkpoints-path "${QUANTIZED_CKPT_PATH}" \
+      --quantization-tier "${FP8_TIER}" \
       --seq-len "${SEQ_LEN}" --batch-size 1 \
       --context-encoding-buckets "${CTE_BUCKETS_CSV}" \
       --tp-degree "${TP_DEGREE}" --logical-nc-config "${LOGICAL_NC_CONFIG}"

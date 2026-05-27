@@ -20,6 +20,7 @@
 #   DECODE_CONC="1"
 #   PREFILL_TTFT_LIMIT_S=180  DECODE_TTFT_LIMIT_S=30
 #   READY_TIMEOUT_S=600
+#   SKIP_CORRECTNESS_GATE=0   # set to 1 to bypass the offline correctness gate
 set -euo pipefail
 
 : "${PRECISION:?PRECISION required (bf16|fp8)}"
@@ -61,10 +62,37 @@ echo "=== [${TAG}] STEP 1: COMPILE ===" | tee -a "${COMPILE_LOG}"
 PRECISION="${PRECISION}" REPO="${REPO}" COMPILER_VENV="${COMPILER_VENV}" \
   MODEL_PATH="${MODEL_PATH}" COMPILED_PATH="${COMPILED_PATH}" \
   QUANTIZED_CKPT_PATH="${QUANTIZED_CKPT_PATH:-}" \
+  FP8_TIER="${FP8_TIER:-weight_only_mlp}" \
   bash "${SCRIPT_DIR}/run_compile_b1.sh" >> "${COMPILE_LOG}" 2>&1
 echo "=== [${TAG}] COMPILE_DONE ==="
 
-echo "=== [${TAG}] STEP 2: START SERVER ==="
+GATE_LOG="${LOG_DIR}/${TAG}_gate.log"
+if [[ "${SKIP_CORRECTNESS_GATE:-0}" == "1" ]]; then
+  echo "=== [${TAG}] STEP 2: CORRECTNESS GATE (SKIPPED via SKIP_CORRECTNESS_GATE=1) ==="
+else
+  echo "=== [${TAG}] STEP 2: CORRECTNESS GATE ===" | tee -a "${GATE_LOG}"
+  # Gate uses NxDI directly to load the compiled artifact, so it needs the
+  # compiler venv (not the vLLM server venv). Run in a subshell so the
+  # activation does not leak into later steps.
+  (
+    # shellcheck disable=SC1091
+    source "${COMPILER_VENV}/bin/activate"
+    cd "${REPO}"
+    python3 "${SCRIPT_DIR}/correctness_gate.py" \
+      --model-path "${MODEL_PATH}" \
+      --compiled-path "${COMPILED_PATH}" \
+      --repo "${REPO}"
+  ) >> "${GATE_LOG}" 2>&1
+  gate_rc=$?
+  if [[ ${gate_rc} -ne 0 ]]; then
+    echo "ERROR: correctness gate failed (rc=${gate_rc}); refusing to start server / sweep"
+    tail -60 "${GATE_LOG}" || true
+    exit 1
+  fi
+  echo "=== [${TAG}] GATE_DONE ==="
+fi
+
+echo "=== [${TAG}] STEP 3: START SERVER ==="
 PRECISION="${PRECISION}" REPO="${REPO}" SERVER_VENV="${SERVER_VENV}" \
   MODEL_PATH="${MODEL_PATH}" COMPILED_PATH="${COMPILED_PATH}" \
   PORT="${PORT}" \
@@ -72,7 +100,7 @@ PRECISION="${PRECISION}" REPO="${REPO}" SERVER_VENV="${SERVER_VENV}" \
 SERVER_PID=$!
 echo "server pid=${SERVER_PID}"
 
-echo "=== [${TAG}] STEP 3: WAIT READY (timeout=${READY_TIMEOUT_S}s) ==="
+echo "=== [${TAG}] STEP 4: WAIT READY (timeout=${READY_TIMEOUT_S}s) ==="
 deadline=$(( $(date +%s) + READY_TIMEOUT_S ))
 ready=0
 while (( $(date +%s) < deadline )); do
@@ -93,7 +121,7 @@ if [[ "${ready}" -ne 1 ]]; then
 fi
 echo "server ready"
 
-echo "=== [${TAG}] STEP 4: SWEEP ==="
+echo "=== [${TAG}] STEP 5: SWEEP ==="
 # `vllm bench serve` lives in SERVER_VENV; activate it before running the
 # sweep so the client binary is on PATH. Use a subshell so the activation
 # does not leak into later cleanup steps.

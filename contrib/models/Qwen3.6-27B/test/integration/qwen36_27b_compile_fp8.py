@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""Compile Qwen3.6-27B 64K with a scoped FP8 weight-quantization ablation.
+"""Compile Qwen3.6-27B 64K with a scoped FP8 quantization ablation.
 
-This script intentionally starts from the validated 64K hybrid/chunked-prefill
-baseline and changes only weight quantization. The first supported mode is
-``mlp_only``: MLP linear weights are converted to FP8 while attention, DeltaNet,
-normalization, embeddings, lm_head, KV cache, and recurrent state remain BF16.
+This script starts from the validated 64K hybrid/chunked-prefill baseline and
+changes only quantization scope. Three tiers are supported via
+``--quantization-tier``:
+
+- ``weight_only_mlp`` (default): MLP linear weights are converted to FP8 e4m3
+  per-channel; attention, DeltaNet, norms, embeddings, lm_head, KV cache, and
+  activations all stay BF16. ``activation_quantization_type`` stays ``None`` so
+  FP8 weights are dequantized to BF16 at compute time. This is a memory-
+  footprint experiment, not an FP8 compute experiment.
+
+- ``dynamic_mlp``: same checkpoint as ``weight_only_mlp``, but
+  ``activation_quantization_type='dynamic'`` so MLP matmul becomes real
+  FP8 x FP8 via the native ``convert()`` quantize path. Attention, DeltaNet,
+  norms, KV cache stay BF16.
+
+- ``dynamic_mlp_attn``: ``dynamic_mlp`` plus removes ``self_attn`` from
+  ``modules_to_not_convert`` so standard self-attention QKV/O on the
+  ``full_attention`` layers also goes FP8. DeltaNet (``linear_attn``), norms,
+  KV cache stay BF16. The checkpoint is built so the standard self-attention
+  weights are pre-quantized to FP8 alongside the MLP weights.
 """
 
 from __future__ import annotations
@@ -39,8 +55,19 @@ def _load_text_config(model_path: Path) -> dict:
     return config_dict
 
 
-def _mlp_only_modules_to_not_convert(num_layers: int) -> list[str]:
-    """Exclude numerically sensitive or unsupported modules from FP8 conversion."""
+QUANT_TIERS = ("weight_only_mlp", "dynamic_mlp", "dynamic_mlp_attn")
+
+
+def _modules_to_not_convert(num_layers: int, tier: str) -> list[str]:
+    """Build the FP8-exclude list for the requested quantization tier.
+
+    All tiers exclude embeddings, lm_head, norms, rotary cache, DeltaNet
+    (``linear_attn``), and per-layer norms. ``self_attn`` is excluded for the
+    MLP-only tiers and *included* (i.e. allowed to be FP8-converted) for
+    ``dynamic_mlp_attn``.
+    """
+    if tier not in QUANT_TIERS:
+        raise ValueError(f"unknown quantization tier: {tier}")
     modules = [
         "embed_tokens",
         "model.embed_tokens",
@@ -54,12 +81,13 @@ def _mlp_only_modules_to_not_convert(num_layers: int) -> list[str]:
         for prefix in ("layers", "model.layers"):
             modules.extend(
                 [
-                    f"{prefix}.{layer_idx}.self_attn",
                     f"{prefix}.{layer_idx}.linear_attn",
                     f"{prefix}.{layer_idx}.input_layernorm",
                     f"{prefix}.{layer_idx}.post_attention_layernorm",
                 ]
             )
+            if tier != "dynamic_mlp_attn":
+                modules.append(f"{prefix}.{layer_idx}.self_attn")
     return modules
 
 
@@ -81,6 +109,27 @@ def _is_mlp_weight(name: str) -> bool:
     )
 
 
+def _is_self_attn_qkvo_weight(name: str) -> bool:
+    """Match standard self-attention projections on full_attention layers.
+
+    Names look like ``layers.<idx>.self_attn.q_proj.weight`` etc. DeltaNet
+    layers use ``linear_attn`` (different prefix) and are excluded.
+    """
+    parts = name.split(".")
+    return (
+        len(parts) >= 4
+        and parts[-3] == "self_attn"
+        and parts[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}
+        and parts[-1] == "weight"
+    )
+
+
+def _should_quantize_weight(name: str, tier: str) -> bool:
+    if tier == "dynamic_mlp_attn":
+        return _is_mlp_weight(name) or _is_self_attn_qkvo_weight(name)
+    return _is_mlp_weight(name)
+
+
 def _scale_name(weight_name: str) -> str:
     return weight_name[: -len(".weight")] + ".weight_scale"
 
@@ -92,12 +141,16 @@ def _clear_quantized_checkpoint_dir(path: Path) -> None:
             child.unlink()
 
 
-def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
+def _save_fp8_state_dict(
+    model_path: Path, output_path: Path, tier: str = "weight_only_mlp"
+) -> None:
     """Create a sharded FP8 checkpoint directly from HF safetensors.
 
     Loading the HF architecture requires a newer Transformers than the Neuron
-    venv uses internally. For this MLP-only ablation, we do not need model
-    execution: the checkpoint transform is a direct tensor rewrite.
+    venv uses internally. For this scoped ablation, we do not need model
+    execution: the checkpoint transform is a direct tensor rewrite. ``tier``
+    controls which weights are converted to FP8; everything else is copied
+    through unchanged.
     """
     from safetensors.torch import load_file, save_file  # noqa: WPS433
     from neuronx_distributed.quantization.quantization_utils import (  # noqa: WPS433
@@ -125,7 +178,7 @@ def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
         shard = load_file(str(model_path / filename))
         output_shard = {}
         for name, tensor in shard.items():
-            if _is_mlp_weight(name):
+            if _should_quantize_weight(name, tier):
                 weight, scale = quantize_fp8_per_channel(
                     tensor,
                     torch.float8_e4m3fn,
@@ -159,7 +212,10 @@ def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
                 sort_keys=True,
             )
 
-    print("MANUAL_FP8_MLP_WEIGHT_COUNT", quantized_count, flush=True)
+    print(
+        f"MANUAL_FP8_QUANT_COUNT tier={tier} count={quantized_count}",
+        flush=True,
+    )
 
 
 def _parse_buckets(args: argparse.Namespace) -> list[int]:
@@ -169,6 +225,36 @@ def _parse_buckets(args: argparse.Namespace) -> list[int]:
             raise ValueError("--context-encoding-buckets must list at least one int")
         return sorted(set(raw))
     return [args.cte_bucket]
+
+
+def _patch_scale_dequantize_for_3d_activations() -> None:
+    """Workaround for NxDI's scale_dequantize broadcasting on 3-D activations.
+
+    Why: NxDI's `scale_dequantize(tensor, scale, ...)` always does
+    `scale.unsqueeze(len(scale.shape)-1)` before the in-place multiply. That
+    is correct for the 2-D weight scale `[1, out]` -> `[1, 1, out]` against a
+    3-D output `(B, S, out)`. But on the *input* side of the dynamic FP8
+    path, `quantize_fp8_per_channel(x, channel_axis=1)` over a 3-D input
+    `(B, S, H)` produces a per-S scale shaped `[1, S, 1]` (3-D). Unsqueezing
+    that to `[1, S, 1, 1]` and broadcasting onto the 3-D matmul output fails
+    neuronx-cc's rank check:
+        RuntimeError: Check failed: input_sizes.size() <= output_sizes.size()
+
+    Fix: only unsqueeze when the scale rank is strictly less than the tensor
+    rank. This keeps the original 2-D weight-scale path untouched.
+    """
+    from neuronx_distributed.quantization import dequantize as _dq
+    from neuronx_distributed.quantization import quantization_layers as _ql
+
+    def _patched(tensor, scale, upcast_dtype):  # noqa: WPS430
+        upcast_tensor = tensor.to(torch.float32)
+        if scale.ndim < tensor.ndim:
+            scale = scale.unsqueeze(scale.ndim - 1)
+        upcast_tensor = upcast_tensor * scale
+        return upcast_tensor.to(upcast_dtype)
+
+    _dq.scale_dequantize = _patched
+    _ql.scale_dequantize = _patched
 
 
 def _build_config(args: argparse.Namespace):
@@ -181,7 +267,16 @@ def _build_config(args: argparse.Namespace):
     model_path = Path(args.model_path).expanduser().resolve()
     config_dict = _load_text_config(model_path)
     num_layers = int(config_dict["num_hidden_layers"])
-    modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
+    tier = args.quantization_tier
+    modules_to_not_convert = _modules_to_not_convert(num_layers, tier)
+
+    # Tier semantics:
+    #   weight_only_mlp -> FP8 weights, BF16 compute (dequant pre-matmul)
+    #   dynamic_mlp     -> FP8 weights + DYNAMIC FP8 activations on MLP
+    #   dynamic_mlp_attn-> same dynamic, also covers self_attn QKV/O
+    activation_quantization_type = (
+        "dynamic" if tier in ("dynamic_mlp", "dynamic_mlp_attn") else None
+    )
 
     buckets = _parse_buckets(args)
     max_ctx = max(buckets)
@@ -215,7 +310,7 @@ def _build_config(args: argparse.Namespace):
         modules_to_not_convert=modules_to_not_convert,
         kv_cache_quant=False,
         quantized_mlp_kernel_enabled=False,
-        activation_quantization_type=None,
+        activation_quantization_type=activation_quantization_type,
     )
 
     config_dict.setdefault("use_hybrid_cache_manager", True)
@@ -260,6 +355,16 @@ def main() -> int:
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
+    parser.add_argument(
+        "--quantization-tier",
+        choices=QUANT_TIERS,
+        default="weight_only_mlp",
+        help=(
+            "weight_only_mlp (default): FP8 weights, BF16 compute. "
+            "dynamic_mlp: FP8 weights + DYNAMIC FP8 activations on MLP. "
+            "dynamic_mlp_attn: also covers standard self-attention QKV/O."
+        ),
+    )
     args = parser.parse_args()
 
     repo = _repo_root(args.repo_root)
@@ -273,9 +378,13 @@ def main() -> int:
     compiled_path = Path(args.compiled_path).expanduser().resolve()
     quantized_path = Path(args.quantized_checkpoints_path).expanduser().resolve()
 
+    if args.quantization_tier in ("dynamic_mlp", "dynamic_mlp_attn"):
+        _patch_scale_dequantize_for_3d_activations()
+        print("PATCH_SCALE_DEQUANTIZE_APPLIED", flush=True)
+
     inf_config, modules_to_not_convert = _build_config(args)
 
-    print("FP8_MODE mlp_only", flush=True)
+    print(f"FP8_TIER {args.quantization_tier}", flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
     print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
@@ -295,8 +404,8 @@ def main() -> int:
     )
 
     if args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
-        print("QUANTIZE_START manual_mlp_only", flush=True)
-        _save_mlp_only_fp8_state_dict(model_path, quantized_path)
+        print(f"QUANTIZE_START tier={args.quantization_tier}", flush=True)
+        _save_fp8_state_dict(model_path, quantized_path, tier=args.quantization_tier)
         print("QUANTIZE_DONE", flush=True)
     else:
         print("QUANTIZE_SKIP existing checkpoint found", flush=True)
