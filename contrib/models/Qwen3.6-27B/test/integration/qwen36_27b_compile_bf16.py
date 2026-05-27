@@ -80,9 +80,14 @@ def _build_config(args: argparse.Namespace):
         save_sharded_checkpoint=True,
     )
 
-    config_dict.setdefault("use_hybrid_cache_manager", True)
-    config_dict.setdefault("use_qwen_hybrid_chunked_prefill", True)
-    config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
+    config_dict.setdefault("use_hybrid_cache_manager", not args.disable_hybrid_cache_manager)
+    config_dict.setdefault(
+        "use_qwen_hybrid_chunked_prefill", not args.disable_qwen_hybrid_chunked_prefill
+    )
+    config_dict.setdefault(
+        "use_qwen_hybrid_chunked_prefill_nki",
+        not args.disable_qwen_hybrid_chunked_prefill_nki,
+    )
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config
@@ -119,6 +124,30 @@ def main() -> int:
         ),
     )
     parser.add_argument("--load-after-compile", action="store_true")
+    parser.add_argument(
+        "--disable-hybrid-cache-manager",
+        action="store_true",
+        help=(
+            "Force use_hybrid_cache_manager=False. Together with "
+            "--disable-qwen-hybrid-chunked-prefill, routes DeltaNet prefill "
+            "through _fused_chunked_forward (the v17 kernel path) instead of "
+            "the hybrid-cache _nki_chunked_forward path. Debug/bench only."
+        ),
+    )
+    parser.add_argument(
+        "--disable-qwen-hybrid-chunked-prefill",
+        action="store_true",
+        help="Force use_qwen_hybrid_chunked_prefill=False (debug/bench only).",
+    )
+    parser.add_argument(
+        "--disable-qwen-hybrid-chunked-prefill-nki",
+        action="store_true",
+        help=(
+            "Force use_qwen_hybrid_chunked_prefill_nki=False. With "
+            "--disable-qwen-hybrid-chunked-prefill this is moot, but exposed "
+            "so the chunked PyTorch fallback can be benched separately."
+        ),
+    )
     args = parser.parse_args()
 
     repo = _repo_root(args.repo_root)
@@ -137,6 +166,22 @@ def main() -> int:
     print("BF16_MODE", flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
+    print(
+        "DELTANET_PREFILL_PATH",
+        json.dumps(
+            {
+                "use_hybrid_cache_manager": inf_config.use_hybrid_cache_manager,
+                "use_qwen_hybrid_chunked_prefill": (
+                    inf_config.use_qwen_hybrid_chunked_prefill
+                ),
+                "use_qwen_hybrid_chunked_prefill_nki": (
+                    inf_config.use_qwen_hybrid_chunked_prefill_nki
+                ),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     print(
         "CONTEXT_TRACE_SHAPE",
         json.dumps(
