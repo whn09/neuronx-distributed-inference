@@ -37,8 +37,10 @@ comparison is BF16 vs BF16:
 | Platform                                       | Prefill ISL=1023 (ms) | Prefill ISL=8191 (ms) | Decode TPOT (ms) | Decode OTPS (tok/s) |
 |------------------------------------------------|----------------------:|----------------------:|-----------------:|--------------------:|
 | A100 (P4DE, TP=1, BF16)                        |                   500 |                  1974 |            35.14 |                28.3 |
+| H100 (P5, TP=1, BF16)                          |                    96 |                   688 |            20.15 |                47.2 |
 | Trn2 (trn2.3xlarge, TP=4, BF16, probe-H)       |                   446 |                  2763 |            33.01 |                27.4 |
 | **Trn2 / A100 ratio**                          |              **0.89x** |              **1.40x** |        **0.94x** |             **0.97x** |
+| **Trn2 / H100 ratio**                          |              **4.65x** |              **4.02x** |        **1.64x** |             **0.58x** |
 
 Trn2 numbers are the probe-H prefill path
 (`results/trn2_bf16_b1_probeH_2026-05-27/`), which maintains both
@@ -68,6 +70,30 @@ See the next section for the full sweep and why these changed.
   At 8K Trn2 is ~1.40x slower, and the remaining gap is from Trn2's
   near-linear per-chunk DeltaNet scan vs A100's sublinear vLLM prefill
   — not from launch overhead or transpose count anymore.
+- **H100 is the fastest platform here by a wide margin** (BF16 96 ms /
+  688 ms prefill, 20.15 ms TPOT). It is ~4-5x faster than A100 at prefill
+  and ~1.7x at decode — HBM3 bandwidth (3.35 vs 2.0 TB/s) plus more SMs
+  and higher clocks. Trn2 BF16 trails H100 BF16 by ~4x at prefill and
+  ~1.6x at decode TPOT. On H100 the right deployment dtype is native FP8
+  (see the next section), which is faster than H100 BF16 on both phases.
+
+### H100 (P5) FP8 vs BF16 — native FP8 (b=1)
+
+Unlike A100, **H100 has native FP8 tensor cores**, so the FP8 path runs
+true FP8×FP8 GEMMs (flashinfer `fp8_blockscale_gemm_90`), not Marlin
+weight-only dequant. FP8 therefore wins on *both* prefill and decode —
+the opposite of the A100 FP8 result:
+
+| Test                       |  BF16 |   FP8 | FP8 / BF16 |
+|----------------------------|------:|------:|-----------:|
+| Prefill ISL=1023 TTFT (ms) |  96.3 |  92.8 |   0.96x    |
+| Prefill ISL=8191 TTFT (ms) | 687.8 | 499.5 |   0.73x    |
+| Decode TPOT (ms)           | 20.15 | 12.87 |   0.64x    |
+| Decode OTPS (tok/s)        | 47.22 | 71.75 |   1.52x    |
+
+- `results/p5_bf16_b1_2026-06-02/` (H100 BF16)
+- `results/p5_fp8_b1_2026-06-02/` (H100 native FP8, includes the
+  flashinfer FP8-GEMM JIT link fix for the `/opt/pytorch/cuda` lib layout)
 
 #### Why the BF16 numbers changed vs the earlier sweep
 
